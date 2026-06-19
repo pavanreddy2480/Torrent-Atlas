@@ -1,5 +1,7 @@
 CXX      = g++
-CXXFLAGS = -Wall -O2 -pthread -std=c++17
+CXXFLAGS = -Wall -Wextra -O2 -pthread -std=c++17
+GMP_CFLAGS = $(shell pkg-config --cflags gmp 2>/dev/null)
+GMP_LIBS   = $(shell pkg-config --libs gmp 2>/dev/null || echo -lgmp)
 
 # directories
 CLIENT_DIR  = client
@@ -7,33 +9,35 @@ TRACKER_DIR = tracker
 
 # targets
 CLIENT   = $(CLIENT_DIR)/client
+TRACKER  = $(TRACKER_DIR)/tracker
 TRACKER1 = $(TRACKER_DIR)/tracker1
 TRACKER2 = $(TRACKER_DIR)/tracker2
+SECURITY_TEST = tests/security_tests
+PEER_REJECTION_TEST = tests/peer_rejection_test
 
 # default target
-all: $(CLIENT) $(TRACKER1) $(TRACKER2)
+all: $(CLIENT) $(TRACKER) $(TRACKER1) $(TRACKER2)
 
 # ----- build rules -----
-$(CLIENT): $(CLIENT_DIR)/client.cpp
-	$(CXX) $(CXXFLAGS) -o $@ $< -lreadline    # link with readline
+$(CLIENT): $(CLIENT_DIR)/client.cpp common/protocol.hpp common/sha1.hpp common/secure_crypto.hpp common/elgamal.hpp
+	$(CXX) $(CXXFLAGS) $(GMP_CFLAGS) -o $@ $< $(GMP_LIBS)
 
-# Tracker1 and Tracker2 both include tracker_common.hpp automatically
-$(TRACKER1): $(TRACKER_DIR)/tracker1.cpp $(TRACKER_DIR)/tracker_common.hpp
+$(TRACKER): $(TRACKER_DIR)/tracker.cpp $(TRACKER_DIR)/tracker_common.hpp common/protocol.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-$(TRACKER2): $(TRACKER_DIR)/tracker2.cpp $(TRACKER_DIR)/tracker_common.hpp
+$(TRACKER1): $(TRACKER_DIR)/tracker1.cpp $(TRACKER_DIR)/tracker_common.hpp common/protocol.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-# ----- convenience run targets -----
-# ----- convenience run targets -----
-run-client: $(CLIENT)
-	./$(CLIENT)
-
-run-tracker1: $(TRACKER1)
-	./$(TRACKER1) 127.0.0.1 6000 127.0.0.1 7000
-
-run-tracker2: $(TRACKER2)
-	./$(TRACKER2) 127.0.0.1 7000 127.0.0.1 6000
+$(TRACKER2): $(TRACKER_DIR)/tracker2.cpp $(TRACKER_DIR)/tracker_common.hpp common/protocol.hpp
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
 clean:
-	rm -f $(CLIENT) $(TRACKER1) $(TRACKER2)
+	rm -f $(CLIENT) $(TRACKER) $(TRACKER1) $(TRACKER2) $(SECURITY_TEST) $(PEER_REJECTION_TEST)
+
+security-test: tests/security_tests.cpp common/secure_crypto.hpp common/elgamal.hpp common/protocol.hpp
+	$(CXX) $(CXXFLAGS) $(GMP_CFLAGS) -o $(SECURITY_TEST) $< $(GMP_LIBS)
+	./$(SECURITY_TEST)
+
+peer-rejection-test: tests/peer_rejection_test.cpp common/protocol.hpp
+	$(CXX) $(CXXFLAGS) -o $(PEER_REJECTION_TEST) $<
+	./$(PEER_REJECTION_TEST) $(PORT)

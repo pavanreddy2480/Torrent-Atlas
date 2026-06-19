@@ -1,189 +1,679 @@
 #pragma once
-#include<bits/stdc++.h>
-#include<arpa/inet.h>
-#include<sys/socket.h>
-#include<netinet/in.h>
-#include<unistd.h>
-#include<thread>
-#include<mutex>
-#include<atomic>
-using namespace std;
-using u32=uint32_t;using u64=uint64_t;
-static const size_t MAX_FRAME=10*1024*1024;
-inline u64 hton64(u64 v){
-#if __BYTE_ORDER==__LITTLE_ENDIAN
-    return(((u64)htonl((uint32_t)(v&0xffffffffULL)))<<32)|htonl((uint32_t)((v>>32)&0xffffffffULL));
-#else
-    return v;
-#endif
-}
-inline u64 ntoh64(u64 v){
-#if __BYTE_ORDER==__LITTLE_ENDIAN
-    return(((u64)ntohl((uint32_t)(v&0xffffffffULL)))<<32)|ntohl((uint32_t)((v>>32)&0xffffffffULL));
-#else
-    return v;
-#endif
-}
-inline ssize_t readn(int fd,void*buf,size_t n){
-    size_t left=n;char*p=(char*)buf;
-    while(left){
-        ssize_t r=recv(fd,p,left,0);
-        if(r<0){if(errno==EINTR)continue;return-1;}
-        if(r==0)return 0;
-        left-=r;p+=r;
-    }
-    return n;
-}
-inline ssize_t writen(int fd,const void*buf,size_t n){
-    size_t left=n;const char*p=(const char*)buf;
-    while(left){
-        ssize_t w=send(fd,p,left,0);
-        if(w<=0){if(errno==EINTR)continue;return-1;}
-        left-=w;p+=w;
-    }
-    return n;
-}
-struct GroupInfo{
-    string owner;
-    unordered_set<string>members;
-    unordered_set<string>pending;
+
+#include "../common/protocol.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <poll.h>
+#include <sstream>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+struct Endpoint {
+    std::string ip;
+    int port = 0;
 };
-class Tracker{
-    mutex m;
-    unordered_map<string,string>users;
-    unordered_map<u64,string>sessions;
-    unordered_map<string,GroupInfo>groups;
-    static u64 nextId(){static atomic<u64>c(1);return c++;}
+
+struct SeederInfo {
+    Endpoint endpoint;
+    std::string publicKey;
+};
+
+struct FileInfo {
+    u64 size = 0;
+    std::string fullHash;
+    std::string capability;
+    std::vector<std::string> pieceHashes;
+    std::unordered_map<std::string, SeederInfo> seeders;
+};
+
+struct GroupInfo {
+    std::string owner;
+    std::unordered_set<std::string> members;
+    std::unordered_set<std::string> pending;
+    std::unordered_map<std::string, FileInfo> files;
+};
+
+struct HandleResult {
+    std::string response;
+    u64 session = 0;
+    bool shouldSync = false;
+};
+
+class TrackerState {
+    std::mutex mutex_;
+    std::unordered_map<std::string, std::string> users_;
+    std::unordered_map<u64, std::string> sessions_;
+    std::unordered_map<std::string, GroupInfo> groups_;
+    std::atomic<u64> sequence_{1};
+    u64 trackerTag_;
+    std::string statePath_;
+
+    static std::string joinHashes(const std::vector<std::string> &hashes) {
+        std::string result;
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            if (i) result.push_back(',');
+            result += hashes[i];
+        }
+        return result;
+    }
+
+    void removeUserShares(const std::string &user) {
+        for (auto &groupEntry : groups_) {
+            for (auto file = groupEntry.second.files.begin(); file != groupEntry.second.files.end();) {
+                file->second.seeders.erase(user);
+                if (file->second.seeders.empty()) file = groupEntry.second.files.erase(file);
+                else ++file;
+            }
+        }
+    }
+
 public:
-    pair<string,u64> handle(u64 sess,const string&cmdline){
-        stringstream ss(cmdline);
-        string cmd;ss>>cmd;
-        if(cmd.empty())return{"ERR empty",sess};
-        lock_guard<mutex>lk(m);
-        string user=(sess&&sessions.count(sess))?sessions[sess]:"";
-        if(cmd=="create_user"){
-            string u,p;ss>>u>>p;
-            if(u.empty()||p.empty())return{"ERR usage",sess};
-            if(users.count(u))return{"ERR exists",sess};
-            users[u]=p;return{"OK user created",sess};
+    explicit TrackerState(unsigned trackerNumber)
+        : trackerTag_(static_cast<u64>(trackerNumber & 0xffU) << 56U),
+          statePath_("tracker_state_" + std::to_string(trackerNumber) + ".dat") {
+        load();
+    }
+
+    bool empty() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return users_.empty() && groups_.empty();
+    }
+
+    std::string serialize() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ostringstream output;
+        for (const auto &entry : users_)
+            output << "U " << hexEncode(entry.first) << ' ' << hexEncode(entry.second) << '\n';
+        for (const auto &entry : sessions_)
+            output << "S " << entry.first << ' ' << hexEncode(entry.second) << '\n';
+        for (const auto &groupEntry : groups_) {
+            const GroupInfo &group = groupEntry.second;
+            std::string encodedGroup = hexEncode(groupEntry.first);
+            output << "G " << encodedGroup << ' ' << hexEncode(group.owner) << '\n';
+            for (const auto &member : group.members)
+                output << "M " << encodedGroup << ' ' << hexEncode(member) << '\n';
+            for (const auto &pending : group.pending)
+                output << "R " << encodedGroup << ' ' << hexEncode(pending) << '\n';
+            for (const auto &fileEntry : group.files) {
+                const FileInfo &file = fileEntry.second;
+                std::string encodedFile = hexEncode(fileEntry.first);
+                output << "F " << encodedGroup << ' ' << encodedFile << ' ' << file.size << ' '
+                       << file.fullHash << ' ' << file.capability << ' '
+                       << (file.pieceHashes.empty() ? "-" : joinHashes(file.pieceHashes)) << '\n';
+                for (const auto &seeder : file.seeders)
+                    output << "D " << encodedGroup << ' ' << encodedFile << ' '
+                           << hexEncode(seeder.first) << ' ' << hexEncode(seeder.second.endpoint.ip) << ' '
+                           << seeder.second.endpoint.port << ' ' << seeder.second.publicKey << '\n';
+            }
         }
-        if(cmd=="login"){
-            string u,p;ss>>u>>p;
-            if(!users.count(u))return{"ERR no such user",sess};
-            if(users[u]!=p)return{"ERR bad password",sess};
-            if(sess==0)sess=nextId();
-            sessions[sess]=u;
-            return{"OK logged in",sess};
+        return output.str();
+    }
+
+    bool replaceFromSnapshot(const std::string &snapshot) {
+        std::unordered_map<std::string, std::string> users;
+        std::unordered_map<u64, std::string> sessions;
+        std::unordered_map<std::string, GroupInfo> groups;
+        std::istringstream input(snapshot);
+        std::string line;
+        while (std::getline(input, line)) {
+            if (line.empty()) continue;
+            std::istringstream record(line);
+            char type = '\0';
+            record >> type;
+            std::string a, b, c, d;
+            if (type == 'U') {
+                record >> a >> b;
+                std::string user, password;
+                if (!hexDecode(a, user) || !hexDecode(b, password)) return false;
+                users[user] = password;
+            } else if (type == 'S') {
+                u64 session = 0;
+                record >> session >> a;
+                std::string user;
+                if (!record || !hexDecode(a, user)) return false;
+                sessions[session] = user;
+            } else if (type == 'G') {
+                record >> a >> b;
+                std::string group, owner;
+                if (!hexDecode(a, group) || !hexDecode(b, owner)) return false;
+                groups[group].owner = owner;
+            } else if (type == 'M' || type == 'R') {
+                record >> a >> b;
+                std::string group, user;
+                if (!hexDecode(a, group) || !hexDecode(b, user)) return false;
+                if (type == 'M') groups[group].members.insert(user);
+                else groups[group].pending.insert(user);
+            } else if (type == 'F') {
+                u64 size = 0;
+                std::string capability;
+                record >> a >> b >> size >> c >> capability >> d;
+                std::string group, name;
+                if (!record || !hexDecode(a, group) || !hexDecode(b, name)) return false;
+                FileInfo &file = groups[group].files[name];
+                file.size = size;
+                file.fullHash = c;
+                file.capability = capability;
+                file.pieceHashes = d == "-" ? std::vector<std::string>{} : split(d, ',');
+            } else if (type == 'D') {
+                int port = 0;
+                std::string publicKey;
+                record >> a >> b >> c >> d >> port >> publicKey;
+                std::string group, name, user, ip;
+                if (!record || !hexDecode(a, group) || !hexDecode(b, name) ||
+                    !hexDecode(c, user) || !hexDecode(d, ip)) return false;
+                groups[group].files[name].seeders[user] = {{ip, port}, publicKey};
+            } else {
+                return false;
+            }
         }
-        if(cmd=="logout"){
-            if(!sessions.count(sess)||sessions[sess].empty())return{"ERR not logged in",sess};
-            sessions[sess].clear();
-            return{"OK logged out",sess};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            users_ = std::move(users);
+            sessions_ = std::move(sessions);
+            groups_ = std::move(groups);
         }
-        if(cmd=="create_group"){
-            string g;ss>>g;
-            if(g.empty()||user.empty())return{"ERR usage/login",sess};
-            if(groups.count(g))return{"ERR group exists",sess};
-            GroupInfo gi;gi.owner=user;gi.members.insert(user);
-            groups[g]=::move(gi);
-            return{"OK group created",sess};
+        return true;
+    }
+
+    bool save() {
+        std::string snapshot = serialize();
+        std::string temporary = statePath_ + ".tmp";
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output || !output.write(snapshot.data(), static_cast<std::streamsize>(snapshot.size())))
+                return false;
+            output.flush();
+            if (!output) return false;
         }
-        if(cmd=="join_group"){
-            string g;ss>>g;
-            if(g.empty()||user.empty())return{"ERR usage/login",sess};
-            if(!groups.count(g))return{"ERR no such group",sess};
-            auto&gi=groups[g];
-            if(gi.members.count(user))return{"ERR already member",sess};
-            gi.pending.insert(user);
-            return{"OK join requested",sess};
+        return std::rename(temporary.c_str(), statePath_.c_str()) == 0;
+    }
+
+    bool load() {
+        std::ifstream input(statePath_, std::ios::binary);
+        if (!input) return true;
+        std::ostringstream contents;
+        contents << input.rdbuf();
+        return input.good() || input.eof() ? replaceFromSnapshot(contents.str()) : false;
+    }
+
+    HandleResult handle(u64 session, const std::string &commandLine, bool replicated) {
+        std::istringstream input(commandLine);
+        std::string command;
+        input >> command;
+        if (command.empty()) return {"ERR empty command", session, false};
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string user;
+        auto sessionIt = sessions_.find(session);
+        if (sessionIt != sessions_.end()) user = sessionIt->second;
+        auto requireLogin = [&]() -> bool { return !user.empty(); };
+
+        if (command == "create_user") {
+            std::string name, password;
+            input >> name >> password;
+            if (name.empty() || password.empty()) return {"ERR usage: create_user <user> <password>", session, false};
+            if (users_.count(name)) {
+                if (replicated && users_[name] == password) return {"OK already replicated", session, false};
+                return {"ERR user already exists", session, false};
+            }
+            users_[name] = password;
+            return {"OK user created", session, true};
         }
-        if(cmd=="accept_request"){
-            string g,u;ss>>g>>u;
-            if(!groups.count(g))return{"ERR no group",sess};
-            auto&gi=groups[g];
-            if(gi.owner!=user)return{"ERR not owner",sess};
-            if(!gi.pending.count(u))return{"ERR no such req",sess};
-            gi.pending.erase(u);gi.members.insert(u);
-            return{"OK accepted",sess};
+        if (command == "login") {
+            std::string name, password;
+            input >> name >> password;
+            if (requireLogin()) {
+                if (replicated && user == name) return {"OK already logged in", session, false};
+                return {"ERR logout before logging in again", session, false};
+            }
+            if (!users_.count(name)) return {"ERR no such user", session, false};
+            if (users_[name] != password) return {"ERR invalid password", session, false};
+            if (session == 0) {
+                u64 now = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+                session = trackerTag_ | ((now ^ sequence_++) & 0x00ffffffffffffffULL);
+            }
+            sessions_[session] = name;
+            return {"OK logged in", session, true};
         }
-        if(cmd=="list_groups"){
-            string out="Groups:";
-            for(auto&kv:groups)out+=" "+kv.first;
-            return{out,sess};
+        if (command == "logout") {
+            if (!requireLogin())
+                return replicated ? HandleResult{"OK already logged out", session, false}
+                                  : HandleResult{"ERR not logged in", session, false};
+            removeUserShares(user);
+            sessions_.erase(session);
+            return {"OK logged out", 0, true};
         }
-        return{"ERR unknown",sess};
+        if (command == "create_group") {
+            std::string group;
+            input >> group;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            if (group.empty()) return {"ERR usage: create_group <group>", session, false};
+            if (groups_.count(group)) {
+                if (replicated && groups_[group].owner == user)
+                    return {"OK already replicated", session, false};
+                return {"ERR group already exists", session, false};
+            }
+            GroupInfo info;
+            info.owner = user;
+            info.members.insert(user);
+            groups_[group] = std::move(info);
+            return {"OK group created", session, true};
+        }
+        if (command == "join_group") {
+            std::string group;
+            input >> group;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            auto it = groups_.find(group);
+            if (it == groups_.end()) return {"ERR no such group", session, false};
+            if (it->second.members.count(user))
+                return replicated ? HandleResult{"OK already a member", session, false}
+                                  : HandleResult{"ERR already a member", session, false};
+            if (!it->second.pending.insert(user).second)
+                return replicated ? HandleResult{"OK already replicated", session, false}
+                                  : HandleResult{"ERR request already pending", session, false};
+            return {"OK join requested", session, true};
+        }
+        if (command == "leave_group") {
+            std::string group;
+            input >> group;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            auto it = groups_.find(group);
+            if (it == groups_.end()) return {"ERR no such group", session, false};
+            if (it->second.owner == user) return {"ERR owner cannot leave group", session, false};
+            if (!it->second.members.erase(user))
+                return replicated ? HandleResult{"OK already absent", session, false}
+                                  : HandleResult{"ERR not a member", session, false};
+            for (auto file = it->second.files.begin(); file != it->second.files.end();) {
+                file->second.seeders.erase(user);
+                if (file->second.seeders.empty()) file = it->second.files.erase(file);
+                else ++file;
+            }
+            return {"OK left group", session, true};
+        }
+        if (command == "list_groups") {
+            if (!requireLogin()) return {"ERR login required", session, false};
+            std::string response = "OK";
+            for (const auto &entry : groups_) response += " " + entry.first;
+            return {response, session, false};
+        }
+        if (command == "list_requests") {
+            std::string group;
+            input >> group;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            auto it = groups_.find(group);
+            if (it == groups_.end()) return {"ERR no such group", session, false};
+            if (it->second.owner != user) return {"ERR only owner may list requests", session, false};
+            std::string response = "OK";
+            for (const auto &name : it->second.pending) response += " " + name;
+            return {response, session, false};
+        }
+        if (command == "accept_request") {
+            std::string group, name;
+            input >> group >> name;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            auto it = groups_.find(group);
+            if (it == groups_.end()) return {"ERR no such group", session, false};
+            if (it->second.owner != user) return {"ERR only owner may accept requests", session, false};
+            if (!it->second.pending.erase(name)) {
+                if (replicated && it->second.members.count(name)) return {"OK already replicated", session, false};
+                return {"ERR no such pending request", session, false};
+            }
+            it->second.members.insert(name);
+            return {"OK request accepted", session, true};
+        }
+        if (command == "upload_file") {
+            std::string group, encodedName, fullHash, capability, hashes, ip, publicKey;
+            u64 size = 0;
+            int port = 0;
+            input >> group >> encodedName >> size >> fullHash >> capability >> hashes >> ip >> port >> publicKey;
+            std::string name;
+            std::string capabilityBytes, publicKeyBytes;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            auto groupIt = groups_.find(group);
+            if (groupIt == groups_.end()) return {"ERR no such group", session, false};
+            if (!groupIt->second.members.count(user)) return {"ERR not a group member", session, false};
+            if (!hexDecode(encodedName, name) || !hexDecode(capability, capabilityBytes) ||
+                !hexDecode(publicKey, publicKeyBytes) || name.empty() || fullHash.size() != 40 ||
+                capability.size() != 64 || ip.empty() || port <= 0 ||
+                publicKey.size() < 256 || publicKey.size() > 512)
+                return {"ERR invalid upload metadata", session, false};
+            std::vector<std::string> pieceHashes = hashes == "-" ? std::vector<std::string>{} : split(hashes, ',');
+            std::size_t expectedPieces = static_cast<std::size_t>((size + PIECE_SIZE - 1) / PIECE_SIZE);
+            if (pieceHashes.size() != expectedPieces) return {"ERR invalid piece hash count", session, false};
+            for (const auto &hash : pieceHashes) if (hash.size() != 40) return {"ERR invalid piece hash", session, false};
+
+            FileInfo &file = groupIt->second.files[name];
+            if (!file.fullHash.empty() &&
+                (file.size != size || file.fullHash != fullHash || file.pieceHashes != pieceHashes))
+                return {"ERR conflicting file metadata", session, false};
+            if (file.fullHash.empty()) {
+                file.size = size;
+                file.fullHash = fullHash;
+                file.capability = capability;
+                file.pieceHashes = std::move(pieceHashes);
+            }
+            file.seeders[user] = {{ip, port}, publicKey};
+            return {"OK file shared " + file.capability, session, true};
+        }
+        if (command == "list_files") {
+            std::string group;
+            input >> group;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            auto it = groups_.find(group);
+            if (it == groups_.end()) return {"ERR no such group", session, false};
+            if (!it->second.members.count(user)) return {"ERR not a group member", session, false};
+            std::string response = "OK";
+            for (const auto &entry : it->second.files) response += " " + hexEncode(entry.first);
+            return {response, session, false};
+        }
+        if (command == "download_file") {
+            std::string group, encodedName, name;
+            input >> group >> encodedName;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            auto groupIt = groups_.find(group);
+            if (groupIt == groups_.end()) return {"ERR no such group", session, false};
+            if (!groupIt->second.members.count(user)) return {"ERR not a group member", session, false};
+            if (!hexDecode(encodedName, name)) return {"ERR invalid file name", session, false};
+            auto fileIt = groupIt->second.files.find(name);
+            if (fileIt == groupIt->second.files.end() || fileIt->second.seeders.empty())
+                return {"ERR file has no online seeders", session, false};
+            const FileInfo &file = fileIt->second;
+            std::string response = "META " + std::to_string(file.size) + " " + file.fullHash + " " +
+                                   file.capability + " " +
+                                   (file.pieceHashes.empty() ? "-" : joinHashes(file.pieceHashes)) + " ";
+            bool first = true;
+            for (const auto &seeder : file.seeders) {
+                if (!first) response.push_back(',');
+                first = false;
+                response += seeder.second.endpoint.ip + ":" +
+                            std::to_string(seeder.second.endpoint.port) + ":" +
+                            seeder.second.publicKey;
+            }
+            return {response, session, false};
+        }
+        if (command == "stop_share") {
+            std::string group, encodedName, name;
+            input >> group >> encodedName;
+            if (!requireLogin()) return {"ERR login required", session, false};
+            auto groupIt = groups_.find(group);
+            if (groupIt == groups_.end() || !hexDecode(encodedName, name)) return {"ERR invalid group/file", session, false};
+            auto fileIt = groupIt->second.files.find(name);
+            if (fileIt == groupIt->second.files.end() || !fileIt->second.seeders.erase(user))
+                return replicated ? HandleResult{"OK already stopped", session, false}
+                                  : HandleResult{"ERR you are not sharing this file", session, false};
+            if (fileIt->second.seeders.empty()) groupIt->second.files.erase(fileIt);
+            return {"OK sharing stopped", session, true};
+        }
+        return {"ERR unknown command", session, false};
     }
 };
-struct SyncItem{u64 sess;string cmd;};
-class SyncQueue{
-    string peer_ip;int peer_port;
-    deque<SyncItem>q;
-    mutex m;condition_variable cv;
-    bool stop=false;
+
+struct SyncItem {
+    u64 session;
+    std::string command;
+};
+
+class SyncQueue {
+    Endpoint peer_;
+    std::deque<SyncItem> queue_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool stopping_ = false;
+    std::string queuePath_;
+
+    bool saveLocked() {
+        std::string temporary = queuePath_ + ".tmp";
+        {
+            std::ofstream output(temporary, std::ios::trunc);
+            if (!output) return false;
+            for (const auto &item : queue_)
+                output << item.session << ' ' << hexEncode(item.command) << '\n';
+            output.flush();
+            if (!output) return false;
+        }
+        return std::rename(temporary.c_str(), queuePath_.c_str()) == 0;
+    }
+
+    void load() {
+        std::ifstream input(queuePath_);
+        u64 session = 0;
+        std::string encoded;
+        while (input >> session >> encoded) {
+            std::string command;
+            if (!hexDecode(encoded, command)) {
+                std::cerr << "warning: invalid persisted synchronization queue\n";
+                queue_.clear();
+                return;
+            }
+            queue_.push_back({session, command});
+        }
+    }
+
 public:
-    SyncQueue(const string&ip="",int port=0):peer_ip(ip),peer_port(port){}
-    void enqueue(u64 s,const string&c){
-        lock_guard<mutex>lk(m);q.push_back({s,c});cv.notify_one();
+    SyncQueue(Endpoint peer, unsigned trackerNumber)
+        : peer_(std::move(peer)),
+          queuePath_("tracker_sync_" + std::to_string(trackerNumber) + ".dat") {
+        load();
     }
-    void run(){
-        while(true){
-            unique_lock<mutex>lk(m);
-            cv.wait(lk,[&]{return stop||!q.empty();});
-            if(stop)break;
-            SyncItem it=q.front();q.pop_front();
-            lk.unlock();
-            int fd=socket(AF_INET,SOCK_STREAM,0);
-            if(fd<0){this_thread::sleep_for(1s);continue;}
-            sockaddr_in addr{};addr.sin_family=AF_INET;
-            addr.sin_port=htons(peer_port);
-            inet_pton(AF_INET,peer_ip.c_str(),&addr.sin_addr);
-            if(connect(fd,(sockaddr*)&addr,sizeof(addr))<0){close(fd);this_thread::sleep_for(1s);continue;}
-            string payload="SYNC:"+it.cmd;
-            u32 len=htonl(sizeof(u64)+payload.size());
-            u64 sess=hton64(it.sess);
-            writen(fd,&len,sizeof(len));
-            writen(fd,&sess,sizeof(sess));
-            writen(fd,payload.data(),payload.size());
-            close(fd);
+
+    void enqueue(u64 session, const std::string &command) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) return;
+        queue_.push_back({session, command});
+        if (!saveLocked()) std::cerr << "warning: failed to persist synchronization queue\n";
+        condition_.notify_one();
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        condition_.notify_all();
+    }
+
+    void run() {
+        for (;;) {
+            SyncItem item;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
+                if (stopping_) return;
+                item = queue_.front();
+            }
+            int fd = connectTcp(peer_.ip, peer_.port, 2);
+            bool delivered = false;
+            if (fd >= 0) {
+                std::string request = "S\t" + std::to_string(item.session) + "\t" + item.command;
+                std::string response;
+                delivered = sendFrame(fd, request) && receiveFrame(fd, response) &&
+                            (response.rfind("OK", 0) == 0 || response == "REPLICATED");
+                close(fd);
+            }
+            if (delivered) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                queue_.pop_front();
+                if (!saveLocked()) std::cerr << "warning: failed to persist synchronization queue\n";
+            } else {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         }
     }
 };
-inline void sessionWorker(int fd,Tracker&tracker,SyncQueue*sync,bool doForward){
-    while(true){
-        u32 netlen;
-        ssize_t r=readn(fd,&netlen,sizeof(netlen));
-        if(r<=0)break;
-        u32 len=ntohl(netlen);
-        if(len<sizeof(u64)||len>MAX_FRAME)break;
-        u64 nets;if(readn(fd,&nets,sizeof(nets))<=0)break;
-        u64 sess=ntoh64(nets);
-        size_t pay=len-sizeof(u64);
-        string cmd;
-        if(pay){
-            vector<char>buf(pay);
-            if(readn(fd,buf.data(),pay)<=0)break;
-            cmd.assign(buf.data(),pay);
-        }
-        bool isSync=false;
-        if(cmd.rfind("SYNC:",0)==0){isSync=true;cmd=cmd.substr(5);}
-        auto[reply,newSess]=tracker.handle(sess,cmd);
-        u32 respLen=htonl(sizeof(u64)+reply.size());
-        u64 respSess=hton64(newSess);
-        if(writen(fd,&respLen,sizeof(respLen))<0)break;
-        if(writen(fd,&respSess,sizeof(respSess))<0)break;
-        if(!reply.empty())if(writen(fd,reply.data(),reply.size())<0)break;
-        if(doForward&&!isSync&&sync)sync->enqueue(newSess,cmd);
+
+inline void trackerConnection(int fd, TrackerState &state, SyncQueue &sync) {
+    std::string request;
+    if (!receiveFrame(fd, request)) {
+        close(fd);
+        return;
     }
+    std::vector<std::string> fields = split(request, '\t');
+    if (fields.size() >= 3 && fields[0] == "X" && fields[2] == "SNAPSHOT") {
+        sendFrame(fd, "STATE\n" + state.serialize());
+        close(fd);
+        return;
+    }
+    if (fields.size() < 3 || (fields[0] != "C" && fields[0] != "S")) {
+        sendFrame(fd, "ERR malformed request");
+        close(fd);
+        return;
+    }
+    u64 session = 0;
+    try {
+        session = static_cast<u64>(std::stoull(fields[1]));
+    } catch (...) {
+        sendFrame(fd, "ERR malformed session");
+        close(fd);
+        return;
+    }
+    std::string command = fields[2];
+    for (std::size_t i = 3; i < fields.size(); ++i) command += "\t" + fields[i];
+    bool replicated = fields[0] == "S";
+    HandleResult result = state.handle(session, command, replicated);
+    if (result.shouldSync && !state.save())
+        std::cerr << "warning: failed to persist tracker state\n";
+    if (!replicated && result.shouldSync) {
+        // Logout removes the session locally, but the peer needs the old token to identify
+        // which user's shares and session must be removed.
+        u64 replicationSession = command == "logout" ? session : result.session;
+        sync.enqueue(replicationSession, command);
+    }
+    std::string response = result.response + "\t" + std::to_string(result.session);
+    sendFrame(fd, response);
     close(fd);
 }
-inline int prepare_listener(const string&ip,int port){
-    int fd=socket(AF_INET,SOCK_STREAM,0);
-    if(fd<0){perror("socket");exit(1);}
-    int opt=1;setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-    sockaddr_in addr{};addr.sin_family=AF_INET;
-    addr.sin_port=htons(port);
-    inet_pton(AF_INET,ip.c_str(),&addr.sin_addr);
-    if(::bind(fd,(sockaddr*)&addr,sizeof(addr))<0){perror("bind");exit(1);}
-    if(listen(fd,50)<0){perror("listen");exit(1);}
-    return fd;
+
+inline bool readTrackerInfo(const std::string &path, std::vector<Endpoint> &trackers) {
+    std::ifstream input(path);
+    if (!input) return false;
+    std::string token;
+    while (input >> token) {
+        std::string ip;
+        int port = 0;
+        std::size_t colon = token.rfind(':');
+        if (colon != std::string::npos) {
+            ip = token.substr(0, colon);
+            try { port = std::stoi(token.substr(colon + 1)); } catch (...) { return false; }
+        } else {
+            ip = token;
+            if (!(input >> port)) return false;
+        }
+        trackers.push_back({ip, port});
+    }
+    return trackers.size() == 2;
+}
+
+inline int runTracker(int argc, char **argv, unsigned defaultNumber) {
+    std::vector<Endpoint> trackers;
+    unsigned number = defaultNumber;
+    if (argc == 3) {
+        if (!readTrackerInfo(argv[1], trackers)) {
+            std::cerr << "tracker info must contain exactly two IP:PORT entries\n";
+            return 1;
+        }
+        try { number = static_cast<unsigned>(std::stoul(argv[2])); } catch (...) { number = 0; }
+        if (number < 1 || number > 2) {
+            std::cerr << "tracker number must be 1 or 2\n";
+            return 1;
+        }
+    } else if (argc == 5) {
+        trackers.push_back({argv[1], std::stoi(argv[2])});
+        trackers.push_back({argv[3], std::stoi(argv[4])});
+        if (defaultNumber == 2) std::swap(trackers[0], trackers[1]);
+        number = defaultNumber;
+    } else {
+        std::cerr << "usage: " << argv[0] << " tracker_info.txt tracker_no\n";
+        return 1;
+    }
+
+    Endpoint local = trackers[number - 1];
+    Endpoint peer = trackers[2 - number];
+    TrackerState state(number);
+    if (state.empty()) {
+        int peerFd = connectTcp(peer.ip, peer.port, 2);
+        if (peerFd >= 0) {
+            std::string snapshot;
+            if (sendFrame(peerFd, "X\t0\tSNAPSHOT") && receiveFrame(peerFd, snapshot) &&
+                snapshot.rfind("STATE\n", 0) == 0 &&
+                state.replaceFromSnapshot(snapshot.substr(6))) {
+                state.save();
+                std::cerr << "Recovered tracker state from peer\n";
+            }
+            close(peerFd);
+        }
+    }
+    int listener = createListener(local.ip, local.port);
+    if (listener < 0) {
+        perror("tracker listen");
+        return 1;
+    }
+    SyncQueue sync(peer, number);
+    std::thread syncThread(&SyncQueue::run, &sync);
+    std::cerr << "Tracker " << number << " listening on " << local.ip << ':' << local.port
+              << ", peer " << peer.ip << ':' << peer.port << '\n';
+
+    bool running = true;
+    bool monitorConsole = true;
+    std::mutex workersMutex;
+    std::condition_variable workersCondition;
+    std::size_t activeWorkers = 0;
+
+    while (running) {
+        pollfd descriptors[2]{};
+        descriptors[0].fd = listener;
+        descriptors[0].events = POLLIN;
+        descriptors[1].fd = monitorConsole ? STDIN_FILENO : -1;
+        descriptors[1].events = POLLIN;
+        int ready = poll(descriptors, 2, -1);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+        if (monitorConsole && (descriptors[1].revents & (POLLIN | POLLHUP))) {
+            std::string command;
+            if (!std::getline(std::cin, command)) monitorConsole = false;
+            else if (command == "quit") running = false;
+        }
+        if (!running) break;
+        if (descriptors[0].revents & POLLIN) {
+            int client = accept(listener, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                perror("accept");
+                break;
+            }
+            timeval timeout{};
+            timeout.tv_sec = 5;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            {
+                std::lock_guard<std::mutex> lock(workersMutex);
+                ++activeWorkers;
+            }
+            std::thread([&, client] {
+                trackerConnection(client, state, sync);
+                {
+                    std::lock_guard<std::mutex> lock(workersMutex);
+                    --activeWorkers;
+                }
+                workersCondition.notify_all();
+            }).detach();
+        }
+    }
+    close(listener);
+    {
+        std::unique_lock<std::mutex> lock(workersMutex);
+        workersCondition.wait(lock, [&] { return activeWorkers == 0; });
+    }
+    sync.stop();
+    syncThread.join();
+    return 0;
 }
