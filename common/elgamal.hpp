@@ -46,6 +46,49 @@ public:
     std::string publicHex()const{return toHex(public_);}
     static unsigned securityBits(){return 2048;}
 
+    bool generateEphemeral(std::string &privateHex, std::string &publicHex) const {
+        mpz_t privateValue, publicValue, range;
+        mpz_inits(privateValue, publicValue, range, nullptr);
+        mpz_sub_ui(range, p_, 3);
+        bool ok = randomRange(privateValue, range);
+        if (ok) {
+            mpz_add_ui(privateValue, privateValue, 2);
+            powMod(publicValue, g_, privateValue, p_);
+            privateHex = toHex(privateValue);
+            publicHex = toHex(publicValue);
+        }
+        mpz_clears(privateValue, publicValue, range, nullptr);
+        return ok;
+    }
+
+    bool deriveEphemeralSecret(const std::string &privateHex,
+                               const std::string &peerPublicHex,
+                               std::string &secret) const {
+        mpz_t privateValue, peerPublic, shared;
+        mpz_inits(privateValue, peerPublic, shared, nullptr);
+        bool ok = fromHex(privateValue, privateHex) &&
+                  fromHex(peerPublic, peerPublicHex) &&
+                  mpz_cmp_ui(privateValue, 1) > 0 &&
+                  mpz_cmp_ui(peerPublic, 1) > 0 &&
+                  mpz_cmp(peerPublic, p_) < 0;
+        if (ok) {
+            powMod(shared, peerPublic, privateValue, p_);
+            std::size_t width = (mpz_sizeinbase(p_, 2) + 7) / 8;
+            std::string encoded(width, '\0');
+            std::string temporary(width, '\0');
+            std::size_t written = 0;
+            mpz_export(&temporary[0], &written, 1, 1, 1, 0, shared);
+            if (written > width) ok = false;
+            else {
+                std::copy(temporary.begin(), temporary.begin() + written,
+                          encoded.begin() + static_cast<std::ptrdiff_t>(width - written));
+                secret = sha256(encoded);
+            }
+        }
+        mpz_clears(privateValue, peerPublic, shared, nullptr);
+        return ok;
+    }
+
     ElGamalCipher encrypt(const std::string &message,const std::string &publicHex)const{
         mpz_t y,m,k,range,c1,shared,c2;mpz_inits(y,m,k,range,c1,shared,c2,nullptr);bool ok=fromHex(y,publicHex)&&mpz_cmp_ui(y,1)>0&&mpz_cmp(y,p_)<0;importBytes(m,message);mpz_sub_ui(range,p_,3);ok=ok&&randomRange(k,range);ElGamalCipher out;if(ok){mpz_add_ui(k,k,2);powMod(c1,g_,k,p_);powMod(shared,y,k,p_);mpz_mul(c2,m,shared);mpz_mod(c2,c2,p_);out={toHex(c1),toHex(c2)};}mpz_clears(y,m,k,range,c1,shared,c2,nullptr);return out;}
     bool decrypt(const ElGamalCipher &cipher,std::string &message,std::size_t size)const{

@@ -132,6 +132,12 @@ inline bool constantTimeEqual(const std::string &a, const std::string &b) {
     return difference == 0;
 }
 
+inline void secureErase(std::string &value) {
+    volatile char *cursor = value.empty() ? nullptr : &value[0];
+    for (std::size_t i = 0; i < value.size(); ++i) cursor[i] = 0;
+    value.clear();
+}
+
 class Aes256 {
     std::array<unsigned char, 240> roundKeys_{};
     static unsigned char multiply(unsigned char a, unsigned char b) {

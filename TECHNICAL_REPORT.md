@@ -32,10 +32,23 @@ sides of a partition.
 Files are split into 512 KiB pieces, with a shorter final piece. Upload computes ordered piece
 SHA1 values and a complete-file SHA1 using a streaming implementation.
 
-For a download, an atomic counter assigns every piece exactly once to a bounded worker pool.
-The starting peer is rotated by piece and worker index to spread load. On connection failure,
-truncated transfer, or hash mismatch, the worker discards the response and tries other peers.
-Temporary network failures receive bounded retry rounds.
+For a download, the client first requests encrypted piece bitmaps from all candidate peers. It
+computes the replication count of each piece and sorts pieces in ascending availability order.
+A bounded worker pool therefore fetches rare pieces before common pieces. Equal-quality peers
+are striped initially; later selections prefer peers with stronger reputation and throughput.
+
+The last three pieces use endgame mode. Two peers receive the same request concurrently and
+the first authenticated, SHA1-valid response wins. Losing requests do not write to the output,
+so the downloader can finish without waiting for a slow duplicate.
+
+After every successful `pwrite`, the local verified bitmap changes from zero to one. The partial
+file is already registered with the tracker, allowing other clients to discover and securely
+request those pieces while the original download remains in progress.
+
+The same bitmap is written to a crash-safe resume manifest only after `fsync` makes the piece
+durable. Manifests bind group, file name, size, complete hash, capability, ordered piece hashes,
+temporary path, and verified bitmap. Restart recovery re-hashes every marked piece before
+trusting it. Invalid bits are cleared and scheduled normally.
 
 Verified pieces are written at fixed offsets with `pwrite`, allowing workers to share one output
 descriptor safely. The output is a unique temporary file. After all workers finish, the complete
@@ -51,10 +64,12 @@ one-byte success/error marker before binary data.
 The protocol deliberately opens short-lived connections. This simplifies failure isolation and
 avoids shared connection synchronization while still supporting concurrent transfers.
 
-Peer requests follow the security model in `security.pdf`: a fresh 256-bit secret is ElGamal
-encrypted to the seeder, request/response nonces provide freshness, the seeder signs the
-response transcript, AES-256-CBC protects content, and HMAC-SHA256 authenticates ciphertext
-before decryption. Manual implementations and exact primitive test vectors are in
+Peer requests extend the security model in `security.pdf` with forward secrecy. Both peers
+generate fresh 2048-bit Diffie-Hellman values and sign the complete exchange using long-term
+ElGamal identity keys. The session is derived from the ephemeral shared secret and transcript;
+long-term keys never derive the content-encryption key. Request/response nonces provide
+freshness, AES-256-CBC protects content, and HMAC-SHA256 authenticates ciphertext before
+decryption. Manual implementations and exact primitive test vectors are in
 `common/secure_crypto.hpp`, `common/elgamal.hpp`, and `tests/security_tests.cpp`.
 
 ## Concurrency and resource control
@@ -76,6 +91,13 @@ size.
 - Concurrent output writes: disjoint `pwrite` offsets.
 - Incomplete destination exposure: temporary files and atomic rename.
 - Lost replication acknowledgement: idempotent replay behavior.
+- Malicious seeders: local evidence-based scoring, heavy integrity penalties, and timed
+  blacklisting.
+- Slow final pieces: duplicate endgame requests with first-valid-response selection.
+- Client crashes: durable per-piece manifests, restart-time SHA1 revalidation, and automatic
+  continuation from the missing-piece set.
+- Long-term key compromise: signed ephemeral Diffie-Hellman provides forward secrecy for past
+  piece-transfer sessions.
 
 ## External resources
 

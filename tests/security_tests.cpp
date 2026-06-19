@@ -34,5 +34,15 @@ int main() {
     assert(receiver.verify(digest, signature, receiver.publicHex()));
     assert(!receiver.verify(sha256("tampered transcript"), signature, receiver.publicHex()));
 
+    ElGamalKey firstParty;
+    ElGamalKey secondParty;
+    std::string firstPrivate, firstPublic, secondPrivate, secondPublic;
+    std::string firstSecret, secondSecret;
+    assert(firstParty.generateEphemeral(firstPrivate, firstPublic));
+    assert(secondParty.generateEphemeral(secondPrivate, secondPublic));
+    assert(firstParty.deriveEphemeralSecret(firstPrivate, secondPublic, firstSecret));
+    assert(secondParty.deriveEphemeralSecret(secondPrivate, firstPublic, secondSecret));
+    assert(firstSecret == secondSecret);
+
     std::cout << "security tests passed\n";
 }

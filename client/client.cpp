@@ -4,11 +4,16 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <ctime>
 #include <fcntl.h>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -27,6 +32,7 @@ struct LocalFile {
     std::string fullHash;
     std::string capability;
     std::vector<std::string> pieceHashes;
+    std::vector<unsigned char> available;
 };
 
 struct PeerInfo {
@@ -41,6 +47,38 @@ struct DownloadStatus {
     std::size_t total = 0;
     std::atomic<bool> finished{false};
     std::atomic<bool> failed{false};
+    std::atomic<std::size_t> duplicateRequests{0};
+    std::atomic<std::size_t> integrityFailures{0};
+    std::atomic<std::size_t> rarePieces{0};
+    std::atomic<std::size_t> resumedPieces{0};
+};
+
+struct PeerReputation {
+    u64 successes = 0;
+    u64 networkFailures = 0;
+    u64 authenticationFailures = 0;
+    u64 integrityFailures = 0;
+    u64 bytes = 0;
+    double transferSeconds = 0.0;
+    std::time_t blacklistedUntil = 0;
+};
+
+struct ResumeState {
+    std::mutex mutex;
+    std::string manifestPath;
+    std::string temporaryPath;
+    std::string group;
+    std::string name;
+    LocalFile metadata;
+    std::vector<unsigned char> verified;
+};
+
+enum class TransferResult {
+    Success,
+    NetworkFailure,
+    AuthenticationFailure,
+    IntegrityFailure,
+    Unavailable
 };
 
 static std::mutex sharedMutex;
@@ -52,10 +90,136 @@ static std::size_t preferredTracker = 0;
 static std::mutex trackerMutex;
 static u64 sessionId = 0;
 static Endpoint peerEndpoint;
-static std::atomic<u64> temporarySequence{1};
 static ElGamalKey peerKey;
 static std::mutex replayMutex;
 static std::unordered_map<std::string, std::time_t> seenNonces;
+static std::mutex reputationMutex;
+static std::unordered_map<std::string, PeerReputation> reputations;
+
+static std::string joinHashes(const std::vector<std::string> &hashes);
+
+static bool saveResumeLocked(const ResumeState &resume) {
+    std::string temporaryManifest = resume.manifestPath + ".tmp";
+    std::ofstream output(temporaryManifest, std::ios::trunc);
+    if (!output) return false;
+    output << "P2PRESUME1\n"
+           << hexEncode(resume.group) << '\n'
+           << hexEncode(resume.name) << '\n'
+           << resume.metadata.size << '\n'
+           << resume.metadata.fullHash << '\n'
+           << resume.metadata.capability << '\n'
+           << joinHashes(resume.metadata.pieceHashes) << '\n';
+    for (unsigned char piece : resume.verified) output << (piece ? '1' : '0');
+    output << '\n' << hexEncode(resume.temporaryPath) << '\n';
+    output.flush();
+    if (!output) return false;
+    output.close();
+    chmod(temporaryManifest.c_str(), 0600);
+    if (rename(temporaryManifest.c_str(), resume.manifestPath.c_str()) != 0) return false;
+    chmod(resume.manifestPath.c_str(), 0600);
+    return true;
+}
+
+static bool loadResume(const std::string &manifestPath, const std::string &group,
+                       const std::string &name, const LocalFile &metadata,
+                       std::string &temporaryPath, std::vector<unsigned char> &verified) {
+    std::ifstream input(manifestPath);
+    std::string version, encodedGroup, encodedName, sizeText, fullHash;
+    std::string capability, hashes, bitmap, encodedTemporary;
+    if (!std::getline(input, version) || !std::getline(input, encodedGroup) ||
+        !std::getline(input, encodedName) || !std::getline(input, sizeText) ||
+        !std::getline(input, fullHash) || !std::getline(input, capability) ||
+        !std::getline(input, hashes) || !std::getline(input, bitmap) ||
+        !std::getline(input, encodedTemporary) || version != "P2PRESUME1")
+        return false;
+    std::string storedGroup, storedName;
+    u64 storedSize = 0;
+    try { storedSize = static_cast<u64>(std::stoull(sizeText)); } catch (...) { return false; }
+    if (!hexDecode(encodedGroup, storedGroup) || !hexDecode(encodedName, storedName) ||
+        !hexDecode(encodedTemporary, temporaryPath) || storedGroup != group ||
+        storedName != name || storedSize != metadata.size ||
+        fullHash != metadata.fullHash || capability != metadata.capability ||
+        hashes != joinHashes(metadata.pieceHashes) ||
+        bitmap.size() != metadata.pieceHashes.size())
+        return false;
+    verified.resize(bitmap.size());
+    for (std::size_t i = 0; i < bitmap.size(); ++i) {
+        if (bitmap[i] != '0' && bitmap[i] != '1') return false;
+        verified[i] = bitmap[i] == '1';
+    }
+    return true;
+}
+
+static bool verifyStoredPieces(int fd, const LocalFile &metadata,
+                               std::vector<unsigned char> &verified) {
+    std::vector<char> buffer(PIECE_SIZE);
+    for (std::size_t piece = 0; piece < verified.size(); ++piece) {
+        if (!verified[piece]) continue;
+        std::size_t expected = static_cast<std::size_t>(
+            std::min<u64>(PIECE_SIZE, metadata.size - static_cast<u64>(piece) * PIECE_SIZE));
+        std::size_t received = 0;
+        off_t offset = static_cast<off_t>(piece * PIECE_SIZE);
+        while (received < expected) {
+            ssize_t count = pread(fd, buffer.data() + received, expected - received,
+                                  offset + static_cast<off_t>(received));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) break;
+            received += static_cast<std::size_t>(count);
+        }
+        Sha1 hash;
+        hash.update(buffer.data(), received);
+        if (received != expected || hash.finalHex() != metadata.pieceHashes[piece])
+            verified[piece] = 0;
+    }
+    return true;
+}
+
+static std::string endpointKey(const Endpoint &endpoint) {
+    return endpoint.ip + ":" + std::to_string(endpoint.port);
+}
+
+static double reputationScore(const PeerInfo &peer) {
+    std::lock_guard<std::mutex> lock(reputationMutex);
+    const PeerReputation &reputation = reputations[endpointKey(peer.endpoint)];
+    if (reputation.blacklistedUntil > std::time(nullptr)) return -1e12;
+    double throughput = reputation.transferSeconds > 0.0
+        ? static_cast<double>(reputation.bytes) / reputation.transferSeconds / (1024.0 * 1024.0)
+        : 0.0;
+    return 100.0 + std::min(throughput, 100.0) + reputation.successes * 0.5 -
+           reputation.networkFailures * 2.0 - reputation.authenticationFailures * 25.0 -
+           reputation.integrityFailures * 40.0;
+}
+
+static bool peerBlacklisted(const PeerInfo &peer) {
+    std::lock_guard<std::mutex> lock(reputationMutex);
+    return reputations[endpointKey(peer.endpoint)].blacklistedUntil > std::time(nullptr);
+}
+
+static void recordPeerResult(const PeerInfo &peer, TransferResult result,
+                             std::size_t bytes = 0, double seconds = 0.0) {
+    std::lock_guard<std::mutex> lock(reputationMutex);
+    PeerReputation &reputation = reputations[endpointKey(peer.endpoint)];
+    switch (result) {
+        case TransferResult::Success:
+            ++reputation.successes;
+            reputation.bytes += bytes;
+            reputation.transferSeconds += seconds;
+            break;
+        case TransferResult::NetworkFailure:
+            ++reputation.networkFailures;
+            break;
+        case TransferResult::AuthenticationFailure:
+            ++reputation.authenticationFailures;
+            break;
+        case TransferResult::IntegrityFailure:
+            ++reputation.integrityFailures;
+            break;
+        case TransferResult::Unavailable:
+            break;
+    }
+    if (reputation.authenticationFailures + reputation.integrityFailures >= 3)
+        reputation.blacklistedUntil = std::time(nullptr) + 300;
+}
 
 static std::string keyFor(const std::string &group, const std::string &name) {
     return group + '\n' + name;
@@ -165,19 +329,24 @@ static std::string uploadCommand(const std::string &group, const std::string &na
 }
 
 static void peerConnection(int fd) {
-    std::string request;
-    if (!receiveFrame(fd, request)) {
+    timeval timeout{};
+    timeout.tv_sec = 8;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    std::string hello;
+    if (!receiveFrame(fd, hello)) {
         close(fd);
         return;
     }
-    std::vector<std::string> fields = split(request, '|');
-    if (fields.size() != 8 || fields[0] != "20") {
+    std::vector<std::string> helloFields = split(hello, '|');
+    if (helloFields.size() != 7 || helloFields[0] != "20") {
         sendFrame(fd, "60|malformed");
         close(fd);
         return;
     }
     std::time_t timestamp = 0;
-    try { timestamp = static_cast<std::time_t>(std::stoll(fields[1])); }
+    try { timestamp = static_cast<std::time_t>(std::stoll(helloFields[1])); }
     catch (...) { sendFrame(fd, "60|timestamp"); close(fd); return; }
     std::time_t now = std::time(nullptr);
     if (timestamp < now - 60 || timestamp > now + 60) {
@@ -185,29 +354,59 @@ static void peerConnection(int fd) {
         close(fd);
         return;
     }
-    std::string clientNonce, requestIv, requestCipher, requestTag;
-    if (!hexDecode(fields[2], clientNonce) || clientNonce.size() != 16 ||
-        !hexDecode(fields[5], requestIv) || requestIv.size() != 16 ||
-        !hexDecode(fields[6], requestCipher) || !hexDecode(fields[7], requestTag)) {
+    std::string clientNonce;
+    if (!hexDecode(helloFields[2], clientNonce) || clientNonce.size() != 16) {
         sendFrame(fd, "60|encoding"); close(fd); return;
+    }
+    std::string helloHeader = helloFields[0] + "|" + helloFields[1] + "|" + helloFields[2] +
+                              "|" + helloFields[3] + "|" + helloFields[4];
+    if (!peerKey.verify(sha256(helloHeader), {helloFields[5], helloFields[6]},
+                        helloFields[4])) {
+        sendFrame(fd, "60|signature"); close(fd); return;
     }
     {
         std::lock_guard<std::mutex> lock(replayMutex);
         for (auto it = seenNonces.begin(); it != seenNonces.end();) {
             if (it->second < now - 120) it = seenNonces.erase(it); else ++it;
         }
-        if (seenNonces.count(fields[2])) {
+        if (seenNonces.count(helloFields[2])) {
             sendFrame(fd, "60|replay"); close(fd); return;
         }
+        seenNonces[helloFields[2]] = timestamp;
     }
-    std::string sessionKey;
-    if (!peerKey.decrypt({fields[3], fields[4]}, sessionKey, 32)) {
+
+    std::string serverPrivate, serverEphemeral, serverNonce = randomBytes(16), sharedSecret;
+    if (serverNonce.empty() ||
+        !peerKey.generateEphemeral(serverPrivate, serverEphemeral) ||
+        !peerKey.deriveEphemeralSecret(serverPrivate, helloFields[3], sharedSecret)) {
         sendFrame(fd, "60|key"); close(fd); return;
     }
+    std::string transcript = helloHeader + "|" + hexEncode(serverNonce) + "|" +
+                             serverEphemeral + "|" + peerKey.publicHex();
+    ElGamalSignature serverProof = peerKey.sign(sha256(transcript));
+    std::string helloResponse = "25|" + hexEncode(serverNonce) + "|" + serverEphemeral + "|" +
+                                peerKey.publicHex() + "|" + serverProof.r + "|" + serverProof.s;
+    if (!sendFrame(fd, helloResponse)) { close(fd); return; }
+
+    // Ephemeral private material is no longer needed after deriving the shared secret.
+    secureErase(serverPrivate);
+    std::string sessionKey = sha256(sharedSecret + transcript);
+    secureErase(sharedSecret);
     std::string encryptionKey = sha256(sessionKey + "ENC");
     std::string macKey = sha256(sessionKey + "MAC");
-    std::string authenticated = fields[0]+"|"+fields[1]+"|"+fields[2]+"|"+fields[3]+"|"+
-                                fields[4]+"|"+fields[5]+"|"+fields[6];
+
+    std::string request;
+    if (!receiveFrame(fd, request)) { close(fd); return; }
+    std::vector<std::string> fields = split(request, '|');
+    if (fields.size() != 4 || fields[0] != "21") {
+        sendFrame(fd, "60|request"); close(fd); return;
+    }
+    std::string requestIv, requestCipher, requestTag;
+    if (!hexDecode(fields[1], requestIv) || requestIv.size() != 16 ||
+        !hexDecode(fields[2], requestCipher) || !hexDecode(fields[3], requestTag)) {
+        sendFrame(fd, "60|encoding"); close(fd); return;
+    }
+    std::string authenticated = fields[0] + "|" + fields[1] + "|" + fields[2];
     if (!constantTimeEqual(hmacSha256(macKey, authenticated), requestTag)) {
         sendFrame(fd, "60|hmac"); close(fd); return;
     }
@@ -216,24 +415,21 @@ static void peerConnection(int fd) {
         sendFrame(fd, "60|decrypt"); close(fd); return;
     }
     std::vector<std::string> requestParts = split(requestPlain, '\n');
-    if (requestParts.size() != 4) { sendFrame(fd, "60|request"); close(fd); return; }
-    std::string group = requestParts[0], name = requestParts[1], capability = requestParts[3];
+    if (requestParts.size() != 5) { sendFrame(fd, "60|request"); close(fd); return; }
+    std::string operation = requestParts[0], group = requestParts[1];
+    std::string name = requestParts[2], capability = requestParts[4];
     std::size_t pieceIndex = 0;
-    try { pieceIndex = static_cast<std::size_t>(std::stoull(requestParts[2])); }
+    try { pieceIndex = static_cast<std::size_t>(std::stoull(requestParts[3])); }
     catch (...) { sendFrame(fd, "60|piece"); close(fd); return; }
-    {
-        std::lock_guard<std::mutex> lock(replayMutex);
-        if (!seenNonces.emplace(fields[2], timestamp).second) {
-            sendFrame(fd, "60|replay"); close(fd); return;
-        }
-    }
     LocalFile file;
     bool found = false;
     {
         std::lock_guard<std::mutex> lock(sharedMutex);
         auto it = sharedFiles.find(keyFor(group, name));
-        if (it != sharedFiles.end() && pieceIndex < it->second.pieceHashes.size() &&
-            constantTimeEqual(it->second.capability, capability)) {
+        if (it != sharedFiles.end() && constantTimeEqual(it->second.capability, capability) &&
+            (operation == "BITMAP" ||
+             (operation == "GET" && pieceIndex < it->second.pieceHashes.size() &&
+              pieceIndex < it->second.available.size() && it->second.available[pieceIndex]))) {
             file = it->second;
             found = true;
         }
@@ -244,33 +440,45 @@ static void peerConnection(int fd) {
         return;
     }
 
-    std::size_t expected = static_cast<std::size_t>(
-        std::min<u64>(PIECE_SIZE, file.size - static_cast<u64>(pieceIndex) * PIECE_SIZE));
-    std::string piece(expected, '\0');
-    int fileFd = open(file.path.c_str(), O_RDONLY);
-    if (fileFd < 0) {
-        sendFrame(fd, std::string(1, '\1') + "file open failed");
+    std::string responsePlain;
+    if (operation == "BITMAP") {
+        responsePlain.assign(file.available.begin(), file.available.end());
+    } else if (operation == "GET") {
+        std::size_t expected = static_cast<std::size_t>(
+            std::min<u64>(PIECE_SIZE, file.size - static_cast<u64>(pieceIndex) * PIECE_SIZE));
+        responsePlain.assign(expected, '\0');
+        int fileFd = open(file.path.c_str(), O_RDONLY);
+        if (fileFd < 0) {
+            sendFrame(fd, "60|open");
+            close(fd);
+            return;
+        }
+        std::size_t received = 0;
+        off_t offset = static_cast<off_t>(pieceIndex * PIECE_SIZE);
+        while (received < expected) {
+            ssize_t count = pread(fileFd, &responsePlain[received], expected - received,
+                                  offset + static_cast<off_t>(received));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) break;
+            received += static_cast<std::size_t>(count);
+        }
+        close(fileFd);
+        if (received != expected) {
+            sendFrame(fd, "60|read");
+            close(fd);
+            return;
+        }
+    } else {
+        sendFrame(fd, "60|operation");
         close(fd);
         return;
     }
-    std::size_t received = 0;
-    off_t offset = static_cast<off_t>(pieceIndex * PIECE_SIZE);
-    while (received < expected) {
-        ssize_t count = pread(fileFd, &piece[received], expected - received,
-                              offset + static_cast<off_t>(received));
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) break;
-        received += static_cast<std::size_t>(count);
-    }
-    close(fileFd);
-    if (received != expected) {
-        sendFrame(fd, "60|read");
-    } else {
-        std::string serverNonce = randomBytes(16), responseIv = randomBytes(16);
-        std::string responseCipher = aes256CbcEncrypt(encryptionKey, responseIv, piece);
+    {
+        std::string responseNonce = randomBytes(16), responseIv = randomBytes(16);
+        std::string responseCipher = aes256CbcEncrypt(encryptionKey, responseIv, responsePlain);
         ElGamalSignature signature = peerKey.sign(
-            sha256(fields[2] + "|" + hexEncode(serverNonce) + "|" + sha256(responseCipher)));
-        std::string responseHeader = "30|" + hexEncode(serverNonce) + "|" + signature.r + "|" +
+            sha256(helloFields[2] + "|" + hexEncode(responseNonce) + "|" + sha256(responseCipher)));
+        std::string responseHeader = "30|" + hexEncode(responseNonce) + "|" + signature.r + "|" +
                                      signature.s + "|" + hexEncode(responseIv) + "|" +
                                      hexEncode(responseCipher);
         sendFrame(fd, responseHeader + "|" + hexEncode(hmacSha256(macKey, responseHeader)));
@@ -295,53 +503,155 @@ static void peerServer() {
     close(listener);
 }
 
-static bool fetchPiece(const PeerInfo &peer, const std::string &group, const std::string &name,
-                       const std::string &capability, std::size_t index,
-                       const std::string &expectedHash, int outputFd) {
+static TransferResult securePeerRequest(const PeerInfo &peer, const std::string &plain,
+                                        std::string &responsePlain, double &seconds) {
+    auto started = std::chrono::steady_clock::now();
     int fd = connectTcp(peer.endpoint.ip, peer.endpoint.port);
-    if (fd < 0) return false;
-    std::string sessionKey = randomBytes(32), clientNonce = randomBytes(16), iv = randomBytes(16);
-    if (sessionKey.empty() || clientNonce.empty() || iv.empty()) { close(fd); return false; }
-    ElGamalCipher encryptedKey = peerKey.encrypt(sessionKey, peer.publicKey);
-    if (encryptedKey.c1.empty() || encryptedKey.c2.empty()) { close(fd); return false; }
+    if (fd < 0) return TransferResult::NetworkFailure;
+    std::string clientPrivate, clientEphemeral, clientNonce = randomBytes(16);
+    if (clientNonce.empty() ||
+        !peerKey.generateEphemeral(clientPrivate, clientEphemeral)) {
+        close(fd);
+        return TransferResult::NetworkFailure;
+    }
+    std::string helloHeader = "20|" + std::to_string(std::time(nullptr)) + "|" +
+                              hexEncode(clientNonce) + "|" + clientEphemeral + "|" +
+                              peerKey.publicHex();
+    ElGamalSignature clientProof = peerKey.sign(sha256(helloHeader));
+    std::string hello = helloHeader + "|" + clientProof.r + "|" + clientProof.s;
+    std::string helloResponse;
+    if (!sendFrame(fd, hello) || !receiveFrame(fd, helloResponse)) {
+        close(fd);
+        return TransferResult::NetworkFailure;
+    }
+    std::vector<std::string> helloFields = split(helloResponse, '|');
+    if (helloFields.size() != 6 || helloFields[0] != "25" ||
+        helloFields[3] != peer.publicKey) {
+        close(fd);
+        return TransferResult::AuthenticationFailure;
+    }
+    std::string serverNonce;
+    if (!hexDecode(helloFields[1], serverNonce) || serverNonce.size() != 16) {
+        close(fd);
+        return TransferResult::AuthenticationFailure;
+    }
+    std::string transcript = helloHeader + "|" + helloFields[1] + "|" +
+                             helloFields[2] + "|" + helloFields[3];
+    if (!peerKey.verify(sha256(transcript), {helloFields[4], helloFields[5]},
+                        peer.publicKey)) {
+        close(fd);
+        return TransferResult::AuthenticationFailure;
+    }
+    std::string sharedSecret;
+    if (!peerKey.deriveEphemeralSecret(clientPrivate, helloFields[2], sharedSecret)) {
+        close(fd);
+        return TransferResult::AuthenticationFailure;
+    }
+    secureErase(clientPrivate);
+    std::string sessionKey = sha256(sharedSecret + transcript);
+    secureErase(sharedSecret);
     std::string encryptionKey = sha256(sessionKey + "ENC");
     std::string macKey = sha256(sessionKey + "MAC");
-    std::string plain = group + "\n" + name + "\n" + std::to_string(index) + "\n" + capability;
+    std::string iv = randomBytes(16);
+    if (iv.empty()) { close(fd); return TransferResult::NetworkFailure; }
     std::string cipher = aes256CbcEncrypt(encryptionKey, iv, plain);
-    std::string requestHeader = "20|" + std::to_string(std::time(nullptr)) + "|" +
-                                hexEncode(clientNonce) + "|" + encryptedKey.c1 + "|" +
-                                encryptedKey.c2 + "|" + hexEncode(iv) + "|" + hexEncode(cipher);
+    std::string requestHeader = "21|" + hexEncode(iv) + "|" + hexEncode(cipher);
     std::string request = requestHeader + "|" + hexEncode(hmacSha256(macKey, requestHeader));
     std::string response;
     bool ok = sendFrame(fd, request) && receiveFrame(fd, response);
     close(fd);
+    seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (!ok) return TransferResult::NetworkFailure;
     std::vector<std::string> fields = split(response, '|');
-    if (!ok || fields.size() != 7 || fields[0] != "30") return false;
-    std::string serverNonce, responseIv, responseCipher, responseTag;
-    if (!hexDecode(fields[1], serverNonce) || serverNonce.size()!=16 ||
+    if (fields.size() >= 2 && fields[0] == "60") {
+        if (fields[1] == "unauthorized" || fields[1] == "hmac" || fields[1] == "key" ||
+            fields[1] == "replay" || fields[1] == "stale" || fields[1] == "signature")
+            return TransferResult::AuthenticationFailure;
+        return TransferResult::Unavailable;
+    }
+    if (fields.size() != 7 || fields[0] != "30")
+        return TransferResult::AuthenticationFailure;
+    std::string responseNonce, responseIv, responseCipher, responseTag;
+    if (!hexDecode(fields[1], responseNonce) || responseNonce.size()!=16 ||
         !hexDecode(fields[4], responseIv) || responseIv.size()!=16 ||
-        !hexDecode(fields[5], responseCipher) || !hexDecode(fields[6], responseTag)) return false;
+        !hexDecode(fields[5], responseCipher) || !hexDecode(fields[6], responseTag))
+        return TransferResult::AuthenticationFailure;
     std::string responseHeader = fields[0]+"|"+fields[1]+"|"+fields[2]+"|"+fields[3]+"|"+fields[4]+"|"+fields[5];
-    if (!constantTimeEqual(hmacSha256(macKey, responseHeader), responseTag)) return false;
+    if (!constantTimeEqual(hmacSha256(macKey, responseHeader), responseTag))
+        return TransferResult::AuthenticationFailure;
     if (!peerKey.verify(sha256(hexEncode(clientNonce)+"|"+fields[1]+"|"+sha256(responseCipher)),
-                        {fields[2], fields[3]}, peer.publicKey)) return false;
-    std::string piece;
-    if (!aes256CbcDecrypt(encryptionKey, responseIv, responseCipher, piece)) return false;
+                        {fields[2], fields[3]}, peer.publicKey))
+        return TransferResult::AuthenticationFailure;
+    if (!aes256CbcDecrypt(encryptionKey, responseIv, responseCipher, responsePlain))
+        return TransferResult::AuthenticationFailure;
+    return TransferResult::Success;
+}
+
+static TransferResult fetchPieceData(const PeerInfo &peer, const std::string &group,
+                                     const std::string &name, const std::string &capability,
+                                     std::size_t index, const std::string &expectedHash,
+                                     std::string &piece) {
+    double seconds = 0.0;
+    TransferResult result = securePeerRequest(
+        peer, "GET\n" + group + "\n" + name + "\n" + std::to_string(index) + "\n" + capability,
+        piece, seconds);
+    if (result != TransferResult::Success) {
+        recordPeerResult(peer, result);
+        return result;
+    }
     const char *data = piece.data();
     std::size_t length = piece.size();
     Sha1 pieceHash;
     pieceHash.update(data, length);
-    if (pieceHash.finalHex() != expectedHash) return false;
+    if (pieceHash.finalHex() != expectedHash) {
+        recordPeerResult(peer, TransferResult::IntegrityFailure);
+        return TransferResult::IntegrityFailure;
+    }
 
+    recordPeerResult(peer, TransferResult::Success, length, seconds);
+    return TransferResult::Success;
+}
+
+static bool writePiece(int outputFd, std::size_t index, const std::string &piece) {
     std::size_t written = 0;
     off_t offset = static_cast<off_t>(index * PIECE_SIZE);
-    while (written < length) {
-        ssize_t count = pwrite(outputFd, data + written, length - written,
+    while (written < piece.size()) {
+        ssize_t count = pwrite(outputFd, piece.data() + written, piece.size() - written,
                                offset + static_cast<off_t>(written));
         if (count < 0 && errno == EINTR) continue;
         if (count <= 0) return false;
         written += static_cast<std::size_t>(count);
     }
+    return true;
+}
+
+static TransferResult fetchPiece(const PeerInfo &peer, const std::string &group,
+                                 const std::string &name, const std::string &capability,
+                                 std::size_t index, const std::string &expectedHash,
+                                 int outputFd) {
+    std::string piece;
+    TransferResult result = fetchPieceData(
+        peer, group, name, capability, index, expectedHash, piece);
+    if (result == TransferResult::Success && !writePiece(outputFd, index, piece))
+        return TransferResult::NetworkFailure;
+    return result;
+}
+
+static bool fetchBitmap(const PeerInfo &peer, const std::string &group,
+                        const std::string &name, const std::string &capability,
+                        std::size_t pieceCount, std::vector<unsigned char> &bitmap) {
+    std::string response;
+    double seconds = 0.0;
+    TransferResult result = securePeerRequest(
+        peer, "BITMAP\n" + group + "\n" + name + "\n0\n" + capability, response, seconds);
+    if (result != TransferResult::Success || response.size() != pieceCount) {
+        recordPeerResult(peer, result == TransferResult::Success
+                                  ? TransferResult::AuthenticationFailure : result);
+        return false;
+    }
+    bitmap.assign(response.begin(), response.end());
+    for (unsigned char &piece : bitmap) piece = piece ? 1 : 0;
+    recordPeerResult(peer, TransferResult::Success, 0, seconds);
     return true;
 }
 
@@ -351,34 +661,139 @@ static void downloadFile(std::string group, std::string name, std::string destin
     struct stat info{};
     if (stat(destination.c_str(), &info) == 0 && S_ISDIR(info.st_mode))
         destination += (destination.back() == '/' ? "" : "/") + name;
-    std::string temporary = destination + ".part." + std::to_string(getpid()) + "." +
-                            std::to_string(temporarySequence.fetch_add(1));
-    int output = open(temporary.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+    std::string manifestPath = destination + ".resume";
+    std::string temporary = destination + ".part";
+    std::vector<unsigned char> resumedPieces;
+    std::string storedTemporary;
+    bool resuming = loadResume(manifestPath, group, name, metadata,
+                               storedTemporary, resumedPieces) &&
+                    storedTemporary == temporary;
+    struct stat partialInfo{};
+    resuming = resuming && stat(temporary.c_str(), &partialInfo) == 0 &&
+               S_ISREG(partialInfo.st_mode) &&
+               static_cast<u64>(partialInfo.st_size) == metadata.size;
+    int output = open(temporary.c_str(), O_CREAT | O_RDWR | (resuming ? 0 : O_TRUNC), 0600);
     if (output < 0 || ftruncate(output, static_cast<off_t>(metadata.size)) < 0) {
         if (output >= 0) close(output);
-        unlink(temporary.c_str());
         status->failed = true;
         status->finished = true;
         return;
     }
 
-    std::atomic<std::size_t> nextPiece{0};
+    const std::size_t pieceCount = metadata.pieceHashes.size();
+    if (!resuming) resumedPieces.assign(pieceCount, 0);
+    verifyStoredPieces(output, metadata, resumedPieces);
+    status->completed = static_cast<std::size_t>(
+        std::count(resumedPieces.begin(), resumedPieces.end(), static_cast<unsigned char>(1)));
+    status->resumedPieces = status->completed.load();
+    auto resume = std::make_shared<ResumeState>();
+    resume->manifestPath = manifestPath;
+    resume->temporaryPath = temporary;
+    resume->group = group;
+    resume->name = name;
+    resume->metadata = metadata;
+    resume->verified = resumedPieces;
+    {
+        std::lock_guard<std::mutex> lock(resume->mutex);
+        if (!saveResumeLocked(*resume)) {
+            close(output);
+            status->failed = true;
+            status->finished = true;
+            return;
+        }
+    }
+
+    std::vector<std::vector<unsigned char>> peerBitmaps(peers.size());
+    for (std::size_t peer = 0; peer < peers.size(); ++peer)
+        fetchBitmap(peers[peer], group, name, metadata.capability, pieceCount, peerBitmaps[peer]);
+
+    std::vector<std::size_t> rarity(pieceCount, 0);
+    for (const auto &bitmap : peerBitmaps)
+        for (std::size_t piece = 0; piece < std::min(pieceCount, bitmap.size()); ++piece)
+            rarity[piece] += bitmap[piece] != 0;
+    if (!rarity.empty()) {
+        std::size_t minimum = *std::min_element(rarity.begin(), rarity.end());
+        status->rarePieces = static_cast<std::size_t>(
+            std::count(rarity.begin(), rarity.end(), minimum));
+    }
+
+    std::vector<std::size_t> order;
+    for (std::size_t piece = 0; piece < pieceCount; ++piece)
+        if (!resumedPieces[piece]) order.push_back(piece);
+    std::sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+        if (rarity[left] != rarity[right]) return rarity[left] < rarity[right];
+        return left < right;
+    });
+
+    LocalFile partial = metadata;
+    partial.path = temporary;
+    partial.available = resumedPieces;
+    {
+        std::lock_guard<std::mutex> lock(sharedMutex);
+        sharedFiles[keyFor(group, name)] = partial;
+    }
+    std::string partialRegistration;
+    trackerRequest(uploadCommand(group, name, partial), partialRegistration);
+
+    auto candidatesFor = [&](std::size_t piece) {
+        std::vector<std::size_t> candidates;
+        for (std::size_t peer = 0; peer < peers.size(); ++peer)
+            if (piece < peerBitmaps[peer].size() && peerBitmaps[peer][piece] &&
+                !peerBlacklisted(peers[peer]))
+                candidates.push_back(peer);
+        std::sort(candidates.begin(), candidates.end(), [&](std::size_t left, std::size_t right) {
+            return reputationScore(peers[left]) > reputationScore(peers[right]);
+        });
+        if (candidates.size() > 1 &&
+            std::abs(reputationScore(peers[candidates.front()]) -
+                     reputationScore(peers[candidates.back()])) < 1.0)
+            std::rotate(candidates.begin(),
+                        candidates.begin() + static_cast<std::ptrdiff_t>(piece % candidates.size()),
+                        candidates.end());
+        return candidates;
+    };
+
+    auto markAvailable = [&](std::size_t piece) {
+        fsync(output);
+        {
+            std::lock_guard<std::mutex> lock(resume->mutex);
+            if (piece < resume->verified.size()) resume->verified[piece] = 1;
+            saveResumeLocked(*resume);
+        }
+        {
+            std::lock_guard<std::mutex> lock(sharedMutex);
+            auto it = sharedFiles.find(keyFor(group, name));
+            if (it != sharedFiles.end() && piece < it->second.available.size())
+                it->second.available[piece] = 1;
+        }
+    };
+
     std::atomic<bool> failure{false};
-    std::size_t workerCount = std::min<std::size_t>(
-        8, std::max<std::size_t>(1, std::min(peers.size(), metadata.pieceHashes.size())));
+    const std::size_t missingCount = order.size();
+    const std::size_t endgameCount = std::min<std::size_t>(3, missingCount);
+    const std::size_t normalCount = missingCount - endgameCount;
+    std::atomic<std::size_t> nextOrder{0};
+    std::size_t workerCount = normalCount == 0 ? 0 : std::min<std::size_t>(
+        8, std::max<std::size_t>(1, std::min(peers.size(), normalCount)));
     std::vector<std::thread> workers;
     for (std::size_t worker = 0; worker < workerCount; ++worker) {
-        workers.emplace_back([&, worker] {
+        workers.emplace_back([&] {
             for (;;) {
-                std::size_t piece = nextPiece.fetch_add(1);
-                if (piece >= metadata.pieceHashes.size()) break;
+                std::size_t position = nextOrder.fetch_add(1);
+                if (position >= normalCount) break;
+                std::size_t piece = order[position];
                 bool obtained = false;
-                for (int round = 0; round < 3 && !obtained; ++round) {
-                    for (std::size_t attempt = 0; attempt < peers.size(); ++attempt) {
-                        const PeerInfo &peer = peers[(piece + worker + attempt) % peers.size()];
-                        if (fetchPiece(peer, group, name, metadata.capability, piece,
-                                       metadata.pieceHashes[piece], output)) {
+                for (int round = 0; round < 2 && !obtained; ++round) {
+                    std::vector<std::size_t> candidates = candidatesFor(piece);
+                    for (std::size_t peer : candidates) {
+                        TransferResult result = fetchPiece(
+                            peers[peer], group, name, metadata.capability, piece,
+                            metadata.pieceHashes[piece], output);
+                        if (result == TransferResult::IntegrityFailure)
+                            ++status->integrityFailures;
+                        if (result == TransferResult::Success) {
                             obtained = true;
+                            markAvailable(piece);
                             ++status->completed;
                             break;
                         }
@@ -390,6 +805,63 @@ static void downloadFile(std::string group, std::string name, std::string destin
         });
     }
     for (auto &worker : workers) worker.join();
+
+    // Endgame mode duplicates the final few requests across the two best peers. The first
+    // verified response wins, reducing tail latency from one slow or disconnected seeder.
+    for (std::size_t position = normalCount; position < missingCount; ++position) {
+        std::size_t piece = order[position];
+        std::vector<std::size_t> candidates = candidatesFor(piece);
+        if (candidates.empty()) {
+            failure = true;
+            continue;
+        }
+        std::size_t requestCount = std::min<std::size_t>(2, candidates.size());
+        if (requestCount > 1) status->duplicateRequests += requestCount - 1;
+        struct EndgameState {
+            std::mutex mutex;
+            std::condition_variable condition;
+            std::size_t completed = 0;
+            bool won = false;
+            std::string piece;
+        };
+        auto endgame = std::make_shared<EndgameState>();
+        for (std::size_t request = 0; request < requestCount; ++request) {
+            PeerInfo peer = peers[candidates[request]];
+            std::string groupCopy = group, nameCopy = name;
+            std::string capabilityCopy = metadata.capability;
+            std::string expectedHash = metadata.pieceHashes[piece];
+            auto statusCopy = status;
+            std::thread([endgame, peer, groupCopy, nameCopy, capabilityCopy, expectedHash,
+                         statusCopy, piece] {
+                std::string data;
+                TransferResult result = fetchPieceData(
+                    peer, groupCopy, nameCopy, capabilityCopy, piece, expectedHash, data);
+                if (result == TransferResult::IntegrityFailure)
+                    ++statusCopy->integrityFailures;
+                {
+                    std::lock_guard<std::mutex> lock(endgame->mutex);
+                    ++endgame->completed;
+                    if (result == TransferResult::Success && !endgame->won) {
+                        endgame->won = true;
+                        endgame->piece = std::move(data);
+                    }
+                }
+                endgame->condition.notify_one();
+            }).detach();
+        }
+        {
+            std::unique_lock<std::mutex> lock(endgame->mutex);
+            endgame->condition.wait(lock, [&] {
+                return endgame->won || endgame->completed == requestCount;
+            });
+            if (endgame->won && writePiece(output, piece, endgame->piece)) {
+                markAvailable(piece);
+                ++status->completed;
+            } else {
+                failure = true;
+            }
+        }
+    }
     close(output);
 
     u64 verifiedSize = 0;
@@ -398,16 +870,15 @@ static void downloadFile(std::string group, std::string name, std::string destin
     if (failure || !hashFile(temporary, verifiedSize, verifiedHash, verifiedPieces) ||
         verifiedSize != metadata.size || verifiedHash != metadata.fullHash ||
         rename(temporary.c_str(), destination.c_str()) != 0) {
-        unlink(temporary.c_str());
         status->failed = true;
     } else {
+        unlink(manifestPath.c_str());
         metadata.path = destination;
+        metadata.available.assign(pieceCount, 1);
         std::string registrationResponse;
         trackerRequest(uploadCommand(group, name, metadata), registrationResponse);
-        if (registrationResponse.rfind("OK", 0) == 0) {
-            std::lock_guard<std::mutex> lock(sharedMutex);
-            sharedFiles[keyFor(group, name)] = metadata;
-        }
+        std::lock_guard<std::mutex> lock(sharedMutex);
+        sharedFiles[keyFor(group, name)] = metadata;
     }
     status->finished = true;
 }
@@ -427,6 +898,8 @@ static std::string canonicalCommand(const std::vector<std::string> &args) {
          args[0] == "list" || args[0] == "accept" || args[0] == "upload" ||
          args[0] == "download" || args[0] == "stop" || args[0] == "show") &&
         args.size() >= 2)
+        return args[0] + "_" + args[1];
+    if (args[0] == "resume" && args.size() >= 2)
         return args[0] + "_" + args[1];
     return args[0];
 }
@@ -464,6 +937,7 @@ int main(int argc, char **argv) {
                 perror("upload file");
                 continue;
             }
+            file.available.assign(file.pieceHashes.size(), 1);
             std::string response;
             trackerRequest(uploadCommand(group, name, file), response);
             if (response.rfind("OK", 0) == 0) {
@@ -478,9 +952,10 @@ int main(int argc, char **argv) {
             }
             continue;
         }
-        if (command == "download_file") {
+        if (command == "download_file" || command == "resume_download") {
             if (args.size() < offset + 3) {
-                std::cout << "ERR usage: download_file <group> <file-name> <destination>\n";
+                std::cout << "ERR usage: " << command
+                          << " <group> <file-name> <destination>\n";
                 continue;
             }
             std::string group = args[offset], name = args[offset + 1], destination = args[offset + 2];
@@ -533,7 +1008,38 @@ int main(int argc, char **argv) {
                 std::cout << '[' << state << "] [" << status->group << "] " << status->name;
                 if (!status->finished)
                     std::cout << " (" << status->completed << '/' << status->total << " pieces)";
+                std::cout << " rare=" << status->rarePieces
+                          << " resumed=" << status->resumedPieces
+                          << " endgame-duplicates=" << status->duplicateRequests
+                          << " integrity-failures=" << status->integrityFailures;
                 std::cout << '\n';
+            }
+            continue;
+        }
+        if (command == "peer_stats" || command == "show_peers") {
+            std::lock_guard<std::mutex> lock(reputationMutex);
+            if (reputations.empty()) {
+                std::cout << "No peer observations yet\n";
+                continue;
+            }
+            for (const auto &entry : reputations) {
+                const PeerReputation &reputation = entry.second;
+                double throughput = reputation.transferSeconds > 0.0
+                    ? static_cast<double>(reputation.bytes) / reputation.transferSeconds /
+                      (1024.0 * 1024.0)
+                    : 0.0;
+                double trust = std::max(0.0, std::min(100.0,
+                    100.0 - reputation.networkFailures * 2.0 -
+                    reputation.authenticationFailures * 20.0 -
+                    reputation.integrityFailures * 30.0));
+                bool blacklisted = reputation.blacklistedUntil > std::time(nullptr);
+                std::cout << entry.first << " trust=" << std::fixed << std::setprecision(1)
+                          << trust << " speed=" << throughput << "MiB/s"
+                          << " ok=" << reputation.successes
+                          << " network=" << reputation.networkFailures
+                          << " auth=" << reputation.authenticationFailures
+                          << " corrupt=" << reputation.integrityFailures
+                          << " status=" << (blacklisted ? "BLACKLISTED" : "ACTIVE") << '\n';
             }
             continue;
         }

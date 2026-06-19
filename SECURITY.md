@@ -34,19 +34,35 @@ Every client creates a 2048-bit ElGamal identity key when it starts. Upload meta
 the seeder public key and a random 256-bit file capability with the tracker. Only authenticated
 group members receive that capability and the list of seeder public keys.
 
-### Opcode 20: authenticated request
+### Opcode 20: signed ephemeral hello
 
 The downloader creates:
 
-- a random 256-bit request session key;
 - a random 128-bit client nonce;
 - a timestamp;
-- an ElGamal encryption of the session key for the selected seeder;
-- an AES-256-CBC encryption of group, file, piece index, and capability;
-- an HMAC-SHA256 over the complete request header and ciphertext.
+- a fresh private/public Diffie-Hellman value in the 2048-bit group;
+- an ElGamal signature over the timestamp, nonce, ephemeral public value, and client identity
+  public key.
 
-The seeder rejects timestamps outside a 60-second window, malformed values, invalid HMACs,
-invalid capabilities, and repeated authenticated nonces.
+The seeder rejects timestamps outside a 60-second window, malformed signatures, and repeated
+authenticated nonces.
+
+### Opcode 25: signed ephemeral response
+
+The seeder creates its own fresh DH value and nonce, derives the shared secret, and signs the
+complete two-party handshake transcript. The downloader requires the signing key to exactly
+match the public key returned by the tracker. Both sides derive:
+
+```text
+session = SHA256(DH shared secret || signed transcript)
+```
+
+Ephemeral private values and raw shared secrets are overwritten after derivation.
+
+### Opcode 21: encrypted request
+
+After authenticating the handshake, the downloader encrypts the group, file, piece index, and
+capability using the ephemeral session and authenticates the ciphertext with HMAC-SHA256.
 
 ### Opcode 30: authenticated piece response
 
@@ -59,6 +75,28 @@ The seeder:
 
 The downloader verifies HMAC and signature before decryption, then immediately checks the
 assignment-required piece SHA-1 before writing with `pwrite`.
+
+The same authenticated channel supports `BITMAP` requests. Bitmap responses disclose only
+whether each piece has already been verified; they are encrypted, signed, and MAC-protected
+like file data. Unverified partial-file regions are never served.
+
+## Malicious peer isolation
+
+Each client maintains evidence per peer:
+
+- successful authenticated transfers;
+- measured bytes and elapsed transfer time;
+- network failures;
+- signature, HMAC, replay, and authorization failures;
+- decrypted pieces whose SHA-1 does not match tracker metadata.
+
+Scheduler preference combines trust and measured throughput. Authentication and corruption
+events are weighted heavily, and three such events blacklist the endpoint for five minutes.
+Timeouts reduce preference without immediate blacklisting. This distinction prevents an
+overloaded honest peer from being treated like a peer supplying forged data.
+
+The reputation state is local to each client, so a malicious client cannot submit arbitrary
+negative reports to globally frame another peer.
 
 ### Opcode 60: rejection
 
@@ -73,7 +111,7 @@ returns opcode 60. The server nonce is included in the signed response transcrip
 
 ## Key separation
 
-The random request secret is not used directly. SHA-256 derives independent labels:
+The ephemeral session secret is not used directly. SHA-256 derives independent labels:
 
 ```text
 encryption key = SHA256(session key || "ENC")
@@ -84,12 +122,14 @@ The protocol uses encrypt-then-MAC. Padding is checked only after the HMAC succe
 
 ## Forward secrecy
 
-This implementation does **not** claim true forward secrecy. Like the protocol in
-`security.pdf`, it encrypts a session secret under a long-term ElGamal public key. Compromise of
-the seeder private key plus recorded traffic can recover historical request session keys.
+Piece and bitmap sessions use fresh ephemeral Diffie-Hellman values authenticated by long-term
+ElGamal signatures. Long-term keys sign the exchange but do not derive its encryption key.
+Later compromise of a client's long-term signing key therefore does not reveal shared secrets
+from previously recorded sessions.
 
-True forward secrecy requires an ephemeral authenticated Diffie-Hellman exchange and secure
-erasure of ephemeral private values. That extension is intentionally not claimed here.
+This assumes secure randomness, uncompromised endpoints during the live exchange, and
+effective destruction of ephemeral process memory. It does not protect plaintext already
+stored at an endpoint or captured from a compromised process.
 
 ## Operational limitations
 
@@ -99,3 +139,5 @@ erasure of ephemeral private values. That extension is intentionally not claimed
 - AES-CBC is always paired with HMAC-SHA256; CBC ciphertext must never be accepted without
   successful MAC verification.
 - The file capability is authorization material and must not be logged or disclosed.
+- Resume manifests contain capabilities and verified-piece state, so they are atomically written
+  with mode 0600.
