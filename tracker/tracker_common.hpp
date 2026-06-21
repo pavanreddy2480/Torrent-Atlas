@@ -5,7 +5,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdio>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -55,7 +54,6 @@ class TrackerState {
     std::unordered_map<std::string, GroupInfo> groups_;
     std::atomic<u64> sequence_{1};
     u64 trackerTag_;
-    std::string statePath_;
 
     static std::string joinHashes(const std::vector<std::string> &hashes) {
         std::string result;
@@ -78,10 +76,7 @@ class TrackerState {
 
 public:
     explicit TrackerState(unsigned trackerNumber)
-        : trackerTag_(static_cast<u64>(trackerNumber & 0xffU) << 56U),
-          statePath_("tracker_state_" + std::to_string(trackerNumber) + ".dat") {
-        load();
-    }
+        : trackerTag_(static_cast<u64>(trackerNumber & 0xffU) << 56U) {}
 
     bool empty() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -182,27 +177,6 @@ public:
             groups_ = std::move(groups);
         }
         return true;
-    }
-
-    bool save() {
-        std::string snapshot = serialize();
-        std::string temporary = statePath_ + ".tmp";
-        {
-            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-            if (!output || !output.write(snapshot.data(), static_cast<std::streamsize>(snapshot.size())))
-                return false;
-            output.flush();
-            if (!output) return false;
-        }
-        return std::rename(temporary.c_str(), statePath_.c_str()) == 0;
-    }
-
-    bool load() {
-        std::ifstream input(statePath_, std::ios::binary);
-        if (!input) return true;
-        std::ostringstream contents;
-        contents << input.rdbuf();
-        return input.good() || input.eof() ? replaceFromSnapshot(contents.str()) : false;
     }
 
     HandleResult handle(u64 session, const std::string &commandLine, bool replicated) {
@@ -428,48 +402,14 @@ class SyncQueue {
     std::mutex mutex_;
     std::condition_variable condition_;
     bool stopping_ = false;
-    std::string queuePath_;
-
-    bool saveLocked() {
-        std::string temporary = queuePath_ + ".tmp";
-        {
-            std::ofstream output(temporary, std::ios::trunc);
-            if (!output) return false;
-            for (const auto &item : queue_)
-                output << item.session << ' ' << hexEncode(item.command) << '\n';
-            output.flush();
-            if (!output) return false;
-        }
-        return std::rename(temporary.c_str(), queuePath_.c_str()) == 0;
-    }
-
-    void load() {
-        std::ifstream input(queuePath_);
-        u64 session = 0;
-        std::string encoded;
-        while (input >> session >> encoded) {
-            std::string command;
-            if (!hexDecode(encoded, command)) {
-                std::cerr << "warning: invalid persisted synchronization queue\n";
-                queue_.clear();
-                return;
-            }
-            queue_.push_back({session, command});
-        }
-    }
 
 public:
-    SyncQueue(Endpoint peer, unsigned trackerNumber)
-        : peer_(std::move(peer)),
-          queuePath_("tracker_sync_" + std::to_string(trackerNumber) + ".dat") {
-        load();
-    }
+    explicit SyncQueue(Endpoint peer) : peer_(std::move(peer)) {}
 
     void enqueue(u64 session, const std::string &command) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_) return;
         queue_.push_back({session, command});
-        if (!saveLocked()) std::cerr << "warning: failed to persist synchronization queue\n";
         condition_.notify_one();
     }
 
@@ -500,7 +440,6 @@ public:
             if (delivered) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 queue_.pop_front();
-                if (!saveLocked()) std::cerr << "warning: failed to persist synchronization queue\n";
             } else {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
@@ -537,8 +476,6 @@ inline void trackerConnection(int fd, TrackerState &state, SyncQueue &sync) {
     for (std::size_t i = 3; i < fields.size(); ++i) command += "\t" + fields[i];
     bool replicated = fields[0] == "S";
     HandleResult result = state.handle(session, command, replicated);
-    if (result.shouldSync && !state.save())
-        std::cerr << "warning: failed to persist tracker state\n";
     if (!replicated && result.shouldSync) {
         // Logout removes the session locally, but the peer needs the old token to identify
         // which user's shares and session must be removed.
@@ -603,8 +540,7 @@ inline int runTracker(int argc, char **argv, unsigned defaultNumber) {
             if (sendFrame(peerFd, "X\t0\tSNAPSHOT") && receiveFrame(peerFd, snapshot) &&
                 snapshot.rfind("STATE\n", 0) == 0 &&
                 state.replaceFromSnapshot(snapshot.substr(6))) {
-                state.save();
-                std::cerr << "Recovered tracker state from peer\n";
+                std::cerr << "Recovered current in-memory state from running peer\n";
             }
             close(peerFd);
         }
@@ -614,7 +550,7 @@ inline int runTracker(int argc, char **argv, unsigned defaultNumber) {
         perror("tracker listen");
         return 1;
     }
-    SyncQueue sync(peer, number);
+    SyncQueue sync(peer);
     std::thread syncThread(&SyncQueue::run, &sync);
     std::cerr << "Tracker " << number << " listening on " << local.ip << ':' << local.port
               << ", peer " << peer.ip << ':' << peer.port << '\n';

@@ -5,17 +5,19 @@ This project implements the two-tracker, peer-to-peer file sharing system descri
 
 ## Build and execution
 
-Requirements: Linux/macOS, `g++`, POSIX sockets, pthread support, `pkg-config`, and GMP.
+Requirements: Linux/macOS, CMake 3.16+, a C++17 compiler, POSIX sockets, pthread support,
+`pkg-config`, GMP, Git, and network access during the initial FTXUI configure.
 
 On Debian/Ubuntu:
 
 ```sh
-sudo apt install g++ make pkg-config libgmp-dev
+sudo apt install g++ cmake make git pkg-config libgmp-dev
 ```
 
 ```sh
-make
-make security-test
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
 Create `tracker_info.txt` with exactly two reachable endpoints:
@@ -28,18 +30,38 @@ Create `tracker_info.txt` with exactly two reachable endpoints:
 Run the same tracker executable twice:
 
 ```sh
-./tracker/tracker tracker_info.txt 1
-./tracker/tracker tracker_info.txt 2
+./build/tracker tracker_info.txt 1
+./build/tracker tracker_info.txt 2
 ```
 
-Compatibility binaries `tracker/tracker1` and `tracker/tracker2` are also built. Enter `quit`
+Compatibility binaries `build/tracker1` and `build/tracker2` are also built. Enter `quit`
 in a tracker console for a clean shutdown.
 
 Run each client with a unique, externally reachable peer endpoint:
 
 ```sh
+./build/client 127.0.0.1:8001 tracker_info.txt
+./build/client 127.0.0.1:8002 tracker_info.txt
+```
+
+Add `--tui` to launch the interactive terminal dashboard:
+
+```sh
+./build/client 127.0.0.1:8001 tracker_info.txt --tui
+```
+
+The FTXUI dashboard displays live piece state, availability, reservations, worker assignments,
+peer trust, throughput, protocol events, and rolling speed. Arrow keys select a download and
+all detail panels follow it. Press `:` to open the command bar, `F1` for help, or `F10` to exit.
+Passwords are masked in command history. A completion or failure summary opens automatically;
+Enter or Escape returns to the dashboard. The full layout targets 120×35 and switches to a
+compact layout below that size.
+
+The original Makefile remains available for classic, non-TUI builds:
+
+```sh
+make
 ./client/client 127.0.0.1:8001 tracker_info.txt
-./client/client 127.0.0.1:8002 tracker_info.txt
 ```
 
 ## Commands
@@ -60,6 +82,7 @@ list files <group-id>
 download file <group-id> <file-name> <destination-path>
 resume download <group-id> <file-name> <destination-path>
 show downloads
+stats
 peer_stats
 show peers
 stop share <group-id> <file-name>
@@ -71,6 +94,21 @@ quit
 shows rare-piece count, endgame duplicate requests, and integrity failures. `peer_stats` and
 `show peers` display trust, throughput, failure counters, and blacklist state. A resumed
 download also reports how many pieces survived restart-time revalidation.
+
+`stats` prints a live per-download dashboard:
+
+```text
+[D] [group] archive.bin
+  progress: 84.4% (54/64 pieces, 27/32 MiB)
+  speed: 5.3 MiB/s  elapsed: 5.1s  eta: 0.9s
+  peers: 1/1 responsive, 1 requests active, 0 blacklisted
+  scheduler: rare=64 resumed=0 endgame-duplicates=0
+  reliability: retries=0 network=0 auth=0 unavailable=0 corrupt=0
+  security: crypto=2545.2ms network/wait=2431.7ms disk=45.6ms crypto-overhead=50.7%
+```
+
+The measurements are collected at the signed-DH/AES/HMAC, socket/wait, and
+`pwrite`/`fsync`/manifest boundaries rather than estimated from total runtime.
 
 ## Architecture and data structures
 
@@ -135,19 +173,19 @@ Tracker responses begin with `OK`, `ERR`, or `META`. Secure peer messages use op
 Tracker requests carry a 64-bit session token. File names are hex encoded in protocol fields,
 allowing binary-safe parsing without delimiter ambiguity.
 
-## Tracker synchronization and recovery
+## Tracker synchronization
 
 Both trackers accept all operations. Successful state-changing commands are:
 
 1. applied under the tracker-state mutex;
-2. persisted as a complete local state snapshot;
-3. appended to a persistent FIFO synchronization queue;
-4. retried in order until the peer acknowledges them.
+2. appended to an in-memory FIFO synchronization queue;
+3. retried in order until the peer acknowledges them.
 
-The queue remains intact while the other tracker is offline and survives a source-tracker
-restart. A tracker with no local state requests a complete snapshot from its online peer at
-startup. Session IDs include a tracker-specific prefix, preventing collisions between the two
-independent token generators.
+Tracker metadata is intentionally ephemeral. Stopping both trackers clears users, sessions,
+groups, files, and pending replication. If one tracker restarts while its peer remains running,
+it requests the peer's current in-memory snapshot so failover remains usable within that running
+deployment. Session IDs include a tracker-specific prefix, preventing collisions between the
+two independent token generators.
 
 Clients try their preferred tracker first and automatically fail over to the second endpoint.
 
@@ -157,8 +195,7 @@ Clients try their preferred tracker first and automatically fail over to the sec
   accepted by the interactive parser.
 - A group owner cannot leave, because owner-only request management otherwise has no defined
   successor in the specification.
-- Tracker state files are written in the process working directory. Delete
-  `tracker_state_*.dat` and `tracker_sync_*.dat` to start a completely new deployment.
+- Tracker metadata is not persisted. Restarting both trackers starts a clean deployment.
 - Contradictory writes accepted independently on both sides of a network partition do not use
   consensus. Normal ordered updates converge, but conflicting simultaneous account/group
   creation requires administrative cleanup.
@@ -181,8 +218,7 @@ Recommended functional sequence:
 4. Download to another client and compare with `sha1sum`/`shasum` and `cmp`.
 5. Start two downloads simultaneously and inspect `show downloads`.
 6. Stop one tracker and continue issuing commands through client failover.
-7. Make changes while the peer tracker is offline, restart both trackers, and verify queued
-   updates recover.
+7. Restart both trackers and verify users and groups have been cleared.
 8. Stop one seeder during a multi-peer transfer and confirm another peer supplies the piece.
 9. Corrupt a seeder's local source after upload and verify the downloader rejects its pieces.
 10. Keep one valid seeder online: verify three corrupt responses blacklist the malicious peer,
@@ -193,5 +229,7 @@ Recommended functional sequence:
     Confirm progress continues from the verified count.
 13. Modify bytes in a `.part` file before resuming and confirm the affected piece is rejected and
     fetched again.
+14. Run `stats` repeatedly during a multi-peer transfer and confirm progress, active requests,
+    throughput, ETA, failure counters, and cryptographic overhead change live.
 
 See [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md) for design rationale and algorithm details.

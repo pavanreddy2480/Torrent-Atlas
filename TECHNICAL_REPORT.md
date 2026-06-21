@@ -14,14 +14,13 @@ precision storage/arithmetic required by the manual 2048-bit ElGamal implementat
 ## Synchronization algorithm
 
 Every successful mutation is first applied under one tracker-state mutex. The resulting state is
-atomically persisted through a temporary file and `rename`. The original command and session
-token are then added to a persistent FIFO queue. A dedicated synchronization thread repeatedly
-connects to the peer tracker and removes an item only after acknowledgement.
+added with its session token to an in-memory FIFO queue. A dedicated synchronization thread
+repeatedly connects to the peer tracker and removes an item only after acknowledgement.
 
 Commands are designed to be idempotent when replayed. This matters when acknowledgement is
-lost after the peer already applied an update. If a tracker starts without local state, it requests
-a full snapshot from the other tracker. Persistent state plus persistent pending operations covers
-temporary disconnection and process restart without requiring both trackers to remain online.
+lost after the peer already applied an update. A restarting tracker requests a full in-memory
+snapshot from a peer that is still running. No tracker metadata or pending replication is written
+to disk, so stopping both trackers deliberately starts the next deployment with empty state.
 
 This is primary-primary asynchronous replication, not consensus. It preserves ordered normal
 updates but cannot automatically resolve contradictory writes independently accepted on both
@@ -82,12 +81,32 @@ Each file download uses at most eight workers, limiting descriptors and memory. 
 holds at most one roughly 512 KiB response. Hashing uses one 512 KiB buffer regardless of file
 size.
 
+## Observability
+
+Each download owns atomic counters plus a mutex-protected snapshot model. The scheduler and
+workers update that model without changing piece ordering or peer-selection decisions.
+Instrumentation records:
+
+- verified and resumed bytes, pieces, elapsed time, throughput, and ETA;
+- every piece's unavailable, available, reserved, downloading, verified, or failed state;
+- peer bitmaps, availability counts, trust, throughput, failures, and blacklist state;
+- rarest-first queue order, active reservations, and worker-to-piece assignments;
+- discovered/responsive peers, active secure requests, and protocol events;
+- retries separated into network, authentication, unavailable-piece, and corruption causes;
+- rolling speed samples and rare-piece/endgame scheduler decisions;
+- microseconds spent in signed DH/AES/HMAC, network/wait, and durable disk/manifest work.
+
+The `stats` command renders text snapshots. The CMake-built FTXUI dashboard renders the same
+state as a live piece grid, speed graph, peer table, scheduler view, worker table, and event log.
+Completion time is frozen when a download reaches `[C]` or `[F]`, and the TUI automatically
+opens an integrity or failure summary.
+
 ## Challenges and solutions
 
 - TCP partial transmission: exact-length read/write loops.
 - Corrupt data: verify each response before disk write, then verify the whole temporary file.
-- Tracker outage: endpoint failover and persistent queued replication.
-- Tracker restart: atomic state snapshots and peer snapshot recovery.
+- Tracker outage: endpoint failover and in-memory queued replication.
+- Single-tracker restart: live peer snapshot recovery.
 - Concurrent output writes: disjoint `pwrite` offsets.
 - Incomplete destination exposure: temporary files and atomic rename.
 - Lost replication acknowledgement: idempotent replay behavior.

@@ -1,10 +1,9 @@
+CMakeLists.txt
+test_piano.pdf
 client/client
 tracker/tracker1
 tracker/tracker2
 tracker/tracker
 tests/security_tests
 tests/peer_rejection_test
-tracker_state_*.dat
-tracker_state_*.dat.tmp
-tracker_sync_*.dat
-tracker_sync_*.dat.tmp
+build/
