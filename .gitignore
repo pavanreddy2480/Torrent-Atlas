@@ -1,12 +1,7 @@
+images/
+open.dmg
 CMakeLists.txt
 test_piano.pdf
-client/client
-tracker/tracker1
-tracker/tracker2
-tracker/tracker
-tests/security_tests
-tests/peer_rejection_test
-tests/tracker_state_tests
-tests/command_parser_tests
+bin/
 build/
 build-sanitize/
