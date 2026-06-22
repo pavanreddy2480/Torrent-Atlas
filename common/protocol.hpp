@@ -151,6 +151,19 @@ inline bool hexDecode(const std::string &value, std::string &result) {
     return true;
 }
 
+inline bool isHexInteger(const std::string &value,
+                         std::size_t minimumLength = 1,
+                         std::size_t maximumLength = static_cast<std::size_t>(-1)) {
+    if (value.size() < minimumLength || value.size() > maximumLength) return false;
+    for (char character : value) {
+        bool digit = character >= '0' && character <= '9';
+        bool lower = character >= 'a' && character <= 'f';
+        bool upper = character >= 'A' && character <= 'F';
+        if (!digit && !lower && !upper) return false;
+    }
+    return true;
+}
+
 inline std::vector<std::string> split(const std::string &text, char delimiter) {
     std::vector<std::string> parts;
     std::size_t begin = 0;

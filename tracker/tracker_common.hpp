@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../common/protocol.hpp"
+#include "../common/secure_crypto.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -48,12 +49,62 @@ struct HandleResult {
 };
 
 class TrackerState {
+    struct LoginThrottle {
+        unsigned failures = 0;
+        std::chrono::steady_clock::time_point lockedUntil{};
+    };
+
     std::mutex mutex_;
     std::unordered_map<std::string, std::string> users_;
     std::unordered_map<u64, std::string> sessions_;
     std::unordered_map<std::string, GroupInfo> groups_;
+    std::unordered_map<std::string, LoginThrottle> loginThrottles_;
     std::atomic<u64> sequence_{1};
     u64 trackerTag_;
+    static constexpr std::uint32_t PASSWORD_ITERATIONS = 20000;
+
+    static std::string encodePassword(const std::string &password) {
+        std::string salt = randomBytes(16);
+        if (salt.size() != 16) return {};
+        std::string digest = pbkdf2HmacSha256(
+            password, salt, PASSWORD_ITERATIONS, 32);
+        return "pbkdf2-sha256$" + std::to_string(PASSWORD_ITERATIONS) + "$" +
+               hexEncode(salt) + "$" + hexEncode(digest);
+    }
+
+    static bool verifyPassword(const std::string &password,
+                               const std::string &encoded) {
+        std::vector<std::string> fields = split(encoded, '$');
+        if (fields.size() != 4 || fields[0] != "pbkdf2-sha256") return false;
+        std::uint32_t iterations = 0;
+        try {
+            iterations = static_cast<std::uint32_t>(std::stoul(fields[1]));
+        } catch (...) {
+            return false;
+        }
+        if (iterations == 0 || iterations > 1000000) return false;
+        std::string salt, expected;
+        if (!hexDecode(fields[2], salt) || !hexDecode(fields[3], expected) ||
+            salt.size() != 16 || expected.size() != 32)
+            return false;
+        std::string actual = pbkdf2HmacSha256(
+            password, salt, iterations, expected.size());
+        bool valid = constantTimeEqual(actual, expected);
+        secureErase(actual);
+        return valid;
+    }
+
+    u64 createSessionId() {
+        for (int attempt = 0; attempt < 16; ++attempt) {
+            std::string bytes = randomBytes(sizeof(u64));
+            if (bytes.size() != sizeof(u64)) return 0;
+            u64 random = 0;
+            std::memcpy(&random, bytes.data(), sizeof(random));
+            u64 session = trackerTag_ | (random & 0x00ffffffffffffffULL);
+            if (session != 0 && !sessions_.count(session)) return session;
+        }
+        return 0;
+    }
 
     static std::string joinHashes(const std::vector<std::string> &hashes) {
         std::string result;
@@ -196,10 +247,15 @@ public:
             input >> name >> password;
             if (name.empty() || password.empty()) return {"ERR usage: create_user <user> <password>", session, false};
             if (users_.count(name)) {
-                if (replicated && users_[name] == password) return {"OK already replicated", session, false};
+                if (replicated && verifyPassword(password, users_[name]))
+                    return {"OK already replicated", session, false};
                 return {"ERR user already exists", session, false};
             }
-            users_[name] = password;
+            std::string encoded = encodePassword(password);
+            secureErase(password);
+            if (encoded.empty())
+                return {"ERR secure random generation failed", session, false};
+            users_[name] = std::move(encoded);
             return {"OK user created", session, true};
         }
         if (command == "login") {
@@ -210,10 +266,27 @@ public:
                 return {"ERR logout before logging in again", session, false};
             }
             if (!users_.count(name)) return {"ERR no such user", session, false};
-            if (users_[name] != password) return {"ERR invalid password", session, false};
+            LoginThrottle &throttle = loginThrottles_[name];
+            auto now = std::chrono::steady_clock::now();
+            if (throttle.lockedUntil > now) {
+                secureErase(password);
+                return {"ERR too many login attempts; try again later", session, false};
+            }
+            bool passwordValid = verifyPassword(password, users_[name]);
+            secureErase(password);
+            if (!passwordValid) {
+                if (++throttle.failures >= 5) {
+                    throttle.failures = 0;
+                    throttle.lockedUntil = now + std::chrono::seconds(30);
+                    return {"ERR too many login attempts; try again later", session, false};
+                }
+                return {"ERR invalid password", session, false};
+            }
+            loginThrottles_.erase(name);
             if (session == 0) {
-                u64 now = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
-                session = trackerTag_ | ((now ^ sequence_++) & 0x00ffffffffffffffULL);
+                session = createSessionId();
+                if (session == 0)
+                    return {"ERR secure random generation failed", 0, false};
             }
             sessions_[session] = name;
             return {"OK logged in", session, true};
@@ -310,15 +383,17 @@ public:
             int port = 0;
             input >> group >> encodedName >> size >> fullHash >> capability >> hashes >> ip >> port >> publicKey;
             std::string name;
-            std::string capabilityBytes, publicKeyBytes;
+            std::string capabilityBytes;
             if (!requireLogin()) return {"ERR login required", session, false};
             auto groupIt = groups_.find(group);
             if (groupIt == groups_.end()) return {"ERR no such group", session, false};
             if (!groupIt->second.members.count(user)) return {"ERR not a group member", session, false};
+            std::string publicKeyBytes;
             if (!hexDecode(encodedName, name) || !hexDecode(capability, capabilityBytes) ||
-                !hexDecode(publicKey, publicKeyBytes) || name.empty() || fullHash.size() != 40 ||
+                !hexDecode(publicKey, publicKeyBytes) ||
+                publicKeyBytes.size() != 32 || name.empty() || fullHash.size() != 40 ||
                 capability.size() != 64 || ip.empty() || port <= 0 ||
-                publicKey.size() < 256 || publicKey.size() > 512)
+                capabilityBytes.size() != 32)
                 return {"ERR invalid upload metadata", session, false};
             std::vector<std::string> pieceHashes = hashes == "-" ? std::vector<std::string>{} : split(hashes, ',');
             std::size_t expectedPieces = static_cast<std::size_t>((size + PIECE_SIZE - 1) / PIECE_SIZE);

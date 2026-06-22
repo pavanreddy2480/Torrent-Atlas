@@ -8,8 +8,14 @@ discovery, then transfer pieces directly between client peer servers.
 
 The implementation uses C++17 standard containers and POSIX calls: TCP sockets, `open`,
 `read`, `pread`, `pwrite`, `ftruncate`, `rename`, and threads. It does not use database,
-filesystem, process-execution, or external torrent libraries. GMP is used only for arbitrary
-precision storage/arithmetic required by the manual 2048-bit ElGamal implementation.
+filesystem, process-execution, or external torrent libraries. OpenSSL supplies the standard
+cryptographic primitives used by tracker authentication and peer transfers.
+
+Command tokenization is isolated in a reusable parser supporting quoted and escaped paths.
+Tracker passwords are represented as salted PBKDF2-HMAC-SHA256 verifiers, and tracker session
+tokens use operating-system cryptographic randomness. Repeated login failures trigger a
+temporary tracker-local lockout, and sensitive client command buffers are overwritten where
+their lifetime is under application control.
 
 ## Synchronization algorithm
 
@@ -64,12 +70,11 @@ The protocol deliberately opens short-lived connections. This simplifies failure
 avoids shared connection synchronization while still supporting concurrent transfers.
 
 Peer requests extend the security model in `security.pdf` with forward secrecy. Both peers
-generate fresh 2048-bit Diffie-Hellman values and sign the complete exchange using long-term
-ElGamal identity keys. The session is derived from the ephemeral shared secret and transcript;
-long-term keys never derive the content-encryption key. Request/response nonces provide
-freshness, AES-256-CBC protects content, and HMAC-SHA256 authenticates ciphertext before
-decryption. Manual implementations and exact primitive test vectors are in
-`common/secure_crypto.hpp`, `common/elgamal.hpp`, and `tests/security_tests.cpp`.
+generate fresh X25519 values and sign the complete exchange using persistent Ed25519 identity
+keys. HKDF-SHA256 derives a transcript-bound session key; long-term keys never derive the
+content-encryption key. Request/response nonces provide freshness, and ChaCha20-Poly1305
+provides authenticated encryption. The OpenSSL-backed implementation and primitive tests are
+in `common/peer_crypto.cpp`, `common/secure_crypto.hpp`, and `tests/security_tests.cpp`.
 
 ## Concurrency and resource control
 
@@ -80,6 +85,11 @@ history have separate mutexes. Piece indices and progress counters are atomic.
 Each file download uses at most eight workers, limiting descriptors and memory. Each worker
 holds at most one roughly 512 KiB response. Hashing uses one 512 KiB buffer regardless of file
 size.
+
+Active destination paths are reserved before metadata lookup so concurrent jobs cannot write the
+same output. The scheduler retries failed requests with bounded exponential backoff and random
+jitter. Cancellation is cooperative: workers stop between requests, the partial file and resume
+manifest remain valid, and the destination reservation is released.
 
 ## Observability
 
@@ -94,12 +104,24 @@ Instrumentation records:
 - discovered/responsive peers, active secure requests, and protocol events;
 - retries separated into network, authentication, unavailable-piece, and corruption causes;
 - rolling speed samples and rare-piece/endgame scheduler decisions;
-- microseconds spent in signed DH/AES/HMAC, network/wait, and durable disk/manifest work.
+- microseconds spent in signed X25519/AEAD, network/wait, and durable disk/manifest work.
 
 The `stats` command renders text snapshots. The CMake-built FTXUI dashboard renders the same
 state as a live piece grid, speed graph, peer table, scheduler view, worker table, and event log.
 Completion time is frozen when a download reaches `[C]` or `[F]`, and the TUI automatically
 opens an integrity or failure summary.
+
+The TUI keeps sensitive commands out of history, supports command recall for other commands,
+scrolls protocol events independently, and exposes cancellation for the selected transfer.
+
+## Automated verification
+
+CTest covers published cryptographic vectors, PBKDF2, quoted command parsing, password/session
+state behavior, live two-tracker replication, and clean state after both tracker processes
+restart. A process-level client test additionally exercises account/group setup, multi-piece
+upload, the signed ephemeral peer protocol, reconstruction, final hashing, and byte-for-byte
+output comparison. CMake optionally enables AddressSanitizer and UndefinedBehaviorSanitizer for
+every project target with `TORRENT_ENABLE_SANITIZERS=ON`.
 
 ## Challenges and solutions
 

@@ -1,9 +1,18 @@
 #include "../common/protocol.hpp"
 #include "../common/sha1.hpp"
-#include "../common/elgamal.hpp"
+#include "../common/secure_crypto.hpp"
+#include "../common/peer_crypto.hpp"
+#include "client_types.hpp"
+#include "command_utils.hpp"
+#include "download_storage.hpp"
+#include "network_utils.hpp"
+#include "telemetry.hpp"
+#include "tui_model.hpp"
+#include "tui_theme.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -32,176 +41,8 @@
 #include <ftxui/dom/elements.hpp>
 #endif
 
-struct Endpoint {
-    std::string ip;
-    int port = 0;
-};
-
-struct LocalFile {
-    std::string path;
-    u64 size = 0;
-    std::string fullHash;
-    std::string capability;
-    std::vector<std::string> pieceHashes;
-    std::vector<unsigned char> available;
-};
-
-struct PeerInfo {
-    Endpoint endpoint;
-    std::string publicKey;
-};
-
-enum class PieceState {
-    Unavailable,
-    Available,
-    Reserved,
-    Downloading,
-    Verified,
-    Failed
-};
-
-struct PeerTelemetry {
-    std::string endpoint;
-    std::vector<unsigned char> bitmap;
-    std::size_t availablePieces = 0;
-    double trust = 100.0;
-    double throughputMiB = 0.0;
-    u64 failures = 0;
-    bool blacklisted = false;
-};
-
-struct WorkerTelemetry {
-    std::size_t id = 0;
-    std::optional<std::size_t> piece;
-    std::string peer;
-    std::string state = "idle";
-    std::size_t completed = 0;
-    std::size_t failures = 0;
-    u64 bytes = 0;
-    double transferSeconds = 0.0;
-};
-
-struct DownloadTelemetry {
-    std::vector<PieceState> pieces;
-    std::vector<std::size_t> availability;
-    std::vector<std::size_t> rarestQueue;
-    std::map<std::size_t, std::vector<std::string>> reservations;
-    std::vector<PeerTelemetry> peers;
-    std::vector<WorkerTelemetry> workers;
-    std::deque<std::string> events;
-    std::deque<double> speedHistory;
-    std::string destination;
-    std::string failureReason;
-    bool integrityVerified = false;
-    std::size_t peersUsed = 0;
-    std::set<std::string> peerEndpointsUsed;
-    u64 lastSpeedBytes = 0;
-    std::chrono::steady_clock::time_point lastSpeedSample =
-        std::chrono::steady_clock::now();
-};
-
-struct DownloadStatus {
-    std::string group;
-    std::string name;
-    std::atomic<std::size_t> completed{0};
-    std::size_t total = 0;
-    std::atomic<bool> finished{false};
-    std::atomic<bool> failed{false};
-    std::atomic<std::size_t> duplicateRequests{0};
-    std::atomic<std::size_t> integrityFailures{0};
-    std::atomic<std::size_t> rarePieces{0};
-    std::atomic<std::size_t> resumedPieces{0};
-    std::atomic<u64> totalBytes{0};
-    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
-    std::atomic<u64> verifiedBytes{0};
-    std::atomic<u64> resumedVerifiedBytes{0};
-    std::atomic<u64> wireRequests{0};
-    std::atomic<u64> retries{0};
-    std::atomic<u64> networkFailures{0};
-    std::atomic<u64> authenticationFailures{0};
-    std::atomic<u64> unavailableResponses{0};
-    std::atomic<u64> activeRequests{0};
-    std::atomic<u64> cryptoMicroseconds{0};
-    std::atomic<u64> networkMicroseconds{0};
-    std::atomic<u64> diskMicroseconds{0};
-    std::atomic<std::size_t> discoveredPeers{0};
-    std::atomic<std::size_t> responsivePeers{0};
-    std::atomic<u64> finalElapsedMicroseconds{0};
-    mutable std::mutex telemetryMutex;
-    DownloadTelemetry telemetry;
-    std::atomic<bool> summaryPresented{false};
-};
-
-struct PeerReputation {
-    u64 successes = 0;
-    u64 networkFailures = 0;
-    u64 authenticationFailures = 0;
-    u64 integrityFailures = 0;
-    u64 bytes = 0;
-    double transferSeconds = 0.0;
-    std::time_t blacklistedUntil = 0;
-};
-
-struct ResumeState {
-    std::mutex mutex;
-    std::string manifestPath;
-    std::string temporaryPath;
-    std::string group;
-    std::string name;
-    LocalFile metadata;
-    std::vector<unsigned char> verified;
-};
-
-enum class TransferResult {
-    Success,
-    NetworkFailure,
-    AuthenticationFailure,
-    IntegrityFailure,
-    Unavailable
-};
-
-static u64 elapsedMicroseconds(std::chrono::steady_clock::time_point started) {
-    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - started).count());
-}
-
-static void recordDownloadFailure(const std::shared_ptr<DownloadStatus> &status,
-                                  TransferResult result) {
-    if (!status || result == TransferResult::Success) return;
-    ++status->retries;
-    if (result == TransferResult::NetworkFailure) ++status->networkFailures;
-    else if (result == TransferResult::AuthenticationFailure)
-        ++status->authenticationFailures;
-    else if (result == TransferResult::Unavailable) ++status->unavailableResponses;
-}
-
-static void addProtocolEvent(const std::shared_ptr<DownloadStatus> &status,
-                             const std::string &event) {
-    if (!status) return;
-    std::lock_guard<std::mutex> lock(status->telemetryMutex);
-    status->telemetry.events.push_back(event);
-    while (status->telemetry.events.size() > 80)
-        status->telemetry.events.pop_front();
-}
-
-static void sampleDownloadSpeed(const std::shared_ptr<DownloadStatus> &status,
-                                bool force = false) {
-    if (!status) return;
-    std::lock_guard<std::mutex> lock(status->telemetryMutex);
-    auto now = std::chrono::steady_clock::now();
-    double seconds = std::chrono::duration<double>(
-        now - status->telemetry.lastSpeedSample).count();
-    if (!force && seconds < 0.25) return;
-    u64 bytes = status->verifiedBytes.load();
-    u64 delta = bytes >= status->telemetry.lastSpeedBytes
-        ? bytes - status->telemetry.lastSpeedBytes : 0;
-    status->telemetry.speedHistory.push_back(
-        seconds > 0.0 ? static_cast<double>(delta) / seconds / (1024.0 * 1024.0) : 0.0);
-    while (status->telemetry.speedHistory.size() > 60)
-        status->telemetry.speedHistory.pop_front();
-    status->telemetry.lastSpeedBytes = bytes;
-    status->telemetry.lastSpeedSample = now;
-}
+static std::mutex activeDestinationsMutex;
+static std::set<std::string> activeDestinations;
 
 static void finishDownload(const std::shared_ptr<DownloadStatus> &status, bool failed,
                            const std::string &reason = "") {
@@ -222,6 +63,10 @@ static void finishDownload(const std::shared_ptr<DownloadStatus> &status, bool f
     status->failed = failed;
     status->finalElapsedMicroseconds = elapsedMicroseconds(status->started);
     status->finished = true;
+    if (!status->destinationKey.empty()) {
+        std::lock_guard<std::mutex> lock(activeDestinationsMutex);
+        activeDestinations.erase(status->destinationKey);
+    }
 }
 
 static std::mutex sharedMutex;
@@ -233,93 +78,11 @@ static std::size_t preferredTracker = 0;
 static std::mutex trackerMutex;
 static u64 sessionId = 0;
 static Endpoint peerEndpoint;
-static ElGamalKey peerKey;
+static std::unique_ptr<PeerIdentity> peerKey;
 static std::mutex replayMutex;
 static std::unordered_map<std::string, std::time_t> seenNonces;
 static std::mutex reputationMutex;
 static std::unordered_map<std::string, PeerReputation> reputations;
-
-static std::string joinHashes(const std::vector<std::string> &hashes);
-
-static bool saveResumeLocked(const ResumeState &resume) {
-    std::string temporaryManifest = resume.manifestPath + ".tmp";
-    std::ofstream output(temporaryManifest, std::ios::trunc);
-    if (!output) return false;
-    output << "P2PRESUME1\n"
-           << hexEncode(resume.group) << '\n'
-           << hexEncode(resume.name) << '\n'
-           << resume.metadata.size << '\n'
-           << resume.metadata.fullHash << '\n'
-           << resume.metadata.capability << '\n'
-           << joinHashes(resume.metadata.pieceHashes) << '\n';
-    for (unsigned char piece : resume.verified) output << (piece ? '1' : '0');
-    output << '\n' << hexEncode(resume.temporaryPath) << '\n';
-    output.flush();
-    if (!output) return false;
-    output.close();
-    chmod(temporaryManifest.c_str(), 0600);
-    if (rename(temporaryManifest.c_str(), resume.manifestPath.c_str()) != 0) return false;
-    chmod(resume.manifestPath.c_str(), 0600);
-    return true;
-}
-
-static bool loadResume(const std::string &manifestPath, const std::string &group,
-                       const std::string &name, const LocalFile &metadata,
-                       std::string &temporaryPath, std::vector<unsigned char> &verified) {
-    std::ifstream input(manifestPath);
-    std::string version, encodedGroup, encodedName, sizeText, fullHash;
-    std::string capability, hashes, bitmap, encodedTemporary;
-    if (!std::getline(input, version) || !std::getline(input, encodedGroup) ||
-        !std::getline(input, encodedName) || !std::getline(input, sizeText) ||
-        !std::getline(input, fullHash) || !std::getline(input, capability) ||
-        !std::getline(input, hashes) || !std::getline(input, bitmap) ||
-        !std::getline(input, encodedTemporary) || version != "P2PRESUME1")
-        return false;
-    std::string storedGroup, storedName;
-    u64 storedSize = 0;
-    try { storedSize = static_cast<u64>(std::stoull(sizeText)); } catch (...) { return false; }
-    if (!hexDecode(encodedGroup, storedGroup) || !hexDecode(encodedName, storedName) ||
-        !hexDecode(encodedTemporary, temporaryPath) || storedGroup != group ||
-        storedName != name || storedSize != metadata.size ||
-        fullHash != metadata.fullHash || capability != metadata.capability ||
-        hashes != joinHashes(metadata.pieceHashes) ||
-        bitmap.size() != metadata.pieceHashes.size())
-        return false;
-    verified.resize(bitmap.size());
-    for (std::size_t i = 0; i < bitmap.size(); ++i) {
-        if (bitmap[i] != '0' && bitmap[i] != '1') return false;
-        verified[i] = bitmap[i] == '1';
-    }
-    return true;
-}
-
-static bool verifyStoredPieces(int fd, const LocalFile &metadata,
-                               std::vector<unsigned char> &verified) {
-    std::vector<char> buffer(PIECE_SIZE);
-    for (std::size_t piece = 0; piece < verified.size(); ++piece) {
-        if (!verified[piece]) continue;
-        std::size_t expected = static_cast<std::size_t>(
-            std::min<u64>(PIECE_SIZE, metadata.size - static_cast<u64>(piece) * PIECE_SIZE));
-        std::size_t received = 0;
-        off_t offset = static_cast<off_t>(piece * PIECE_SIZE);
-        while (received < expected) {
-            ssize_t count = pread(fd, buffer.data() + received, expected - received,
-                                  offset + static_cast<off_t>(received));
-            if (count < 0 && errno == EINTR) continue;
-            if (count <= 0) break;
-            received += static_cast<std::size_t>(count);
-        }
-        Sha1 hash;
-        hash.update(buffer.data(), received);
-        if (received != expected || hash.finalHex() != metadata.pieceHashes[piece])
-            verified[piece] = 0;
-    }
-    return true;
-}
-
-static std::string endpointKey(const Endpoint &endpoint) {
-    return endpoint.ip + ":" + std::to_string(endpoint.port);
-}
 
 static double reputationScore(const PeerInfo &peer) {
     std::lock_guard<std::mutex> lock(reputationMutex);
@@ -368,36 +131,6 @@ static std::string keyFor(const std::string &group, const std::string &name) {
     return group + '\n' + name;
 }
 
-static std::string baseName(const std::string &path) {
-    std::size_t slash = path.find_last_of('/');
-    return slash == std::string::npos ? path : path.substr(slash + 1);
-}
-
-static bool parseEndpoint(const std::string &text, Endpoint &endpoint) {
-    std::size_t colon = text.rfind(':');
-    if (colon == std::string::npos) return false;
-    endpoint.ip = text.substr(0, colon);
-    try { endpoint.port = std::stoi(text.substr(colon + 1)); } catch (...) { return false; }
-    return !endpoint.ip.empty() && endpoint.port > 0 && endpoint.port <= 65535;
-}
-
-static bool readTrackerInfo(const std::string &path) {
-    std::ifstream input(path);
-    if (!input) return false;
-    std::string token;
-    while (input >> token) {
-        Endpoint endpoint;
-        if (token.find(':') != std::string::npos) {
-            if (!parseEndpoint(token, endpoint)) return false;
-        } else {
-            endpoint.ip = token;
-            if (!(input >> endpoint.port)) return false;
-        }
-        trackers.push_back(endpoint);
-    }
-    return trackers.size() == 2;
-}
-
 static bool trackerRequest(const std::string &command, std::string &response) {
     std::lock_guard<std::mutex> lock(trackerMutex);
     for (std::size_t attempt = 0; attempt < trackers.size(); ++attempt) {
@@ -420,55 +153,12 @@ static bool trackerRequest(const std::string &command, std::string &response) {
     return false;
 }
 
-static bool hashFile(const std::string &path, u64 &size, std::string &fullHash,
-                     std::vector<std::string> &pieceHashes) {
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) return false;
-    Sha1 complete;
-    std::vector<char> buffer(PIECE_SIZE);
-    size = 0;
-    pieceHashes.clear();
-    for (;;) {
-        std::size_t used = 0;
-        while (used < buffer.size()) {
-            ssize_t count = read(fd, buffer.data() + used, buffer.size() - used);
-            if (count < 0) {
-                if (errno == EINTR) continue;
-                close(fd);
-                return false;
-            }
-            if (count == 0) break;
-            used += static_cast<std::size_t>(count);
-        }
-        if (used == 0) break;
-        Sha1 piece;
-        piece.update(buffer.data(), used);
-        pieceHashes.push_back(piece.finalHex());
-        complete.update(buffer.data(), used);
-        size += used;
-        if (used < buffer.size()) break;
-    }
-    close(fd);
-    fullHash = complete.finalHex();
-    return true;
-}
-
-static std::string joinHashes(const std::vector<std::string> &hashes) {
-    if (hashes.empty()) return "-";
-    std::string result;
-    for (std::size_t i = 0; i < hashes.size(); ++i) {
-        if (i) result.push_back(',');
-        result += hashes[i];
-    }
-    return result;
-}
-
 static std::string uploadCommand(const std::string &group, const std::string &name,
                                  const LocalFile &file) {
     return "upload_file " + group + " " + hexEncode(name) + " " +
            std::to_string(file.size) + " " + file.fullHash + " " + file.capability + " " +
            joinHashes(file.pieceHashes) + " " + peerEndpoint.ip + " " +
-           std::to_string(peerEndpoint.port) + " " + peerKey.publicHex();
+           std::to_string(peerEndpoint.port) + " " + peerKey->publicHex();
 }
 
 static void peerConnection(int fd) {
@@ -483,7 +173,7 @@ static void peerConnection(int fd) {
         return;
     }
     std::vector<std::string> helloFields = split(hello, '|');
-    if (helloFields.size() != 7 || helloFields[0] != "20") {
+    if (helloFields.size() != 6 || helloFields[0] != "20") {
         sendFrame(fd, "60|malformed");
         close(fd);
         return;
@@ -503,8 +193,7 @@ static void peerConnection(int fd) {
     }
     std::string helloHeader = helloFields[0] + "|" + helloFields[1] + "|" + helloFields[2] +
                               "|" + helloFields[3] + "|" + helloFields[4];
-    if (!peerKey.verify(sha256(helloHeader), {helloFields[5], helloFields[6]},
-                        helloFields[4])) {
+    if (!peerKey->verifyHex(helloHeader, helloFields[5], helloFields[4])) {
         sendFrame(fd, "60|signature"); close(fd); return;
     }
     {
@@ -518,25 +207,25 @@ static void peerConnection(int fd) {
         seenNonces[helloFields[2]] = timestamp;
     }
 
-    std::string serverPrivate, serverEphemeral, serverNonce = randomBytes(16), sharedSecret;
+    std::string serverPrivate, serverEphemeral;
+    std::string serverNonce = randomBytes(16), sharedSecret;
     if (serverNonce.empty() ||
-        !peerKey.generateEphemeral(serverPrivate, serverEphemeral) ||
-        !peerKey.deriveEphemeralSecret(serverPrivate, helloFields[3], sharedSecret)) {
+        !peerKey->generateEphemeral(serverPrivate, serverEphemeral) ||
+        !peerKey->deriveEphemeralSecret(
+            serverPrivate, helloFields[3], sharedSecret)) {
         sendFrame(fd, "60|key"); close(fd); return;
     }
     std::string transcript = helloHeader + "|" + hexEncode(serverNonce) + "|" +
-                             serverEphemeral + "|" + peerKey.publicHex();
-    ElGamalSignature serverProof = peerKey.sign(sha256(transcript));
+                             serverEphemeral + "|" + peerKey->publicHex();
+    std::string serverProof = peerKey->signHex(transcript);
     std::string helloResponse = "25|" + hexEncode(serverNonce) + "|" + serverEphemeral + "|" +
-                                peerKey.publicHex() + "|" + serverProof.r + "|" + serverProof.s;
+                                peerKey->publicHex() + "|" + serverProof;
     if (!sendFrame(fd, helloResponse)) { close(fd); return; }
 
-    // Ephemeral private material is no longer needed after deriving the shared secret.
     secureErase(serverPrivate);
-    std::string sessionKey = sha256(sharedSecret + transcript);
+    std::string sessionKey = peerKey->deriveSessionKey(sharedSecret, transcript);
     secureErase(sharedSecret);
-    std::string encryptionKey = sha256(sessionKey + "ENC");
-    std::string macKey = sha256(sessionKey + "MAC");
+    if (sessionKey.empty()) { close(fd); return; }
 
     std::string request;
     if (!receiveFrame(fd, request)) { close(fd); return; }
@@ -544,18 +233,16 @@ static void peerConnection(int fd) {
     if (fields.size() != 4 || fields[0] != "21") {
         sendFrame(fd, "60|request"); close(fd); return;
     }
-    std::string requestIv, requestCipher, requestTag;
-    if (!hexDecode(fields[1], requestIv) || requestIv.size() != 16 ||
-        !hexDecode(fields[2], requestCipher) || !hexDecode(fields[3], requestTag)) {
+    PeerAeadMessage requestMessage;
+    if (!hexDecode(fields[1], requestMessage.nonce) ||
+        !hexDecode(fields[2], requestMessage.ciphertext) ||
+        !hexDecode(fields[3], requestMessage.tag)) {
         sendFrame(fd, "60|encoding"); close(fd); return;
     }
-    std::string authenticated = fields[0] + "|" + fields[1] + "|" + fields[2];
-    if (!constantTimeEqual(hmacSha256(macKey, authenticated), requestTag)) {
-        sendFrame(fd, "60|hmac"); close(fd); return;
-    }
     std::string requestPlain;
-    if (!aes256CbcDecrypt(encryptionKey, requestIv, requestCipher, requestPlain)) {
-        sendFrame(fd, "60|decrypt"); close(fd); return;
+    if (!peerKey->decrypt(sessionKey, "21|" + transcript,
+                          requestMessage, requestPlain)) {
+        sendFrame(fd, "60|aead"); close(fd); return;
     }
     std::vector<std::string> requestParts = split(requestPlain, '\n');
     if (requestParts.size() != 5) { sendFrame(fd, "60|request"); close(fd); return; }
@@ -617,14 +304,28 @@ static void peerConnection(int fd) {
         return;
     }
     {
-        std::string responseNonce = randomBytes(16), responseIv = randomBytes(16);
-        std::string responseCipher = aes256CbcEncrypt(encryptionKey, responseIv, responsePlain);
-        ElGamalSignature signature = peerKey.sign(
-            sha256(helloFields[2] + "|" + hexEncode(responseNonce) + "|" + sha256(responseCipher)));
-        std::string responseHeader = "30|" + hexEncode(responseNonce) + "|" + signature.r + "|" +
-                                     signature.s + "|" + hexEncode(responseIv) + "|" +
-                                     hexEncode(responseCipher);
-        sendFrame(fd, responseHeader + "|" + hexEncode(hmacSha256(macKey, responseHeader)));
+        std::string responseNonce = randomBytes(16);
+        std::string responseAad = "30|" + transcript + "|" +
+                                  helloFields[2] + "|" +
+                                  hexEncode(responseNonce);
+        PeerAeadMessage responseMessage;
+        if (responseNonce.empty() ||
+            !peerKey->encrypt(sessionKey, responseAad, responsePlain,
+                              responseMessage)) {
+            sendFrame(fd, "60|encrypt");
+            close(fd);
+            return;
+        }
+        std::string signedResponse =
+            responseAad + "|" + hexEncode(responseMessage.nonce) + "|" +
+            hexEncode(responseMessage.ciphertext) + "|" +
+            hexEncode(responseMessage.tag);
+        std::string response = "30|" + hexEncode(responseNonce) + "|" +
+                               hexEncode(responseMessage.nonce) + "|" +
+                               hexEncode(responseMessage.ciphertext) + "|" +
+                               hexEncode(responseMessage.tag) + "|" +
+                               peerKey->signHex(signedResponse);
+        sendFrame(fd, response);
     }
     close(fd);
 }
@@ -674,7 +375,8 @@ static TransferResult securePeerRequest(const PeerInfo &peer, const std::string 
     std::string clientPrivate, clientEphemeral, clientNonce = randomBytes(16);
     auto cryptoStarted = std::chrono::steady_clock::now();
     bool ephemeralReady = !clientNonce.empty() &&
-                          peerKey.generateEphemeral(clientPrivate, clientEphemeral);
+                          peerKey->generateEphemeral(
+                              clientPrivate, clientEphemeral);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
     if (!ephemeralReady) {
         close(fd);
@@ -682,18 +384,18 @@ static TransferResult securePeerRequest(const PeerInfo &peer, const std::string 
     }
     std::string helloHeader = "20|" + std::to_string(std::time(nullptr)) + "|" +
                               hexEncode(clientNonce) + "|" + clientEphemeral + "|" +
-                              peerKey.publicHex();
+                              peerKey->publicHex();
     cryptoStarted = std::chrono::steady_clock::now();
-    ElGamalSignature clientProof = peerKey.sign(sha256(helloHeader));
+    std::string clientProof = peerKey->signHex(helloHeader);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
-    std::string hello = helloHeader + "|" + clientProof.r + "|" + clientProof.s;
+    std::string hello = helloHeader + "|" + clientProof;
     std::string helloResponse;
     if (!sendFrame(fd, hello) || !receiveFrame(fd, helloResponse)) {
         close(fd);
         return TransferResult::NetworkFailure;
     }
     std::vector<std::string> helloFields = split(helloResponse, '|');
-    if (helloFields.size() != 6 || helloFields[0] != "25" ||
+    if (helloFields.size() != 5 || helloFields[0] != "25" ||
         helloFields[3] != peer.publicKey) {
         close(fd);
         return TransferResult::AuthenticationFailure;
@@ -706,8 +408,8 @@ static TransferResult securePeerRequest(const PeerInfo &peer, const std::string 
     std::string transcript = helloHeader + "|" + helloFields[1] + "|" +
                              helloFields[2] + "|" + helloFields[3];
     cryptoStarted = std::chrono::steady_clock::now();
-    bool serverVerified = peerKey.verify(
-        sha256(transcript), {helloFields[4], helloFields[5]}, peer.publicKey);
+    bool serverVerified = peerKey->verifyHex(
+        transcript, helloFields[4], peer.publicKey);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
     if (!serverVerified) {
         close(fd);
@@ -715,7 +417,7 @@ static TransferResult securePeerRequest(const PeerInfo &peer, const std::string 
     }
     std::string sharedSecret;
     cryptoStarted = std::chrono::steady_clock::now();
-    bool secretReady = peerKey.deriveEphemeralSecret(
+    bool secretReady = peerKey->deriveEphemeralSecret(
         clientPrivate, helloFields[2], sharedSecret);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
     if (!secretReady) {
@@ -723,17 +425,24 @@ static TransferResult securePeerRequest(const PeerInfo &peer, const std::string 
         return TransferResult::AuthenticationFailure;
     }
     secureErase(clientPrivate);
-    std::string sessionKey = sha256(sharedSecret + transcript);
+    std::string sessionKey = peerKey->deriveSessionKey(sharedSecret, transcript);
     secureErase(sharedSecret);
-    std::string encryptionKey = sha256(sessionKey + "ENC");
-    std::string macKey = sha256(sessionKey + "MAC");
-    std::string iv = randomBytes(16);
-    if (iv.empty()) { close(fd); return TransferResult::NetworkFailure; }
+    if (sessionKey.empty()) {
+        close(fd);
+        return TransferResult::AuthenticationFailure;
+    }
     cryptoStarted = std::chrono::steady_clock::now();
-    std::string cipher = aes256CbcEncrypt(encryptionKey, iv, plain);
-    std::string requestHeader = "21|" + hexEncode(iv) + "|" + hexEncode(cipher);
-    std::string request = requestHeader + "|" + hexEncode(hmacSha256(macKey, requestHeader));
+    PeerAeadMessage requestMessage;
+    bool encrypted = peerKey->encrypt(
+        sessionKey, "21|" + transcript, plain, requestMessage);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
+    if (!encrypted) {
+        close(fd);
+        return TransferResult::NetworkFailure;
+    }
+    std::string request = "21|" + hexEncode(requestMessage.nonce) + "|" +
+                          hexEncode(requestMessage.ciphertext) + "|" +
+                          hexEncode(requestMessage.tag);
     std::string response;
     bool ok = sendFrame(fd, request) && receiveFrame(fd, response);
     close(fd);
@@ -741,35 +450,33 @@ static TransferResult securePeerRequest(const PeerInfo &peer, const std::string 
     if (!ok) return TransferResult::NetworkFailure;
     std::vector<std::string> fields = split(response, '|');
     if (fields.size() >= 2 && fields[0] == "60") {
-        if (fields[1] == "unauthorized" || fields[1] == "hmac" || fields[1] == "key" ||
+        if (fields[1] == "unauthorized" || fields[1] == "aead" || fields[1] == "key" ||
             fields[1] == "replay" || fields[1] == "stale" || fields[1] == "signature")
             return TransferResult::AuthenticationFailure;
         return TransferResult::Unavailable;
     }
-    if (fields.size() != 7 || fields[0] != "30")
+    if (fields.size() != 6 || fields[0] != "30")
         return TransferResult::AuthenticationFailure;
-    std::string responseNonce, responseIv, responseCipher, responseTag;
+    std::string responseNonce;
+    PeerAeadMessage responseMessage;
     if (!hexDecode(fields[1], responseNonce) || responseNonce.size()!=16 ||
-        !hexDecode(fields[4], responseIv) || responseIv.size()!=16 ||
-        !hexDecode(fields[5], responseCipher) || !hexDecode(fields[6], responseTag))
+        !hexDecode(fields[2], responseMessage.nonce) ||
+        !hexDecode(fields[3], responseMessage.ciphertext) ||
+        !hexDecode(fields[4], responseMessage.tag))
         return TransferResult::AuthenticationFailure;
-    std::string responseHeader = fields[0]+"|"+fields[1]+"|"+fields[2]+"|"+fields[3]+"|"+fields[4]+"|"+fields[5];
+    std::string responseAad = "30|" + transcript + "|" +
+                              hexEncode(clientNonce) + "|" + fields[1];
+    std::string signedResponse =
+        responseAad + "|" + fields[2] + "|" + fields[3] + "|" + fields[4];
     cryptoStarted = std::chrono::steady_clock::now();
-    bool responseMacValid = constantTimeEqual(
-        hmacSha256(macKey, responseHeader), responseTag);
-    telemetry.crypto += elapsedMicroseconds(cryptoStarted);
-    if (!responseMacValid)
-        return TransferResult::AuthenticationFailure;
-    cryptoStarted = std::chrono::steady_clock::now();
-    bool responseSignatureValid = peerKey.verify(
-        sha256(hexEncode(clientNonce)+"|"+fields[1]+"|"+sha256(responseCipher)),
-        {fields[2], fields[3]}, peer.publicKey);
+    bool responseSignatureValid = peerKey->verifyHex(
+        signedResponse, fields[5], peer.publicKey);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
     if (!responseSignatureValid)
         return TransferResult::AuthenticationFailure;
     cryptoStarted = std::chrono::steady_clock::now();
-    bool decrypted = aes256CbcDecrypt(
-        encryptionKey, responseIv, responseCipher, responsePlain);
+    bool decrypted = peerKey->decrypt(
+        sessionKey, responseAad, responseMessage, responsePlain);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
     if (!decrypted)
         return TransferResult::AuthenticationFailure;
@@ -810,19 +517,6 @@ static TransferResult fetchPieceData(const PeerInfo &peer, const std::string &gr
 
     recordPeerResult(peer, TransferResult::Success, length, seconds);
     return TransferResult::Success;
-}
-
-static bool writePiece(int outputFd, std::size_t index, const std::string &piece) {
-    std::size_t written = 0;
-    off_t offset = static_cast<off_t>(index * PIECE_SIZE);
-    while (written < piece.size()) {
-        ssize_t count = pwrite(outputFd, piece.data() + written, piece.size() - written,
-                               offset + static_cast<off_t>(written));
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) return false;
-        written += static_cast<std::size_t>(count);
-    }
-    return true;
 }
 
 static TransferResult fetchPiece(const PeerInfo &peer, const std::string &group,
@@ -1069,6 +763,7 @@ static void downloadFile(std::string group, std::string name, std::string destin
     for (std::size_t worker = 0; worker < workerCount; ++worker) {
         workers.emplace_back([&, worker] {
             for (;;) {
+                if (status->cancelRequested) break;
                 std::size_t position = nextOrder.fetch_add(1);
                 if (position >= normalCount) break;
                 std::size_t piece = order[position];
@@ -1079,7 +774,8 @@ static void downloadFile(std::string group, std::string name, std::string destin
                     status->telemetry.workers[worker].state = "reserved";
                     status->telemetry.pieces[piece] = PieceState::Reserved;
                 }
-                for (int round = 0; round < 2 && !obtained; ++round) {
+                for (int round = 0;
+                     round < 3 && !obtained && !status->cancelRequested; ++round) {
                     std::vector<std::size_t> candidates = candidatesFor(piece);
                     {
                         std::lock_guard<std::mutex> lock(status->telemetryMutex);
@@ -1089,6 +785,7 @@ static void downloadFile(std::string group, std::string name, std::string destin
                             reserved.push_back(endpointKey(peers[peer].endpoint));
                     }
                     for (std::size_t peer : candidates) {
+                        if (status->cancelRequested) break;
                         const std::string selected = endpointKey(peers[peer].endpoint);
                         {
                             std::lock_guard<std::mutex> lock(status->telemetryMutex);
@@ -1141,9 +838,10 @@ static void downloadFile(std::string group, std::string name, std::string destin
                             break;
                         }
                     }
-                    if (!obtained) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (!obtained && !status->cancelRequested)
+                        std::this_thread::sleep_for(retryDelay(round));
                 }
-                if (!obtained) {
+                if (!obtained && !status->cancelRequested) {
                     failure = true;
                     std::lock_guard<std::mutex> lock(status->telemetryMutex);
                     status->telemetry.pieces[piece] = PieceState::Failed;
@@ -1157,6 +855,11 @@ static void downloadFile(std::string group, std::string name, std::string destin
         });
     }
     for (auto &worker : workers) worker.join();
+    if (status->cancelRequested) {
+        close(output);
+        finishDownload(status, true, "cancelled by user; resume data retained");
+        return;
+    }
 
     // Endgame mode duplicates the final few requests across the two best peers. The first
     // verified response wins, reducing tail latency from one slow or disconnected seeder.
@@ -1166,6 +869,7 @@ static void downloadFile(std::string group, std::string name, std::string destin
             {workerCount + 1, std::nullopt, "", "endgame"});
     }
     for (std::size_t position = normalCount; position < missingCount; ++position) {
+        if (status->cancelRequested) break;
         std::size_t piece = order[position];
         std::vector<std::size_t> candidates = candidatesFor(piece);
         if (candidates.empty()) {
@@ -1271,6 +975,11 @@ static void downloadFile(std::string group, std::string name, std::string destin
             }
         }
     }
+    if (status->cancelRequested) {
+        close(output);
+        finishDownload(status, true, "cancelled by user; resume data retained");
+        return;
+    }
     if (endgameCount) {
         std::lock_guard<std::mutex> lock(status->telemetryMutex);
         auto &worker = status->telemetry.workers.back();
@@ -1315,29 +1024,8 @@ static void downloadFile(std::string group, std::string name, std::string destin
     finishDownload(status, false);
 }
 
-static std::vector<std::string> words(const std::string &line) {
-    std::istringstream input(line);
-    std::vector<std::string> result;
-    std::string word;
-    while (input >> word) result.push_back(word);
-    return result;
-}
-
-static std::string canonicalCommand(const std::vector<std::string> &args) {
-    if (args.empty()) return "";
-    if (args[0].find('_') != std::string::npos || args.size() == 1) return args[0];
-    if ((args[0] == "create" || args[0] == "join" || args[0] == "leave" ||
-         args[0] == "list" || args[0] == "accept" || args[0] == "upload" ||
-         args[0] == "download" || args[0] == "stop" || args[0] == "show") &&
-        args.size() >= 2)
-        return args[0] + "_" + args[1];
-    if (args[0] == "resume" && args.size() >= 2)
-        return args[0] + "_" + args[1];
-    return args[0];
-}
-
 static bool executeCommand(const std::string &line, std::ostream &output) {
-        std::vector<std::string> args = words(line);
+        std::vector<std::string> args = commandWords(line);
         if (args.empty()) return false;
         if (args[0] == "quit") return true;
         std::string command = canonicalCommand(args);
@@ -1364,7 +1052,7 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
             std::string response;
             trackerRequest(uploadCommand(group, name, file), response);
             if (response.rfind("OK", 0) == 0) {
-                std::vector<std::string> responseWords = words(response);
+                std::vector<std::string> responseWords = commandWords(response);
                 if (responseWords.size() >= 4 && responseWords[3].size() == 64)
                     file.capability = responseWords[3];
                 std::lock_guard<std::mutex> lock(sharedMutex);
@@ -1382,9 +1070,25 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
                 return false;
             }
             std::string group = args[offset], name = args[offset + 1], destination = args[offset + 2];
+            std::string destinationKey = resolvedDestination(destination, name);
+            struct stat destinationInfo{};
+            if (stat(destinationKey.c_str(), &destinationInfo) == 0) {
+                output << "ERR destination already exists: " << destinationKey << '\n';
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(activeDestinationsMutex);
+                if (!activeDestinations.insert(destinationKey).second) {
+                    output << "ERR destination is already being downloaded: "
+                           << destinationKey << '\n';
+                    return false;
+                }
+            }
             std::string response;
             if (!trackerRequest("download_file " + group + " " + hexEncode(name), response) ||
                 response.rfind("META ", 0) != 0) {
+                std::lock_guard<std::mutex> lock(activeDestinationsMutex);
+                activeDestinations.erase(destinationKey);
                 output << response << '\n';
                 return false;
             }
@@ -1403,12 +1107,16 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
                 Endpoint endpoint;
                 if (parseEndpoint(peerText.substr(0, lastColon), endpoint)) {
                     std::string publicKey = peerText.substr(lastColon + 1);
-                    std::string publicKeyBytes;
-                    if (publicKey.size() >= 256 && hexDecode(publicKey, publicKeyBytes))
+                    std::string decodedPublicKey;
+                    if (publicKey.size() == 64 &&
+                        hexDecode(publicKey, decodedPublicKey) &&
+                        decodedPublicKey.size() == 32)
                         peers.push_back({endpoint, publicKey});
                 }
             }
             if (peers.empty()) {
+                std::lock_guard<std::mutex> lock(activeDestinationsMutex);
+                activeDestinations.erase(destinationKey);
                 output << "ERR no valid peer endpoints\n";
                 return false;
             }
@@ -1416,6 +1124,7 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
             status->group = group;
             status->name = name;
             status->total = metadata.pieceHashes.size();
+            status->destinationKey = destinationKey;
             {
                 std::lock_guard<std::mutex> lock(downloadsMutex);
                 downloads.push_back(status);
@@ -1437,6 +1146,23 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
                        << " integrity-failures=" << status->integrityFailures;
                 output << '\n';
             }
+            return false;
+        }
+        if (command == "cancel_download") {
+            if (args.size() < offset + 1) {
+                output << "ERR usage: cancel download <file-name>\n";
+                return false;
+            }
+            std::lock_guard<std::mutex> lock(downloadsMutex);
+            for (auto it = downloads.rbegin(); it != downloads.rend(); ++it) {
+                const auto &status = *it;
+                if (status->name == args[offset] && !status->finished) {
+                    status->cancelRequested = true;
+                    output << "OK cancellation requested\n";
+                    return false;
+                }
+            }
+            output << "ERR no active download with that name\n";
             return false;
         }
         if (command == "peer_stats" || command == "show_peers") {
@@ -1552,10 +1278,15 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
         }
         std::string response;
         trackerRequest(trackerCommand, response);
+        if (command == "login" || command == "create_user") {
+            secureErase(trackerCommand);
+            for (std::string &argument : args) secureErase(argument);
+        }
         if (command == "list_files" && response.rfind("OK", 0) == 0) {
-            for (std::size_t i = 1; i < words(response).size(); ++i) {
+            for (std::size_t i = 1; i < commandWords(response).size(); ++i) {
                 std::string decoded;
-                if (hexDecode(words(response)[i], decoded)) output << decoded << '\n';
+                if (hexDecode(commandWords(response)[i], decoded))
+                    output << decoded << '\n';
             }
         } else {
             output << response << '\n';
@@ -1582,137 +1313,18 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
 
 #ifdef TORRENT_ENABLE_FTXUI
 
-static std::string safeCommandForLog(const std::string &line) {
-    std::vector<std::string> args = words(line);
-    if (args.empty()) return "";
-    std::string command = canonicalCommand(args);
-    if ((command == "login" || command == "create_user") && args.size() >= 2) {
-        std::size_t userIndex = command == args[0] ? 1 : 2;
-        if (userIndex < args.size()) return command + " " + args[userIndex] + " ********";
-    }
-    return line;
-}
-
-static std::string formatBytes(u64 bytes) {
-    static const char *units[] = {"B", "KiB", "MiB", "GiB"};
-    double value = static_cast<double>(bytes);
-    std::size_t unit = 0;
-    while (value >= 1024.0 && unit < 3) {
-        value /= 1024.0;
-        ++unit;
-    }
-    std::ostringstream result;
-    result << std::fixed << std::setprecision(unit == 0 ? 0 : 1) << value << ' ' << units[unit];
-    return result.str();
-}
-
-struct DownloadView {
-    std::shared_ptr<DownloadStatus> source;
-    std::string group;
-    std::string name;
-    std::size_t completed = 0;
-    std::size_t total = 0;
-    bool finished = false;
-    bool failed = false;
-    u64 totalBytes = 0;
-    u64 verifiedBytes = 0;
-    u64 resumedBytes = 0;
-    u64 elapsedMicros = 0;
-    u64 activeRequests = 0;
-    u64 retries = 0;
-    u64 networkFailures = 0;
-    u64 authenticationFailures = 0;
-    u64 unavailableResponses = 0;
-    std::size_t integrityFailures = 0;
-    std::size_t discoveredPeers = 0;
-    std::size_t responsivePeers = 0;
-    std::size_t rarePieces = 0;
-    std::size_t duplicateRequests = 0;
-    DownloadTelemetry telemetry;
-};
-
 static std::vector<DownloadView> captureDownloadViews() {
     std::vector<std::shared_ptr<DownloadStatus>> statuses;
+    std::unordered_map<std::string, PeerReputation> reputationSnapshot;
     {
         std::lock_guard<std::mutex> lock(downloadsMutex);
         statuses = downloads;
     }
-    std::vector<DownloadView> result;
-    result.reserve(statuses.size());
-    for (const auto &status : statuses) {
-        sampleDownloadSpeed(status);
-        DownloadView view;
-        view.source = status;
-        view.group = status->group;
-        view.name = status->name;
-        view.completed = status->completed.load();
-        view.total = status->total;
-        view.finished = status->finished.load();
-        view.failed = status->failed.load();
-        view.totalBytes = status->totalBytes.load();
-        view.verifiedBytes = status->verifiedBytes.load();
-        view.resumedBytes = status->resumedVerifiedBytes.load();
-        view.elapsedMicros = status->finalElapsedMicroseconds.load();
-        if (!view.elapsedMicros)
-            view.elapsedMicros = elapsedMicroseconds(status->started);
-        view.activeRequests = status->activeRequests.load();
-        view.retries = status->retries.load();
-        view.networkFailures = status->networkFailures.load();
-        view.authenticationFailures = status->authenticationFailures.load();
-        view.unavailableResponses = status->unavailableResponses.load();
-        view.integrityFailures = status->integrityFailures.load();
-        view.discoveredPeers = status->discoveredPeers.load();
-        view.responsivePeers = status->responsivePeers.load();
-        view.rarePieces = status->rarePieces.load();
-        view.duplicateRequests = status->duplicateRequests.load();
-        {
-            std::lock_guard<std::mutex> lock(status->telemetryMutex);
-            view.telemetry = status->telemetry;
-        }
-        {
-            std::lock_guard<std::mutex> lock(reputationMutex);
-            for (auto &peer : view.telemetry.peers) {
-                auto found = reputations.find(peer.endpoint);
-                if (found == reputations.end()) continue;
-                const PeerReputation &reputation = found->second;
-                peer.trust = std::max(0.0, std::min(100.0,
-                    100.0 - reputation.networkFailures * 2.0 -
-                    reputation.authenticationFailures * 20.0 -
-                    reputation.integrityFailures * 30.0));
-                peer.throughputMiB = reputation.transferSeconds > 0.0
-                    ? static_cast<double>(reputation.bytes) /
-                      reputation.transferSeconds / (1024.0 * 1024.0) : 0.0;
-                peer.failures = reputation.networkFailures +
-                                reputation.authenticationFailures +
-                                reputation.integrityFailures;
-                peer.blacklisted = reputation.blacklistedUntil > std::time(nullptr);
-            }
-        }
-        result.push_back(std::move(view));
+    {
+        std::lock_guard<std::mutex> lock(reputationMutex);
+        reputationSnapshot = reputations;
     }
-    return result;
-}
-
-static double viewSpeedMiB(const DownloadView &view) {
-    double seconds = std::max(0.001, view.elapsedMicros / 1000000.0);
-    u64 transferred = view.verifiedBytes > view.resumedBytes
-        ? view.verifiedBytes - view.resumedBytes : 0;
-    return static_cast<double>(transferred) / seconds / (1024.0 * 1024.0);
-}
-
-static std::string formatDuration(u64 microseconds) {
-    if (microseconds < 1000000) {
-        std::ostringstream shortDuration;
-        shortDuration << std::fixed << std::setprecision(1)
-                      << microseconds / 1000000.0 << "s";
-        return shortDuration.str();
-    }
-    u64 seconds = microseconds / 1000000;
-    std::ostringstream output;
-    if (seconds >= 3600) output << seconds / 3600 << "h ";
-    if (seconds >= 60) output << (seconds / 60) % 60 << "m ";
-    output << seconds % 60 << "s";
-    return output.str();
+    return buildDownloadViews(statuses, reputationSnapshot);
 }
 
 static void appendLog(std::deque<std::string> &log, const std::string &text) {
@@ -1725,20 +1337,21 @@ static void appendLog(std::deque<std::string> &log, const std::string &text) {
 }
 
 static ftxui::Color stateColor(PieceState state) {
-    using ftxui::Color;
+    const CatppuccinMocha &mocha = catppuccinMocha();
     switch (state) {
-        case PieceState::Unavailable: return Color::RGB(76, 87, 108);
-        case PieceState::Available: return Color::RGB(67, 154, 180);
-        case PieceState::Reserved: return Color::RGB(231, 178, 77);
-        case PieceState::Downloading: return Color::RGB(244, 125, 66);
-        case PieceState::Verified: return Color::RGB(75, 199, 144);
-        case PieceState::Failed: return Color::RGB(235, 87, 87);
+        case PieceState::Unavailable: return mocha.overlay;
+        case PieceState::Available: return mocha.blue;
+        case PieceState::Reserved: return mocha.yellow;
+        case PieceState::Downloading: return mocha.peach;
+        case PieceState::Verified: return mocha.green;
+        case PieceState::Failed: return mocha.red;
     }
-    return Color::White;
+    return mocha.text;
 }
 
 static ftxui::Element pieceGrid(const DownloadView &view, int columns) {
     using namespace ftxui;
+    const CatppuccinMocha &mocha = catppuccinMocha();
     Elements rows;
     Elements row;
     for (std::size_t index = 0; index < view.telemetry.pieces.size(); ++index) {
@@ -1755,15 +1368,17 @@ static ftxui::Element pieceGrid(const DownloadView &view, int columns) {
         }
     }
     if (!row.empty()) rows.push_back(hbox(std::move(row)));
-    if (rows.empty()) rows.push_back(text("No pieces (empty file)") | dim);
+    if (rows.empty())
+        rows.push_back(text("No pieces (empty file)") | color(mocha.subtext));
     return vbox(std::move(rows));
 }
 
 static ftxui::Element speedGraph(const DownloadView &view, std::size_t maxColumns) {
     using namespace ftxui;
+    const CatppuccinMocha &mocha = catppuccinMocha();
     static const char *levels[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
     if (view.telemetry.speedHistory.empty())
-        return text("waiting for samples") | dim;
+        return text("waiting for samples") | color(mocha.subtext);
     double maximum = *std::max_element(
         view.telemetry.speedHistory.begin(), view.telemetry.speedHistory.end());
     maximum = std::max({0.01, maximum, viewSpeedMiB(view)});
@@ -1780,14 +1395,13 @@ static ftxui::Element speedGraph(const DownloadView &view, std::size_t maxColumn
     std::ostringstream label;
     label << std::fixed << std::setprecision(2) << viewSpeedMiB(view)
           << " MiB/s avg  peak " << maximum;
-    return vbox({text(graph) | color(Color::RGB(67, 154, 180)),
-                 text(label.str()) | dim});
+    return vbox({text(graph) | color(mocha.blue),
+                 text(label.str()) | color(mocha.subtext)});
 }
 
 static ftxui::Element completionModal(const DownloadView &view) {
     using namespace ftxui;
-    const Color green = Color::RGB(75, 199, 144);
-    const Color red = Color::RGB(235, 87, 87);
+    const CatppuccinMocha &mocha = catppuccinMocha();
     double seconds = std::max(0.001, view.elapsedMicros / 1000000.0);
     double average = static_cast<double>(view.verifiedBytes) / seconds /
                      (1024.0 * 1024.0);
@@ -1795,43 +1409,43 @@ static ftxui::Element completionModal(const DownloadView &view) {
     speed << std::fixed << std::setprecision(2) << average << " MiB/s";
     Elements rows = {
         text(view.failed ? "TRANSFER FAILED" : "TRANSFER COMPLETE") |
-            bold | color(view.failed ? red : green) | center,
-        separator(),
-        hbox({text("File          ") | dim, text(view.name)}),
-        hbox({text("Size          ") | dim, text(formatBytes(view.totalBytes))}),
-        hbox({text("Pieces        ") | dim,
+            bold | color(view.failed ? mocha.red : mocha.green) | center,
+        separator() | color(mocha.surface1),
+        hbox({text("File          ") | color(mocha.subtext), text(view.name)}),
+        hbox({text("Size          ") | color(mocha.subtext),
+              text(formatBytes(view.totalBytes))}),
+        hbox({text("Pieces        ") | color(mocha.subtext),
               text(std::to_string(view.completed) + "/" + std::to_string(view.total))}),
-        hbox({text("Duration      ") | dim, text(formatDuration(view.elapsedMicros))}),
-        hbox({text("Average speed ") | dim, text(speed.str())}),
-        hbox({text("Peers used    ") | dim,
+        hbox({text("Duration      ") | color(mocha.subtext),
+              text(formatDuration(view.elapsedMicros))}),
+        hbox({text("Average speed ") | color(mocha.subtext), text(speed.str())}),
+        hbox({text("Peers used    ") | color(mocha.subtext),
               text(std::to_string(view.telemetry.peersUsed))}),
-        hbox({text("Integrity     ") | dim,
+        hbox({text("Integrity     ") | color(mocha.subtext),
               text(view.telemetry.integrityVerified ? "SHA1 verified" : "not verified") |
-                  color(view.telemetry.integrityVerified ? green : red)}),
-        hbox({text("Destination   ") | dim, text(view.telemetry.destination)}),
+                  color(view.telemetry.integrityVerified ? mocha.green : mocha.red)}),
+        hbox({text("Destination   ") | color(mocha.subtext),
+              text(view.telemetry.destination)}),
     };
     if (view.failed)
-        rows.push_back(hbox({text("Reason        ") | dim,
-                            text(view.telemetry.failureReason) | color(red)}));
-    rows.push_back(separator());
-    rows.push_back(text("Enter or Escape returns to the dashboard") | dim | center);
-    return window(text(" Result "), vbox(std::move(rows))) |
+        rows.push_back(hbox({text("Reason        ") | color(mocha.subtext),
+                            text(view.telemetry.failureReason) | color(mocha.red)}));
+    rows.push_back(separator() | color(mocha.surface1));
+    rows.push_back(text("Enter or Escape returns to the dashboard") |
+                   color(mocha.subtext) | center);
+    return themedPanel(" Result ", vbox(std::move(rows)), mocha.mantle) |
            size(ftxui::WIDTH, ftxui::GREATER_THAN, 64) | clear_under | center;
 }
 
 static int runTui() {
     using namespace ftxui;
-    const Color ink = Color::RGB(212, 222, 238);
-    const Color muted = Color::RGB(119, 137, 166);
-    const Color ocean = Color::RGB(67, 154, 180);
-    const Color amber = Color::RGB(231, 178, 77);
-    const Color green = Color::RGB(75, 199, 144);
-    const Color red = Color::RGB(235, 87, 87);
-    const Color base = Color::RGB(9, 16, 28);
+    const CatppuccinMocha &mocha = catppuccinMocha();
 
     auto screen = ScreenInteractive::Fullscreen();
     std::string commandInput;
     std::deque<std::string> commandLog;
+    std::vector<std::string> commandHistory;
+    std::size_t historyCursor = 0;
     commandLog.push_back("Ready. Press : to enter a command.");
     std::size_t selected = 0;
     std::optional<std::size_t> summary;
@@ -1839,6 +1453,7 @@ static int runTui() {
     bool help = false;
     std::atomic<bool> refreshing{true};
     std::size_t observedDownloadCount = 0;
+    std::size_t eventScroll = 0;
 
     auto renderer = Renderer([&] {
         std::vector<DownloadView> views = captureDownloadViews();
@@ -1860,27 +1475,30 @@ static int runTui() {
                   << std::setprecision(2) << aggregateSpeed << " MiB/s";
         Element header = vbox({
             hbox({
-                text(" TORRENT ") | bold | bgcolor(ocean) | color(base),
-                text("  secure swarm telemetry") | color(ink),
+                text(" TORRENT ") | bold | bgcolor(mocha.blue) | color(mocha.crust),
+                text("  secure swarm telemetry") | color(mocha.text),
                 filler(),
-                text(aggregate.str()) | color(ocean) | bold,
+                text(aggregate.str()) | color(mocha.blue) | bold,
                 text("  ")
             }),
             hbox({
-                text(" " + endpointKey(peerEndpoint)) | color(muted),
-                text("  tracker " + std::to_string(trackerIndex + 1)) | color(muted),
+                text(" " + endpointKey(peerEndpoint)) | color(mocha.subtext),
+                text("  tracker " + std::to_string(trackerIndex + 1)) |
+                    color(mocha.subtext),
                 text(currentSession ? "  authenticated" : "  signed out") |
-                    color(currentSession ? green : amber),
+                    color(currentSession ? mocha.green : mocha.yellow),
                 filler(),
-                text("↑↓ select   : command   F1 help   F10 exit ") | color(muted)
+                text("↑↓ select   c cancel   : command   F1 help   F10 exit ") |
+                    color(mocha.subtext)
             }),
-            separator() | color(ocean),
-        });
+            separator() | color(mocha.blue),
+        }) | bgcolor(mocha.base);
 
         Elements transferRows;
         if (views.empty()) {
             transferRows.push_back(
-                text("No downloads. Press : and run download file …") | color(muted));
+                text("No downloads. Press : and run download file …") |
+                    color(mocha.subtext));
         }
         for (std::size_t index = 0; index < views.size(); ++index) {
             const auto &view = views[index];
@@ -1895,12 +1513,14 @@ static int runTui() {
                  << view.completed << "/" << view.total << "  "
                  << std::setprecision(2) << viewSpeedMiB(view) << " MiB/s";
             Element item = text(line.str()) |
-                color(view.failed ? red : view.finished ? green : ink);
-            if (index == selected) item = item | inverted | focus;
+                color(view.failed ? mocha.red :
+                      view.finished ? mocha.green : mocha.text);
+            if (index == selected)
+                item = item | color(mocha.blue) | bgcolor(mocha.surface1) | focus;
             transferRows.push_back(item);
         }
-        Element transferList = window(text(" Swarm transfers "),
-            vbox(std::move(transferRows)) | frame) |
+        Element transferList = themedPanel(" Swarm transfers ",
+            vbox(std::move(transferRows)) | frame, mocha.base) |
             size(HEIGHT, LESS_THAN, 7);
 
         Element details;
@@ -1908,7 +1528,7 @@ static int runTui() {
             details = vbox({
                 filler(),
                 text("The dashboard will populate when a download starts.") |
-                    center | color(muted),
+                    center | color(mocha.subtext),
                 filler(),
             });
         } else {
@@ -1921,13 +1541,14 @@ static int runTui() {
                          << "%  " << formatBytes(view.verifiedBytes) << " / "
                          << formatBytes(view.totalBytes) << "  ·  "
                          << view.completed << "/" << view.total << " pieces";
-            Element torrentInfo = window(text(" Torrent information "), vbox({
+            Color progressColor = view.failed ? mocha.red :
+                                  view.finished ? mocha.green : mocha.blue;
+            Element torrentInfo = themedPanel(" Torrent information ", vbox({
                 hbox({text(view.name) | bold, filler(),
-                      text(view.telemetry.destination) | color(muted)}),
-                gauge(static_cast<float>(progress)) |
-                    color(view.failed ? red : green),
-                text(progressText.str()) | color(ink),
-            }));
+                      text(view.telemetry.destination) | color(mocha.subtext)}),
+                gauge(static_cast<float>(progress)) | color(progressColor),
+                text(progressText.str()) | color(mocha.blue),
+            }), mocha.base);
 
             std::size_t minAvailability = view.telemetry.availability.empty() ? 0 :
                 *std::min_element(view.telemetry.availability.begin(),
@@ -1943,8 +1564,8 @@ static int runTui() {
                   << " avg " << std::fixed << std::setprecision(1)
                   << averageAvailability << "  ·  " << view.activeRequests
                   << " active";
-            Element health = window(text(" Swarm health "),
-                text(swarm.str()) | color(ink));
+            Element health = themedPanel(" Swarm health ",
+                text(swarm.str()) | color(mocha.blue), mocha.mantle);
 
             Element legend = hbox({
                 text("■ verified ") | color(stateColor(PieceState::Verified)),
@@ -1954,24 +1575,28 @@ static int runTui() {
                 text("· unavailable ") | color(stateColor(PieceState::Unavailable)),
                 text("! failed") | color(stateColor(PieceState::Failed)),
             });
-            Element pieces = window(text(" Piece lifecycle "),
+            Element pieces = themedPanel(" Piece lifecycle ",
                 vbox({pieceGrid(view, screen.dimx() >= 150 ? 48 : 32),
-                      separator(), legend}));
+                      separator() | color(mocha.surface1), legend}), mocha.base);
             int dashboardWidth = std::max(40, screen.dimx());
             int leftWidth = dashboardWidth < 120 ? dashboardWidth :
                             std::max(60, dashboardWidth * 2 / 3);
             int rightWidth = std::max(40, dashboardWidth - leftWidth);
             std::size_t graphColumns = static_cast<std::size_t>(
                 std::max(12, (leftWidth - 8) / 2));
-            Element graph = window(
-                text(" Rolling speed "), speedGraph(view, graphColumns));
+            Element graph = themedPanel(
+                " Rolling speed ", speedGraph(view, graphColumns), mocha.mantle);
 
             Elements peerRows = {
-                hbox({text("endpoint") | bold | size(WIDTH, EQUAL, 24),
-                      text("pieces") | bold | size(WIDTH, EQUAL, 9),
-                      text("trust") | bold | size(WIDTH, EQUAL, 8),
-                      text("MiB/s") | bold | size(WIDTH, EQUAL, 9),
-                      text("state") | bold})
+                hbox({text("endpoint") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 24),
+                      text("pieces") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 9),
+                      text("trust") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 8),
+                      text("MiB/s") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 9),
+                      text("state") | bold | color(mocha.mauve)})
             };
             for (const auto &peer : view.telemetry.peers) {
                 std::ostringstream trust, speed;
@@ -1984,13 +1609,14 @@ static int runTui() {
                     text(trust.str()) | size(WIDTH, EQUAL, 8),
                     text(speed.str()) | size(WIDTH, EQUAL, 9),
                     text(peer.blacklisted ? "blocked" : "active") |
-                        color(peer.blacklisted ? red : green),
+                        color(peer.blacklisted ? mocha.red : mocha.green),
                 }));
             }
             if (view.telemetry.peers.empty())
-                peerRows.push_back(text("Waiting for peer bitmaps") | color(muted));
-            Element peersPanel = window(text(" Connected peers "),
-                vbox(std::move(peerRows)) | frame);
+                peerRows.push_back(text("Waiting for peer bitmaps") |
+                                   color(mocha.subtext));
+            Element peersPanel = themedPanel(" Connected peers ",
+                vbox(std::move(peerRows)) | frame, mocha.base);
 
             Elements queueRows;
             std::size_t queueShown = 0;
@@ -2008,18 +1634,24 @@ static int runTui() {
                 if (++queueShown == 6) break;
             }
             if (queueRows.empty())
-                queueRows.push_back(text("Queue drained") | color(green));
-            Element scheduler = window(text(" Rarest-first scheduler "),
-                vbox(std::move(queueRows)));
+                queueRows.push_back(text("Queue drained") | color(mocha.green));
+            Element scheduler = themedPanel(" Rarest-first scheduler ",
+                vbox(std::move(queueRows)), mocha.mantle);
 
             Elements workerRows = {
-                hbox({text("worker") | bold | size(WIDTH, EQUAL, 7),
-                      text("piece") | bold | size(WIDTH, EQUAL, 7),
-                      text("peer") | bold | size(WIDTH, EQUAL, 20),
-                      text("done") | bold | size(WIDTH, EQUAL, 6),
-                      text("fail") | bold | size(WIDTH, EQUAL, 6),
-                      text("MiB/s") | bold | size(WIDTH, EQUAL, 8),
-                      text("state") | bold})
+                hbox({text("worker") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 7),
+                      text("piece") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 7),
+                      text("peer") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 20),
+                      text("done") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 6),
+                      text("fail") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 6),
+                      text("MiB/s") | bold | color(mocha.mauve) |
+                          size(WIDTH, EQUAL, 8),
+                      text("state") | bold | color(mocha.mauve)})
             };
             for (const auto &worker : view.telemetry.workers) {
                 double workerSpeed = worker.transferSeconds > 0.0
@@ -2040,23 +1672,31 @@ static int runTui() {
                     text(workerSpeedText.str()) | size(WIDTH, EQUAL, 8),
                     text(worker.state) |
                         color(worker.state == "downloading" ||
-                              worker.state == "endgame" ? amber : muted),
+                              worker.state == "endgame" ?
+                              mocha.peach : mocha.subtext),
                 }));
             }
             if (view.telemetry.workers.empty())
-                workerRows.push_back(text("No active workers") | color(muted));
-            Element workersPanel = window(text(" Workers "),
-                vbox(std::move(workerRows)));
+                workerRows.push_back(text("No active workers") |
+                                     color(mocha.subtext));
+            Element workersPanel = themedPanel(" Workers ",
+                vbox(std::move(workerRows)), mocha.base);
 
             Elements eventRows;
-            std::size_t first = view.telemetry.events.size() > 7
-                ? view.telemetry.events.size() - 7 : 0;
-            for (std::size_t i = first; i < view.telemetry.events.size(); ++i)
+            std::size_t eventCount = view.telemetry.events.size();
+            std::size_t visibleEvents = 7;
+            std::size_t maximumScroll = eventCount > visibleEvents
+                ? eventCount - visibleEvents : 0;
+            eventScroll = std::min(eventScroll, maximumScroll);
+            std::size_t end = eventCount - eventScroll;
+            std::size_t first = end > visibleEvents ? end - visibleEvents : 0;
+            for (std::size_t i = first; i < end; ++i)
                 eventRows.push_back(text("• " + view.telemetry.events[i]));
             if (eventRows.empty())
-                eventRows.push_back(text("Waiting for protocol activity") | color(muted));
-            Element events = window(text(" Protocol events "),
-                vbox(std::move(eventRows)));
+                eventRows.push_back(text("Waiting for protocol activity") |
+                                    color(mocha.subtext));
+            Element events = themedPanel(" Protocol events ",
+                vbox(std::move(eventRows)), mocha.base);
 
             if (screen.dimx() < 120 || screen.dimy() < 35) {
                 int halfWidth = std::max(20, dashboardWidth / 2);
@@ -2093,38 +1733,45 @@ static int runTui() {
         for (std::size_t i = activityFirst; i < commandLog.size(); ++i) {
             bool error = commandLog[i].rfind("ERR", 0) == 0;
             activityRows.push_back(text(commandLog[i]) |
-                                   color(error ? red : muted));
+                                   color(error ? mocha.red : mocha.subtext));
         }
-        Element activity = window(text(" Command activity "),
-            vbox(std::move(activityRows))) | size(HEIGHT, LESS_THAN, 5);
+        Element activity = themedPanel(" Command activity ",
+            vbox(std::move(activityRows)), mocha.mantle) |
+            size(HEIGHT, LESS_THAN, 5);
         Element commandBar = commandMode
-            ? hbox({text(" : ") | bold | color(amber), text(commandInput),
-                    text("█") | color(amber), filler(),
-                    text("Enter run · Esc cancel ") | color(muted)})
-            : hbox({text(" : command") | color(muted), filler(),
-                    text("FTXUI live view ") | color(ocean)});
+            ? hbox({text(" : ") | bold | color(mocha.mauve), text(commandInput),
+                    text("█") | color(mocha.mauve), filler(),
+                    text("Enter run · Esc cancel ") | color(mocha.subtext)})
+            : hbox({text(" : command") | color(mocha.subtext), filler(),
+                    text("FTXUI live view ") | color(mocha.blue)});
+        commandBar = commandBar | color(mocha.text) | bgcolor(mocha.mantle);
 
         Element dashboard = vbox({
             header,
             transferList,
             details | flex,
             activity,
-            separator() | color(ocean),
+            separator() | color(mocha.surface1),
             commandBar,
-        }) | color(ink) | bgcolor(base);
+        }) | color(mocha.text) | bgcolor(mocha.crust);
 
         if (help) {
-            Element helpModal = window(text(" Keyboard and commands "), vbox({
-                text("↑ ↓ ← →   select a download"),
+            Element helpModal = themedPanel(" Keyboard and commands ", vbox({
+                text("↑ ↓ ← →   select a download / command history"),
+                text("PgUp/PgDn  scroll protocol events"),
+                text("c           cancel selected active download"),
                 text(":           open command bar"),
                 text("Enter       execute command / close result"),
                 text("Escape      close command bar, help, or result"),
                 text("F1          toggle this help"),
                 text("F10         exit"),
-                separator(),
-                text("The command bar accepts every classic CLI command.") | color(muted),
-                text("Passwords are masked in command activity history.") | color(muted),
-            })) | size(WIDTH, GREATER_THAN, 62) | clear_under | center;
+                separator() | color(mocha.surface1),
+                text("The command bar accepts every classic CLI command.") |
+                    color(mocha.subtext),
+                text("Passwords are masked in command activity history.") |
+                    color(mocha.subtext),
+            }), mocha.mantle) |
+                size(WIDTH, GREATER_THAN, 62) | clear_under | center;
             dashboard = dbox({dashboard, helpModal});
         } else if (summary && *summary < views.size()) {
             dashboard = dbox({dashboard, completionModal(views[*summary])});
@@ -2139,9 +1786,14 @@ static int runTui() {
         if (first == std::string::npos) return false;
         line.erase(0, first);
         commandLog.push_back("> " + safeCommandForLog(line));
+        if (!commandContainsPassword(line) &&
+            (commandHistory.empty() || commandHistory.back() != line))
+            commandHistory.push_back(line);
+        historyCursor = commandHistory.size();
         std::ostringstream output;
         bool quit = executeCommand(line, output);
         appendLog(commandLog, output.str());
+        if (commandContainsPassword(line)) secureErase(line);
         if (quit) {
             refreshing = false;
             screen.ExitLoopClosure()();
@@ -2163,6 +1815,7 @@ static int runTui() {
             }
             if (statuses.size() > observedDownloadCount) {
                 selected = statuses.size() - 1;
+                eventScroll = 0;
                 observedDownloadCount = statuses.size();
             } else if (statuses.size() < observedDownloadCount) {
                 observedDownloadCount = statuses.size();
@@ -2209,13 +1862,33 @@ static int runTui() {
                 if (!commandInput.empty()) commandInput.pop_back();
                 return true;
             }
+            if (event == Event::ArrowUp) {
+                if (!commandHistory.empty() && historyCursor > 0) {
+                    --historyCursor;
+                    commandInput = commandHistory[historyCursor];
+                }
+                return true;
+            }
+            if (event == Event::ArrowDown) {
+                if (historyCursor + 1 < commandHistory.size()) {
+                    ++historyCursor;
+                    commandInput = commandHistory[historyCursor];
+                } else {
+                    historyCursor = commandHistory.size();
+                    commandInput.clear();
+                }
+                return true;
+            }
             if (event == Event::Return) {
                 if (commandInput.empty()) {
                     commandMode = false;
                     return true;
                 }
                 runCommand(commandInput);
-                commandInput.clear();
+                if (commandContainsPassword(commandInput))
+                    secureErase(commandInput);
+                else
+                    commandInput.clear();
                 return true;
             }
             if (event.is_character()) {
@@ -2243,15 +1916,39 @@ static int runTui() {
         if (event == Event::Character(":")) {
             commandMode = true;
             commandInput.clear();
+            historyCursor = commandHistory.size();
+            return true;
+        }
+        if (event == Event::Character("c")) {
+            std::lock_guard<std::mutex> lock(downloadsMutex);
+            if (selected < downloads.size() && !downloads[selected]->finished) {
+                downloads[selected]->cancelRequested = true;
+                commandLog.push_back("Cancellation requested for " +
+                                     downloads[selected]->name);
+            }
+            return true;
+        }
+        if (event == Event::PageUp) {
+            eventScroll += 6;
+            return true;
+        }
+        if (event == Event::PageDown) {
+            eventScroll = eventScroll > 6 ? eventScroll - 6 : 0;
             return true;
         }
         if (event == Event::ArrowUp || event == Event::ArrowLeft) {
-            if (selected > 0) --selected;
+            if (selected > 0) {
+                --selected;
+                eventScroll = 0;
+            }
             return true;
         }
         if (event == Event::ArrowDown || event == Event::ArrowRight) {
             std::lock_guard<std::mutex> lock(downloadsMutex);
-            if (selected + 1 < downloads.size()) ++selected;
+            if (selected + 1 < downloads.size()) {
+                ++selected;
+                eventScroll = 0;
+            }
             return true;
         }
         return false;
@@ -2291,9 +1988,14 @@ static int runCli() {
 int main(int argc, char **argv) {
     bool tui = argc == 4 && std::string(argv[3]) == "--tui";
     if ((argc != 3 && !tui) || !parseEndpoint(argv[1], peerEndpoint) ||
-        !readTrackerInfo(argv[2])) {
+        !loadTrackerInfo(argv[2], trackers)) {
         std::cerr << "usage: " << argv[0]
                   << " <peer-ip:port> tracker_info.txt [--tui]\n";
+        return 1;
+    }
+    peerKey = PeerIdentity::loadOrCreate(endpointKey(peerEndpoint));
+    if (!peerKey) {
+        std::cerr << "unable to load or create the peer identity key\n";
         return 1;
     }
     std::thread(peerServer).detach();

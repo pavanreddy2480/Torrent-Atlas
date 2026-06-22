@@ -6,4 +6,7 @@ tracker/tracker2
 tracker/tracker
 tests/security_tests
 tests/peer_rejection_test
+tests/tracker_state_tests
+tests/command_parser_tests
 build/
+build-sanitize/

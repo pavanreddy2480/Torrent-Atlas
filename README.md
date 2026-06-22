@@ -6,12 +6,12 @@ This project implements the two-tracker, peer-to-peer file sharing system descri
 ## Build and execution
 
 Requirements: Linux/macOS, CMake 3.16+, a C++17 compiler, POSIX sockets, pthread support,
-`pkg-config`, GMP, Git, and network access during the initial FTXUI configure.
+`pkg-config`, OpenSSL 3.x, Git, and network access during the initial FTXUI configure.
 
 On Debian/Ubuntu:
 
 ```sh
-sudo apt install g++ cmake make git pkg-config libgmp-dev
+sudo apt install g++ cmake make git pkg-config libssl-dev
 ```
 
 ```sh
@@ -57,6 +57,10 @@ Passwords are masked in command history. A completion or failure summary opens a
 Enter or Escape returns to the dashboard. The full layout targets 120×35 and switches to a
 compact layout below that size.
 
+Inside the dashboard, `c` cancels the selected active download while preserving its resume
+manifest. Page Up and Page Down scroll protocol events. In command mode, Up and Down recall
+non-sensitive command history; login and account-creation commands are deliberately excluded.
+
 The original Makefile remains available for classic, non-TUI builds:
 
 ```sh
@@ -81,6 +85,7 @@ upload file <group-id> <file-path>
 list files <group-id>
 download file <group-id> <file-name> <destination-path>
 resume download <group-id> <file-name> <destination-path>
+cancel download <file-name>
 show downloads
 stats
 peer_stats
@@ -90,10 +95,20 @@ logout
 quit
 ```
 
+Paths containing spaces are accepted when quoted or escaped:
+
+```text
+upload file demo "documents/final report.pdf"
+download file demo "final report.pdf" "/tmp/final report.pdf"
+```
+
 `show downloads` uses `[D]` for downloading, `[C]` for complete, and `[F]` for failed. It also
 shows rare-piece count, endgame duplicate requests, and integrity failures. `peer_stats` and
 `show peers` display trust, throughput, failure counters, and blacklist state. A resumed
 download also reports how many pieces survived restart-time revalidation.
+
+The client rejects concurrent downloads targeting the same destination and refuses to overwrite
+an existing completed file. Failed peer requests use exponential backoff with jitter.
 
 `stats` prints a live per-download dashboard:
 
@@ -107,7 +122,7 @@ download also reports how many pieces survived restart-time revalidation.
   security: crypto=2545.2ms network/wait=2431.7ms disk=45.6ms crypto-overhead=50.7%
 ```
 
-The measurements are collected at the signed-DH/AES/HMAC, socket/wait, and
+The measurements are collected at the signed-X25519/AEAD, socket/wait, and
 `pwrite`/`fsync`/manifest boundaries rather than estimated from total runtime.
 
 ## Architecture and data structures
@@ -131,13 +146,14 @@ later clients obtain pieces from peers that are still downloading instead of wai
 finish the complete file.
 
 Peer selection uses a live reputation score based on successful transfers, measured throughput,
-network failures, signature/HMAC failures, and SHA1 mismatches. Authentication and integrity
+network failures, signature/AEAD failures, and SHA1 mismatches. Authentication and integrity
 failures carry heavy penalties. Three such failures blacklist a peer for five minutes. Network
 timeouts reduce preference but do not immediately blacklist a potentially overloaded peer.
 
-Peer piece traffic is protected by signed ephemeral Diffie-Hellman, manual 2048-bit ElGamal
-signatures, AES-256-CBC encryption, and HMAC-SHA256 integrity. Requests include timestamps
-and cached nonces to reject replay. See [SECURITY.md](SECURITY.md).
+Peer piece traffic is protected by OpenSSL Ed25519 signatures, ephemeral X25519 key agreement,
+HKDF-SHA256 key derivation, and ChaCha20-Poly1305 authenticated encryption. Requests include
+timestamps and cached nonces to reject replay. Client identity keys persist in a mode-0700
+identity directory with mode-0600 key files. See [SECURITY.md](SECURITY.md).
 
 Each decrypted piece is SHA1-verified before `pwrite` writes it. A failed or corrupt response is
 retried against other peers. The completed temporary file is streamed through SHA1 again and
@@ -189,10 +205,14 @@ two independent token generators.
 
 Clients try their preferred tracker first and automatically fail over to the second endpoint.
 
+Passwords are stored only as salted PBKDF2-HMAC-SHA256 verifiers in tracker memory. Session
+tokens come from the operating system cryptographic random source. The tracker control channel
+is still plaintext and should be restricted to a trusted network. Five failed passwords lock
+that account on the receiving tracker for 30 seconds.
+
 ## Assumptions and limitations
 
-- User IDs and group IDs contain no whitespace. File paths containing whitespace are not
-  accepted by the interactive parser.
+- User IDs and group IDs contain no whitespace. File paths may be quoted or backslash-escaped.
 - A group owner cannot leave, because owner-only request management otherwise has no defined
   successor in the specification.
 - Tracker metadata is not persisted. Restarting both trackers starts a clean deployment.
@@ -232,4 +252,19 @@ Recommended functional sequence:
 14. Run `stats` repeatedly during a multi-peer transfer and confirm progress, active requests,
     throughput, ETA, failure counters, and cryptographic overhead change live.
 
+CTest also includes cryptographic vectors, command-parser tests, tracker-state tests, and a
+two-process tracker replication/restart integration test. A full client integration test creates
+users and a group, uploads a multi-piece file, transfers it over the authenticated encrypted peer
+protocol, reconstructs it, and compares the result byte for byte.
+
 See [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md) for design rationale and algorithm details.
+
+For an AddressSanitizer and UndefinedBehaviorSanitizer build:
+
+```sh
+cmake -S . -B build-sanitize \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DTORRENT_ENABLE_SANITIZERS=ON
+cmake --build build-sanitize -j
+ctest --test-dir build-sanitize --output-on-failure
+```
