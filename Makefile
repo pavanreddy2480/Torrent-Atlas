@@ -22,9 +22,9 @@ COMMAND_PARSER_TEST = $(BIN_DIR)/tests/command_parser_tests
 all: $(CLIENT) $(TRACKER) $(TRACKER1) $(TRACKER2)
 
 # ----- build rules -----
-$(CLIENT): $(CLIENT_DIR)/client.cpp $(CLIENT_DIR)/command_utils.cpp $(CLIENT_DIR)/command_utils.hpp $(CLIENT_DIR)/download_storage.cpp $(CLIENT_DIR)/download_storage.hpp $(CLIENT_DIR)/network_utils.cpp $(CLIENT_DIR)/network_utils.hpp $(CLIENT_DIR)/telemetry.cpp $(CLIENT_DIR)/telemetry.hpp $(CLIENT_DIR)/tui_model.cpp $(CLIENT_DIR)/tui_model.hpp $(CLIENT_DIR)/client_types.hpp $(CLIENT_DIR)/tui_theme.hpp common/protocol.hpp common/sha1.hpp common/secure_crypto.hpp common/peer_crypto.hpp common/peer_crypto.cpp common/command_parser.hpp
+$(CLIENT): $(CLIENT_DIR)/client.cpp $(CLIENT_DIR)/command_utils.cpp $(CLIENT_DIR)/command_utils.hpp $(CLIENT_DIR)/download_storage.cpp $(CLIENT_DIR)/download_storage.hpp $(CLIENT_DIR)/network_utils.cpp $(CLIENT_DIR)/network_utils.hpp $(CLIENT_DIR)/telemetry.cpp $(CLIENT_DIR)/telemetry.hpp $(CLIENT_DIR)/tui_model.cpp $(CLIENT_DIR)/tui_model.hpp $(CLIENT_DIR)/client_types.hpp $(CLIENT_DIR)/tui_theme.hpp common/protocol.hpp common/sha1.hpp common/secure_crypto.hpp common/command_parser.hpp
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $@ $(CLIENT_DIR)/client.cpp $(CLIENT_DIR)/command_utils.cpp $(CLIENT_DIR)/download_storage.cpp $(CLIENT_DIR)/network_utils.cpp $(CLIENT_DIR)/telemetry.cpp $(CLIENT_DIR)/tui_model.cpp common/peer_crypto.cpp $(OPENSSL_LIBS)
+	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $@ $(CLIENT_DIR)/client.cpp $(CLIENT_DIR)/command_utils.cpp $(CLIENT_DIR)/download_storage.cpp $(CLIENT_DIR)/network_utils.cpp $(CLIENT_DIR)/telemetry.cpp $(CLIENT_DIR)/tui_model.cpp $(OPENSSL_LIBS)
 
 $(TRACKER): $(TRACKER_DIR)/tracker.cpp $(TRACKER_DIR)/tracker_common.hpp common/protocol.hpp common/secure_crypto.hpp
 	@mkdir -p $(@D)
@@ -43,9 +43,9 @@ clean:
 		tests/security_tests tests/peer_rejection_test tests/tracker_state_tests \
 		tests/command_parser_tests
 
-security-test: tests/security_tests.cpp common/secure_crypto.hpp common/peer_crypto.hpp common/peer_crypto.cpp common/protocol.hpp
+security-test: tests/security_tests.cpp common/secure_crypto.hpp common/protocol.hpp
 	@mkdir -p $(dir $(SECURITY_TEST))
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $(SECURITY_TEST) $< common/peer_crypto.cpp $(OPENSSL_LIBS)
+	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $(SECURITY_TEST) $< $(OPENSSL_LIBS)
 	./$(SECURITY_TEST)
 
 peer-rejection-test: tests/peer_rejection_test.cpp common/protocol.hpp

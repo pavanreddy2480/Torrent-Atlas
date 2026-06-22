@@ -1,7 +1,6 @@
 #include "../common/protocol.hpp"
 #include "../common/sha1.hpp"
 #include "../common/secure_crypto.hpp"
-#include "../common/peer_crypto.hpp"
 #include "client_types.hpp"
 #include "command_utils.hpp"
 #include "download_storage.hpp"
@@ -78,9 +77,6 @@ static std::size_t preferredTracker = 0;
 static std::mutex trackerMutex;
 static u64 sessionId = 0;
 static Endpoint peerEndpoint;
-static std::unique_ptr<PeerIdentity> peerKey;
-static std::mutex replayMutex;
-static std::unordered_map<std::string, std::time_t> seenNonces;
 static std::mutex reputationMutex;
 static std::unordered_map<std::string, PeerReputation> reputations;
 
@@ -158,7 +154,7 @@ static std::string uploadCommand(const std::string &group, const std::string &na
     return "upload_file " + group + " " + hexEncode(name) + " " +
            std::to_string(file.size) + " " + file.fullHash + " " + file.capability + " " +
            joinHashes(file.pieceHashes) + " " + peerEndpoint.ip + " " +
-           std::to_string(peerEndpoint.port) + " " + peerKey->publicHex();
+           std::to_string(peerEndpoint.port);
 }
 
 static void peerConnection(int fd) {
@@ -167,104 +163,58 @@ static void peerConnection(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    std::string hello;
-    if (!receiveFrame(fd, hello)) {
+    std::string request;
+    if (!receiveFrame(fd, request)) {
         close(fd);
         return;
     }
-    std::vector<std::string> helloFields = split(hello, '|');
-    if (helloFields.size() != 6 || helloFields[0] != "20") {
+    std::vector<std::string> fields = split(request, '|');
+    if (fields.size() != 6 || fields[0] != "21") {
         sendFrame(fd, "60|malformed");
         close(fd);
         return;
     }
-    std::time_t timestamp = 0;
-    try { timestamp = static_cast<std::time_t>(std::stoll(helloFields[1])); }
-    catch (...) { sendFrame(fd, "60|timestamp"); close(fd); return; }
-    std::time_t now = std::time(nullptr);
-    if (timestamp < now - 60 || timestamp > now + 60) {
-        sendFrame(fd, "60|stale");
-        close(fd);
-        return;
-    }
-    std::string clientNonce;
-    if (!hexDecode(helloFields[2], clientNonce) || clientNonce.size() != 16) {
+    std::string group, name;
+    if (!hexDecode(fields[1], group) || !hexDecode(fields[2], name) ||
+        group.empty() || name.empty()) {
         sendFrame(fd, "60|encoding"); close(fd); return;
     }
-    std::string helloHeader = helloFields[0] + "|" + helloFields[1] + "|" + helloFields[2] +
-                              "|" + helloFields[3] + "|" + helloFields[4];
-    if (!peerKey->verifyHex(helloHeader, helloFields[5], helloFields[4])) {
-        sendFrame(fd, "60|signature"); close(fd); return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(replayMutex);
-        for (auto it = seenNonces.begin(); it != seenNonces.end();) {
-            if (it->second < now - 120) it = seenNonces.erase(it); else ++it;
-        }
-        if (seenNonces.count(helloFields[2])) {
-            sendFrame(fd, "60|replay"); close(fd); return;
-        }
-        seenNonces[helloFields[2]] = timestamp;
-    }
-
-    std::string serverPrivate, serverEphemeral;
-    std::string serverNonce = randomBytes(16), sharedSecret;
-    if (serverNonce.empty() ||
-        !peerKey->generateEphemeral(serverPrivate, serverEphemeral) ||
-        !peerKey->deriveEphemeralSecret(
-            serverPrivate, helloFields[3], sharedSecret)) {
-        sendFrame(fd, "60|key"); close(fd); return;
-    }
-    std::string transcript = helloHeader + "|" + hexEncode(serverNonce) + "|" +
-                             serverEphemeral + "|" + peerKey->publicHex();
-    std::string serverProof = peerKey->signHex(transcript);
-    std::string helloResponse = "25|" + hexEncode(serverNonce) + "|" + serverEphemeral + "|" +
-                                peerKey->publicHex() + "|" + serverProof;
-    if (!sendFrame(fd, helloResponse)) { close(fd); return; }
-
-    secureErase(serverPrivate);
-    std::string sessionKey = peerKey->deriveSessionKey(sharedSecret, transcript);
-    secureErase(sharedSecret);
-    if (sessionKey.empty()) { close(fd); return; }
-
-    std::string request;
-    if (!receiveFrame(fd, request)) { close(fd); return; }
-    std::vector<std::string> fields = split(request, '|');
-    if (fields.size() != 4 || fields[0] != "21") {
-        sendFrame(fd, "60|request"); close(fd); return;
-    }
-    PeerAeadMessage requestMessage;
-    if (!hexDecode(fields[1], requestMessage.nonce) ||
-        !hexDecode(fields[2], requestMessage.ciphertext) ||
-        !hexDecode(fields[3], requestMessage.tag)) {
-        sendFrame(fd, "60|encoding"); close(fd); return;
-    }
-    std::string requestPlain;
-    if (!peerKey->decrypt(sessionKey, "21|" + transcript,
-                          requestMessage, requestPlain)) {
-        sendFrame(fd, "60|aead"); close(fd); return;
-    }
-    std::vector<std::string> requestParts = split(requestPlain, '\n');
-    if (requestParts.size() != 5) { sendFrame(fd, "60|request"); close(fd); return; }
-    std::string operation = requestParts[0], group = requestParts[1];
-    std::string name = requestParts[2], capability = requestParts[4];
-    std::size_t pieceIndex = 0;
-    try { pieceIndex = static_cast<std::size_t>(std::stoull(requestParts[3])); }
-    catch (...) { sendFrame(fd, "60|piece"); close(fd); return; }
     LocalFile file;
-    bool found = false;
     {
         std::lock_guard<std::mutex> lock(sharedMutex);
         auto it = sharedFiles.find(keyFor(group, name));
-        if (it != sharedFiles.end() && constantTimeEqual(it->second.capability, capability) &&
-            (operation == "BITMAP" ||
-             (operation == "GET" && pieceIndex < it->second.pieceHashes.size() &&
-              pieceIndex < it->second.available.size() && it->second.available[pieceIndex]))) {
-            file = it->second;
-            found = true;
+        if (it == sharedFiles.end()) {
+            sendFrame(fd, "60|unauthorized");
+            close(fd);
+            return;
         }
+        file = it->second;
     }
-    if (!found) {
+    std::string key;
+    AesGcmMessage requestMessage;
+    if (!hexDecode(file.capability, key) || key.size() != 32 ||
+        !hexDecode(fields[3], requestMessage.nonce) ||
+        !hexDecode(fields[4], requestMessage.ciphertext) ||
+        !hexDecode(fields[5], requestMessage.tag)) {
+        sendFrame(fd, "60|encoding"); close(fd); return;
+    }
+    std::string requestAad =
+        "21|" + fields[1] + "|" + fields[2];
+    std::string requestPlain;
+    if (!aes256GcmDecrypt(key, requestAad, requestMessage, requestPlain)) {
+        sendFrame(fd, "60|aead"); close(fd); return;
+    }
+    std::vector<std::string> requestParts = split(requestPlain, '\n');
+    if (requestParts.size() != 2) {
+        sendFrame(fd, "60|request"); close(fd); return;
+    }
+    std::string operation = requestParts[0];
+    std::size_t pieceIndex = 0;
+    try { pieceIndex = static_cast<std::size_t>(std::stoull(requestParts[1])); }
+    catch (...) { sendFrame(fd, "60|piece"); close(fd); return; }
+    if (operation != "BITMAP" &&
+        (operation != "GET" || pieceIndex >= file.pieceHashes.size() ||
+         pieceIndex >= file.available.size() || !file.available[pieceIndex])) {
         sendFrame(fd, "60|unauthorized");
         close(fd);
         return;
@@ -303,30 +253,16 @@ static void peerConnection(int fd) {
         close(fd);
         return;
     }
-    {
-        std::string responseNonce = randomBytes(16);
-        std::string responseAad = "30|" + transcript + "|" +
-                                  helloFields[2] + "|" +
-                                  hexEncode(responseNonce);
-        PeerAeadMessage responseMessage;
-        if (responseNonce.empty() ||
-            !peerKey->encrypt(sessionKey, responseAad, responsePlain,
-                              responseMessage)) {
-            sendFrame(fd, "60|encrypt");
-            close(fd);
-            return;
-        }
-        std::string signedResponse =
-            responseAad + "|" + hexEncode(responseMessage.nonce) + "|" +
-            hexEncode(responseMessage.ciphertext) + "|" +
-            hexEncode(responseMessage.tag);
-        std::string response = "30|" + hexEncode(responseNonce) + "|" +
-                               hexEncode(responseMessage.nonce) + "|" +
-                               hexEncode(responseMessage.ciphertext) + "|" +
-                               hexEncode(responseMessage.tag) + "|" +
-                               peerKey->signHex(signedResponse);
-        sendFrame(fd, response);
+    std::string responseAad = "30|" + requestAad + "|" + fields[3];
+    AesGcmMessage responseMessage;
+    if (!aes256GcmEncrypt(key, responseAad, responsePlain, responseMessage)) {
+        sendFrame(fd, "60|encrypt");
+        close(fd);
+        return;
     }
+    sendFrame(fd, "30|" + hexEncode(responseMessage.nonce) + "|" +
+                  hexEncode(responseMessage.ciphertext) + "|" +
+                  hexEncode(responseMessage.tag));
     close(fd);
 }
 
@@ -347,7 +283,11 @@ static void peerServer() {
     close(listener);
 }
 
-static TransferResult securePeerRequest(const PeerInfo &peer, const std::string &plain,
+static TransferResult securePeerRequest(const PeerInfo &peer,
+                                        const std::string &group,
+                                        const std::string &name,
+                                        const std::string &capability,
+                                        const std::string &plain,
                                         std::string &responsePlain, double &seconds,
                                         const std::shared_ptr<DownloadStatus> &status) {
     auto started = std::chrono::steady_clock::now();
@@ -372,75 +312,23 @@ static TransferResult securePeerRequest(const PeerInfo &peer, const std::string 
     } telemetry(status);
     int fd = connectTcp(peer.endpoint.ip, peer.endpoint.port);
     if (fd < 0) return TransferResult::NetworkFailure;
-    std::string clientPrivate, clientEphemeral, clientNonce = randomBytes(16);
+    std::string key;
+    if (!hexDecode(capability, key) || key.size() != 32) {
+        close(fd);
+        return TransferResult::AuthenticationFailure;
+    }
+    std::string requestAad =
+        "21|" + hexEncode(group) + "|" + hexEncode(name);
+    AesGcmMessage requestMessage;
     auto cryptoStarted = std::chrono::steady_clock::now();
-    bool ephemeralReady = !clientNonce.empty() &&
-                          peerKey->generateEphemeral(
-                              clientPrivate, clientEphemeral);
-    telemetry.crypto += elapsedMicroseconds(cryptoStarted);
-    if (!ephemeralReady) {
-        close(fd);
-        return TransferResult::NetworkFailure;
-    }
-    std::string helloHeader = "20|" + std::to_string(std::time(nullptr)) + "|" +
-                              hexEncode(clientNonce) + "|" + clientEphemeral + "|" +
-                              peerKey->publicHex();
-    cryptoStarted = std::chrono::steady_clock::now();
-    std::string clientProof = peerKey->signHex(helloHeader);
-    telemetry.crypto += elapsedMicroseconds(cryptoStarted);
-    std::string hello = helloHeader + "|" + clientProof;
-    std::string helloResponse;
-    if (!sendFrame(fd, hello) || !receiveFrame(fd, helloResponse)) {
-        close(fd);
-        return TransferResult::NetworkFailure;
-    }
-    std::vector<std::string> helloFields = split(helloResponse, '|');
-    if (helloFields.size() != 5 || helloFields[0] != "25" ||
-        helloFields[3] != peer.publicKey) {
-        close(fd);
-        return TransferResult::AuthenticationFailure;
-    }
-    std::string serverNonce;
-    if (!hexDecode(helloFields[1], serverNonce) || serverNonce.size() != 16) {
-        close(fd);
-        return TransferResult::AuthenticationFailure;
-    }
-    std::string transcript = helloHeader + "|" + helloFields[1] + "|" +
-                             helloFields[2] + "|" + helloFields[3];
-    cryptoStarted = std::chrono::steady_clock::now();
-    bool serverVerified = peerKey->verifyHex(
-        transcript, helloFields[4], peer.publicKey);
-    telemetry.crypto += elapsedMicroseconds(cryptoStarted);
-    if (!serverVerified) {
-        close(fd);
-        return TransferResult::AuthenticationFailure;
-    }
-    std::string sharedSecret;
-    cryptoStarted = std::chrono::steady_clock::now();
-    bool secretReady = peerKey->deriveEphemeralSecret(
-        clientPrivate, helloFields[2], sharedSecret);
-    telemetry.crypto += elapsedMicroseconds(cryptoStarted);
-    if (!secretReady) {
-        close(fd);
-        return TransferResult::AuthenticationFailure;
-    }
-    secureErase(clientPrivate);
-    std::string sessionKey = peerKey->deriveSessionKey(sharedSecret, transcript);
-    secureErase(sharedSecret);
-    if (sessionKey.empty()) {
-        close(fd);
-        return TransferResult::AuthenticationFailure;
-    }
-    cryptoStarted = std::chrono::steady_clock::now();
-    PeerAeadMessage requestMessage;
-    bool encrypted = peerKey->encrypt(
-        sessionKey, "21|" + transcript, plain, requestMessage);
+    bool encrypted =
+        aes256GcmEncrypt(key, requestAad, plain, requestMessage);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
     if (!encrypted) {
         close(fd);
         return TransferResult::NetworkFailure;
     }
-    std::string request = "21|" + hexEncode(requestMessage.nonce) + "|" +
+    std::string request = requestAad + "|" + hexEncode(requestMessage.nonce) + "|" +
                           hexEncode(requestMessage.ciphertext) + "|" +
                           hexEncode(requestMessage.tag);
     std::string response;
@@ -450,33 +338,22 @@ static TransferResult securePeerRequest(const PeerInfo &peer, const std::string 
     if (!ok) return TransferResult::NetworkFailure;
     std::vector<std::string> fields = split(response, '|');
     if (fields.size() >= 2 && fields[0] == "60") {
-        if (fields[1] == "unauthorized" || fields[1] == "aead" || fields[1] == "key" ||
-            fields[1] == "replay" || fields[1] == "stale" || fields[1] == "signature")
+        if (fields[1] == "unauthorized" || fields[1] == "aead")
             return TransferResult::AuthenticationFailure;
         return TransferResult::Unavailable;
     }
-    if (fields.size() != 6 || fields[0] != "30")
+    if (fields.size() != 4 || fields[0] != "30")
         return TransferResult::AuthenticationFailure;
-    std::string responseNonce;
-    PeerAeadMessage responseMessage;
-    if (!hexDecode(fields[1], responseNonce) || responseNonce.size()!=16 ||
-        !hexDecode(fields[2], responseMessage.nonce) ||
-        !hexDecode(fields[3], responseMessage.ciphertext) ||
-        !hexDecode(fields[4], responseMessage.tag))
+    AesGcmMessage responseMessage;
+    if (!hexDecode(fields[1], responseMessage.nonce) ||
+        !hexDecode(fields[2], responseMessage.ciphertext) ||
+        !hexDecode(fields[3], responseMessage.tag))
         return TransferResult::AuthenticationFailure;
-    std::string responseAad = "30|" + transcript + "|" +
-                              hexEncode(clientNonce) + "|" + fields[1];
-    std::string signedResponse =
-        responseAad + "|" + fields[2] + "|" + fields[3] + "|" + fields[4];
+    std::string responseAad =
+        "30|" + requestAad + "|" + hexEncode(requestMessage.nonce);
     cryptoStarted = std::chrono::steady_clock::now();
-    bool responseSignatureValid = peerKey->verifyHex(
-        signedResponse, fields[5], peer.publicKey);
-    telemetry.crypto += elapsedMicroseconds(cryptoStarted);
-    if (!responseSignatureValid)
-        return TransferResult::AuthenticationFailure;
-    cryptoStarted = std::chrono::steady_clock::now();
-    bool decrypted = peerKey->decrypt(
-        sessionKey, responseAad, responseMessage, responsePlain);
+    bool decrypted =
+        aes256GcmDecrypt(key, responseAad, responseMessage, responsePlain);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
     if (!decrypted)
         return TransferResult::AuthenticationFailure;
@@ -490,7 +367,7 @@ static TransferResult fetchPieceData(const PeerInfo &peer, const std::string &gr
                                      const std::shared_ptr<DownloadStatus> &status) {
     double seconds = 0.0;
     TransferResult result = securePeerRequest(
-        peer, "GET\n" + group + "\n" + name + "\n" + std::to_string(index) + "\n" + capability,
+        peer, group, name, capability, "GET\n" + std::to_string(index),
         piece, seconds, status);
     if (result != TransferResult::Success) {
         recordPeerResult(peer, result);
@@ -543,7 +420,7 @@ static bool fetchBitmap(const PeerInfo &peer, const std::string &group,
     std::string response;
     double seconds = 0.0;
     TransferResult result = securePeerRequest(
-        peer, "BITMAP\n" + group + "\n" + name + "\n0\n" + capability,
+        peer, group, name, capability, "BITMAP\n0",
         response, seconds, status);
     if (result != TransferResult::Success || response.size() != pieceCount) {
         recordPeerResult(peer, result == TransferResult::Success
@@ -1100,19 +977,9 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
             metadata.pieceHashes = hashes == "-" ? std::vector<std::string>{} : split(hashes, ',');
             std::vector<PeerInfo> peers;
             for (const auto &peerText : split(peersText, ',')) {
-                std::size_t lastColon = peerText.rfind(':');
-                std::size_t firstColon = lastColon == std::string::npos ? std::string::npos :
-                                         peerText.rfind(':', lastColon - 1);
-                if (firstColon == std::string::npos || lastColon == std::string::npos) continue;
                 Endpoint endpoint;
-                if (parseEndpoint(peerText.substr(0, lastColon), endpoint)) {
-                    std::string publicKey = peerText.substr(lastColon + 1);
-                    std::string decodedPublicKey;
-                    if (publicKey.size() == 64 &&
-                        hexDecode(publicKey, decodedPublicKey) &&
-                        decodedPublicKey.size() == 32)
-                        peers.push_back({endpoint, publicKey});
-                }
+                if (parseEndpoint(peerText, endpoint))
+                    peers.push_back({endpoint});
             }
             if (peers.empty()) {
                 std::lock_guard<std::mutex> lock(activeDestinationsMutex);
@@ -1991,11 +1858,6 @@ int main(int argc, char **argv) {
         !loadTrackerInfo(argv[2], trackers)) {
         std::cerr << "usage: " << argv[0]
                   << " <peer-ip:port> tracker_info.txt [--tui]\n";
-        return 1;
-    }
-    peerKey = PeerIdentity::loadOrCreate(endpointKey(peerEndpoint));
-    if (!peerKey) {
-        std::cerr << "unable to load or create the peer identity key\n";
         return 1;
     }
     std::thread(peerServer).detach();

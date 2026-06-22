@@ -24,7 +24,6 @@ struct Endpoint {
 
 struct SeederInfo {
     Endpoint endpoint;
-    std::string publicKey;
 };
 
 struct FileInfo {
@@ -158,7 +157,7 @@ public:
                 for (const auto &seeder : file.seeders)
                     output << "D " << encodedGroup << ' ' << encodedFile << ' '
                            << hexEncode(seeder.first) << ' ' << hexEncode(seeder.second.endpoint.ip) << ' '
-                           << seeder.second.endpoint.port << ' ' << seeder.second.publicKey << '\n';
+                           << seeder.second.endpoint.port << '\n';
             }
         }
         return output.str();
@@ -211,12 +210,11 @@ public:
                 file.pieceHashes = d == "-" ? std::vector<std::string>{} : split(d, ',');
             } else if (type == 'D') {
                 int port = 0;
-                std::string publicKey;
-                record >> a >> b >> c >> d >> port >> publicKey;
+                record >> a >> b >> c >> d >> port;
                 std::string group, name, user, ip;
                 if (!record || !hexDecode(a, group) || !hexDecode(b, name) ||
                     !hexDecode(c, user) || !hexDecode(d, ip)) return false;
-                groups[group].files[name].seeders[user] = {{ip, port}, publicKey};
+                groups[group].files[name].seeders[user] = {{ip, port}};
             } else {
                 return false;
             }
@@ -378,20 +376,18 @@ public:
             return {"OK request accepted", session, true};
         }
         if (command == "upload_file") {
-            std::string group, encodedName, fullHash, capability, hashes, ip, publicKey;
+            std::string group, encodedName, fullHash, capability, hashes, ip;
             u64 size = 0;
             int port = 0;
-            input >> group >> encodedName >> size >> fullHash >> capability >> hashes >> ip >> port >> publicKey;
+            input >> group >> encodedName >> size >> fullHash >> capability >> hashes >> ip >> port;
             std::string name;
             std::string capabilityBytes;
             if (!requireLogin()) return {"ERR login required", session, false};
             auto groupIt = groups_.find(group);
             if (groupIt == groups_.end()) return {"ERR no such group", session, false};
             if (!groupIt->second.members.count(user)) return {"ERR not a group member", session, false};
-            std::string publicKeyBytes;
             if (!hexDecode(encodedName, name) || !hexDecode(capability, capabilityBytes) ||
-                !hexDecode(publicKey, publicKeyBytes) ||
-                publicKeyBytes.size() != 32 || name.empty() || fullHash.size() != 40 ||
+                name.empty() || fullHash.size() != 40 ||
                 capability.size() != 64 || ip.empty() || port <= 0 ||
                 capabilityBytes.size() != 32)
                 return {"ERR invalid upload metadata", session, false};
@@ -410,7 +406,7 @@ public:
                 file.capability = capability;
                 file.pieceHashes = std::move(pieceHashes);
             }
-            file.seeders[user] = {{ip, port}, publicKey};
+            file.seeders[user] = {{ip, port}};
             return {"OK file shared " + file.capability, session, true};
         }
         if (command == "list_files") {
@@ -444,8 +440,7 @@ public:
                 if (!first) response.push_back(',');
                 first = false;
                 response += seeder.second.endpoint.ip + ":" +
-                            std::to_string(seeder.second.endpoint.port) + ":" +
-                            seeder.second.publicKey;
+                            std::to_string(seeder.second.endpoint.port);
             }
             return {response, session, false};
         }

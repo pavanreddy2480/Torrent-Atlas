@@ -8,7 +8,7 @@ The project is built around three goals:
 
 - practical peer-to-peer file sharing with direct client-to-client transfers;
 - a responsive terminal dashboard for live swarm visibility and control;
-- a security model that treats peer traffic as an authenticated, encrypted channel.
+- a simple shared-key security model for encrypted peer traffic.
 
 ## Screenshots
 
@@ -23,12 +23,13 @@ After completion:
 ## Features
 
 - Two independent trackers with in-memory metadata replication and failover.
-- Direct client-to-client piece transfer with signed ephemeral handshakes.
+- Direct client-to-client piece transfer encrypted with AES-256-GCM.
+- Tracker-issued 256-bit file capabilities used for authorization and peer encryption.
 - Piece-level scheduling with rare-piece prioritization and endgame duplication.
 - Resume support with durable `.part` and `.resume` files.
 - Live telemetry for progress, availability, throughput, peer trust, and protocol events.
 - Command-line mode and an FTXUI-based interactive TUI.
-- Password verification, session handling, and peer identity keys backed by OpenSSL.
+- Password verification, session handling, and peer encryption backed by OpenSSL.
 
 ## Repository Layout
 
@@ -42,7 +43,7 @@ After completion:
 ├── CMakeLists.txt       # Primary build
 ├── Makefile             # Classic build and test targets
 ├── README.md            # This file
-├── SECURITY.md         # Protocol and threat-model notes
+├── SECURITY.md          # Protocol and threat-model notes
 └── TECHNICAL_REPORT.md  # Design rationale and implementation details
 ```
 
@@ -181,22 +182,60 @@ download file demo "final report.pdf" "/tmp/final report.pdf"
 5. Start the download and watch the live telemetry in `stats` or the TUI.
 6. Verify the result with `cmp`, `sha1sum`, or `shasum`.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Control["Control plane: metadata and authorization"]
+        T1["Tracker 1<br/>users, groups, files, sessions"]
+        T2["Tracker 2<br/>replicated in-memory state"]
+        T1 <-->|"asynchronous replication<br/>and snapshot recovery"| T2
+    end
+
+    subgraph Peers["Data plane: direct peer transfer"]
+        S["Seeder client<br/>peer server + local file"]
+        D["Downloader client<br/>scheduler + partial file"]
+    end
+
+    S -->|"login, upload metadata,<br/>endpoint, hashes, capability"| T1
+    D -->|"login, group membership,<br/>download metadata request"| T2
+    T2 -->|"piece hashes, seeder endpoint,<br/>256-bit file capability"| D
+    D -->|"AES-256-GCM encrypted<br/>BITMAP / GET request"| S
+    S -->|"AES-256-GCM encrypted<br/>bitmap / piece response"| D
+    D -->|"SHA-1 verification,<br/>pwrite, resume manifest"| F["Completed file"]
+```
+
+Trackers coordinate access but do not relay file data. Clients contact either tracker for
+metadata and authorization, then communicate directly for piece transfer. If one tracker is
+unavailable, clients fail over to the other.
+
+### Download data flow
+
+1. The tracker verifies that the downloader belongs to the group.
+2. It returns piece hashes, seeder endpoints, and the file's random 256-bit capability.
+3. The downloader uses the capability as the AES-256-GCM key.
+4. The downloader requests encrypted bitmaps, schedules rare pieces first, and downloads pieces
+   directly from seeders.
+5. Each decrypted piece is checked against its SHA-1 hash before being written.
+6. After all pieces pass, the complete file is hashed and atomically moved into place.
+
 ## Security Model
 
-The peer protocol uses:
+The peer protocol uses one simple shared-key design:
 
-- Ed25519 signatures for persistent client identities;
-- X25519 for ephemeral key agreement;
-- HKDF-SHA256 for transcript-bound session keys;
-- ChaCha20-Poly1305 for authenticated encryption;
-- timestamp and nonce checks to reject replay.
+- the tracker gives authorized members a random 256-bit file capability;
+- peers use that capability as an AES-256-GCM key;
+- AES-GCM uses a fresh random nonce for each request and response;
+- AES-GCM encrypts peer traffic and rejects modified ciphertext or metadata;
+- existing SHA-1 piece hashes verify downloaded file contents.
 
-Tracker passwords are stored as salted PBKDF2-HMAC-SHA256 verifiers. Client identity keys
-persist in a restricted local directory by default under `~/.torrent-dashboard/identities`.
+Tracker passwords are stored as salted PBKDF2-HMAC-SHA256 verifiers. Peer identity keys are not
+required. Tracker traffic is not encrypted, so the current design assumes the trackers and
+clients run on a trusted network.
 
 For the deeper security notes, see [SECURITY.md](SECURITY.md).
 
-## Architecture
+## Storage and Scheduling
 
 - Trackers keep users, sessions, groups, files, and seeders in memory.
 - Clients keep completed downloads, partial downloads, resume manifests, and peer reputation.
@@ -208,7 +247,7 @@ For the deeper security notes, see [SECURITY.md](SECURITY.md).
 
 The repository includes unit and integration coverage for:
 
-- cryptographic primitives and peer identity persistence;
+- AES-GCM and password-derivation primitives;
 - command parsing;
 - tracker state behavior;
 - tracker-to-tracker replication and restart recovery;

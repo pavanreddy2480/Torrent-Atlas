@@ -30,7 +30,6 @@ struct LocalFile {
 
 struct PeerInfo {
     Endpoint endpoint;
-    std::string publicKey;
 };
 
 enum class PieceState {

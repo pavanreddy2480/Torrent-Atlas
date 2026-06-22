@@ -69,12 +69,11 @@ one-byte success/error marker before binary data.
 The protocol deliberately opens short-lived connections. This simplifies failure isolation and
 avoids shared connection synchronization while still supporting concurrent transfers.
 
-Peer requests extend the security model in `security.pdf` with forward secrecy. Both peers
-generate fresh X25519 values and sign the complete exchange using persistent Ed25519 identity
-keys. HKDF-SHA256 derives a transcript-bound session key; long-term keys never derive the
-content-encryption key. Request/response nonces provide freshness, and ChaCha20-Poly1305
-provides authenticated encryption. The OpenSSL-backed implementation and primitive tests are
-in `common/peer_crypto.cpp`, `common/secure_crypto.hpp`, and `tests/security_tests.cpp`.
+Peer security uses the tracker-issued 256-bit file capability directly as an AES-256-GCM key.
+There is no separate handshake. AES-GCM encrypts each request and response and rejects modified
+messages. Group and file identifiers are authenticated metadata, while operations, piece indexes,
+bitmaps, and piece data are encrypted. The implementation and primitive tests are in
+`common/secure_crypto.hpp` and `tests/security_tests.cpp`.
 
 ## Concurrency and resource control
 
@@ -104,7 +103,7 @@ Instrumentation records:
 - discovered/responsive peers, active secure requests, and protocol events;
 - retries separated into network, authentication, unavailable-piece, and corruption causes;
 - rolling speed samples and rare-piece/endgame scheduler decisions;
-- microseconds spent in signed X25519/AEAD, network/wait, and durable disk/manifest work.
+- microseconds spent in AES-GCM, network/wait, and durable disk/manifest work.
 
 The `stats` command renders text snapshots. The CMake-built FTXUI dashboard renders the same
 state as a live piece grid, speed graph, peer table, scheduler view, worker table, and event log.
@@ -119,7 +118,7 @@ scrolls protocol events independently, and exposes cancellation for the selected
 CTest covers published cryptographic vectors, PBKDF2, quoted command parsing, password/session
 state behavior, live two-tracker replication, and clean state after both tracker processes
 restart. A process-level client test additionally exercises account/group setup, multi-piece
-upload, the signed ephemeral peer protocol, reconstruction, final hashing, and byte-for-byte
+upload, the AES-GCM peer protocol, reconstruction, final hashing, and byte-for-byte
 output comparison. CMake optionally enables AddressSanitizer and UndefinedBehaviorSanitizer for
 every project target with `TORRENT_ENABLE_SANITIZERS=ON`.
 
@@ -137,8 +136,8 @@ every project target with `TORRENT_ENABLE_SANITIZERS=ON`.
 - Slow final pieces: duplicate endgame requests with first-valid-response selection.
 - Client crashes: durable per-piece manifests, restart-time SHA1 revalidation, and automatic
   continuation from the missing-piece set.
-- Long-term key compromise: signed ephemeral Diffie-Hellman provides forward secrecy for past
-  piece-transfer sessions.
+- Security complexity: tracker-issued file capabilities double as AES keys, avoiding a separate
+  peer handshake.
 
 ## External resources
 

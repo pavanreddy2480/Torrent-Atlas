@@ -2,7 +2,6 @@
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #include <cstdint>
@@ -26,16 +25,11 @@ inline bool validIntLength(std::size_t length) {
 
 }  // namespace secure_crypto_detail
 
-inline std::string sha256(const std::string &data) {
-    std::string digest(EVP_MAX_MD_SIZE, '\0');
-    unsigned int length = 0;
-    if (!EVP_Digest(data.data(), data.size(),
-                    reinterpret_cast<unsigned char *>(digest.data()), &length,
-                    EVP_sha256(), nullptr))
-        return {};
-    digest.resize(length);
-    return digest;
-}
+struct AesGcmMessage {
+    std::string nonce;
+    std::string ciphertext;
+    std::string tag;
+};
 
 inline bool secureRandom(void *buffer, std::size_t length) {
     if (!secure_crypto_detail::validIntLength(length)) return false;
@@ -48,20 +42,6 @@ inline std::string randomBytes(std::size_t length) {
     std::string result(length, '\0');
     if (length != 0 && !secureRandom(result.data(), length)) result.clear();
     return result;
-}
-
-inline std::string hmacSha256(const std::string &key,
-                              const std::string &message) {
-    std::string digest(EVP_MAX_MD_SIZE, '\0');
-    unsigned int length = 0;
-    if (!secure_crypto_detail::validIntLength(key.size()) ||
-        !HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
-              reinterpret_cast<const unsigned char *>(message.data()),
-              message.size(),
-              reinterpret_cast<unsigned char *>(digest.data()), &length))
-        return {};
-    digest.resize(length);
-    return digest;
 }
 
 inline std::string pbkdf2HmacSha256(const std::string &password,
@@ -96,62 +76,100 @@ inline void secureErase(std::string &value) {
     value.clear();
 }
 
-inline std::string aes256CbcEncrypt(const std::string &key,
-                                    const std::string &iv,
-                                    const std::string &plain) {
-    if (key.size() != 32 || iv.size() != 16 ||
+inline bool aes256GcmEncrypt(const std::string &key, const std::string &aad,
+                             const std::string &plain,
+                             AesGcmMessage &message) {
+    constexpr std::size_t NONCE_SIZE = 12;
+    constexpr std::size_t TAG_SIZE = 16;
+    if (key.size() != 32 ||
+        !secure_crypto_detail::validIntLength(aad.size()) ||
         !secure_crypto_detail::validIntLength(plain.size()))
-        return {};
+        return false;
+    message.nonce = randomBytes(NONCE_SIZE);
+    message.ciphertext.assign(plain.size() + EVP_MAX_BLOCK_LENGTH, '\0');
+    message.tag.assign(TAG_SIZE, '\0');
+    if (message.nonce.size() != NONCE_SIZE) return false;
     secure_crypto_detail::CipherContext context(EVP_CIPHER_CTX_new());
     if (!context ||
-        EVP_EncryptInit_ex(context.get(), EVP_aes_256_cbc(), nullptr,
-                           reinterpret_cast<const unsigned char *>(key.data()),
-                           reinterpret_cast<const unsigned char *>(iv.data())) != 1)
-        return {};
-    std::string cipher(plain.size() + EVP_MAX_BLOCK_LENGTH, '\0');
-    int first = 0;
-    int final = 0;
-    if (EVP_EncryptUpdate(
+        EVP_EncryptInit_ex(context.get(), EVP_aes_256_gcm(), nullptr, nullptr,
+                           nullptr) != 1 ||
+        EVP_EncryptInit_ex(
+            context.get(), nullptr, nullptr,
+            reinterpret_cast<const unsigned char *>(key.data()),
+            reinterpret_cast<const unsigned char *>(message.nonce.data())) != 1)
+        return false;
+    int length = 0;
+    if (!aad.empty() &&
+        EVP_EncryptUpdate(
+            context.get(), nullptr, &length,
+            reinterpret_cast<const unsigned char *>(aad.data()),
+            static_cast<int>(aad.size())) != 1)
+        return false;
+    length = 0;
+    if (!plain.empty() &&
+        EVP_EncryptUpdate(
             context.get(),
-            reinterpret_cast<unsigned char *>(cipher.data()), &first,
+            reinterpret_cast<unsigned char *>(message.ciphertext.data()),
+            &length,
             reinterpret_cast<const unsigned char *>(plain.data()),
-            static_cast<int>(plain.size())) != 1 ||
-        EVP_EncryptFinal_ex(
+            static_cast<int>(plain.size())) != 1)
+        return false;
+    int total = length;
+    if (EVP_EncryptFinal_ex(
             context.get(),
-            reinterpret_cast<unsigned char *>(cipher.data()) + first,
-            &final) != 1)
-        return {};
-    cipher.resize(static_cast<std::size_t>(first + final));
-    return cipher;
+            reinterpret_cast<unsigned char *>(message.ciphertext.data()) + total,
+            &length) != 1 ||
+        EVP_CIPHER_CTX_ctrl(context.get(), EVP_CTRL_GCM_GET_TAG,
+                            static_cast<int>(message.tag.size()),
+                            message.tag.data()) != 1)
+        return false;
+    message.ciphertext.resize(static_cast<std::size_t>(total + length));
+    return true;
 }
 
-inline bool aes256CbcDecrypt(const std::string &key,
-                             const std::string &iv,
-                             const std::string &cipher,
+inline bool aes256GcmDecrypt(const std::string &key, const std::string &aad,
+                             const AesGcmMessage &message,
                              std::string &plain) {
-    if (key.size() != 32 || iv.size() != 16 || cipher.empty() ||
-        !secure_crypto_detail::validIntLength(cipher.size()))
+    if (key.size() != 32 || message.nonce.size() != 12 ||
+        message.tag.size() != 16 ||
+        !secure_crypto_detail::validIntLength(aad.size()) ||
+        !secure_crypto_detail::validIntLength(message.ciphertext.size()))
         return false;
     secure_crypto_detail::CipherContext context(EVP_CIPHER_CTX_new());
     if (!context ||
-        EVP_DecryptInit_ex(context.get(), EVP_aes_256_cbc(), nullptr,
-                           reinterpret_cast<const unsigned char *>(key.data()),
-                           reinterpret_cast<const unsigned char *>(iv.data())) != 1)
+        EVP_DecryptInit_ex(context.get(), EVP_aes_256_gcm(), nullptr, nullptr,
+                           nullptr) != 1 ||
+        EVP_DecryptInit_ex(
+            context.get(), nullptr, nullptr,
+            reinterpret_cast<const unsigned char *>(key.data()),
+            reinterpret_cast<const unsigned char *>(message.nonce.data())) != 1)
         return false;
-    std::string output(cipher.size(), '\0');
-    int first = 0;
-    int final = 0;
-    if (EVP_DecryptUpdate(
-            context.get(),
-            reinterpret_cast<unsigned char *>(output.data()), &first,
-            reinterpret_cast<const unsigned char *>(cipher.data()),
-            static_cast<int>(cipher.size())) != 1 ||
+    std::string output(message.ciphertext.size() + EVP_MAX_BLOCK_LENGTH, '\0');
+    int length = 0;
+    if (!aad.empty() &&
+        EVP_DecryptUpdate(
+            context.get(), nullptr, &length,
+            reinterpret_cast<const unsigned char *>(aad.data()),
+            static_cast<int>(aad.size())) != 1)
+        return false;
+    length = 0;
+    if (!message.ciphertext.empty() &&
+        EVP_DecryptUpdate(
+            context.get(), reinterpret_cast<unsigned char *>(output.data()),
+            &length,
+            reinterpret_cast<const unsigned char *>(message.ciphertext.data()),
+            static_cast<int>(message.ciphertext.size())) != 1)
+        return false;
+    int total = length;
+    if (EVP_CIPHER_CTX_ctrl(
+            context.get(), EVP_CTRL_GCM_SET_TAG,
+            static_cast<int>(message.tag.size()),
+            const_cast<char *>(message.tag.data())) != 1 ||
         EVP_DecryptFinal_ex(
-            context.get(),
-            reinterpret_cast<unsigned char *>(output.data()) + first,
-            &final) != 1)
+            context.get(), reinterpret_cast<unsigned char *>(output.data()) + total,
+            &length) != 1)
         return false;
-    output.resize(static_cast<std::size_t>(first + final));
+    output.resize(static_cast<std::size_t>(total + length));
     plain = std::move(output);
     return true;
 }
