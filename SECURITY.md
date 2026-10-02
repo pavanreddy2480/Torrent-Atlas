@@ -53,5 +53,6 @@ AES-GCM with that key to encrypt and authenticate requests and responses.
 Run the complete test suite with:
 
 ```sh
-make test
+cmake -S . -B build && cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```

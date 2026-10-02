@@ -34,14 +34,15 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The Makefile is only a convenience wrapper:
+For an AddressSanitizer/UndefinedBehaviorSanitizer build:
 
 ```sh
-make build
-make test
-make sanitize
-make clean
+cmake -S . -B build-sanitize -DTORRENT_ENABLE_SANITIZERS=ON
+cmake --build build-sanitize -j
+ctest --test-dir build-sanitize --output-on-failure
 ```
+
+Build output goes in `build/` (or `build-sanitize/`), which git ignores. Delete it any time; the commands above recreate it.
 
 ## Local demo
 
