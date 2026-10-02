@@ -15,7 +15,7 @@ The supported process forms are:
 ```text
 tracker <two-endpoint-config> <1|2>
 tracker_lb <listen-and-two-backends-config>
-client <peer-ip:port> <one-LB-endpoint-config> [--tui]
+client <peer-ip:port> <one-LB-endpoint-config>
 ```
 
 ## Routing

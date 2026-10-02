@@ -1,26 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
-project(TorrentDashboard LANGUAGES CXX)
+project(Torrent LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 option(TORRENT_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
-option(TORRENT_ENABLE_FTXUI "Build the interactive FTXUI client" ON)
-
-if(TORRENT_ENABLE_FTXUI)
-  include(FetchContent)
-  set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-  set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(
-    ftxui
-    GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
-    GIT_TAG v7.0.0
-    GIT_SHALLOW TRUE
-  )
-  FetchContent_MakeAvailable(ftxui)
-endif()
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -42,17 +26,11 @@ add_executable(client
   client/download_storage.cpp
   client/network_utils.cpp
   client/telemetry.cpp
-  client/tui_model.cpp
 )
 target_link_libraries(client PRIVATE
   Threads::Threads
   OpenSSL::Crypto
 )
-if(TORRENT_ENABLE_FTXUI)
-  target_compile_definitions(client PRIVATE TORRENT_ENABLE_FTXUI=1)
-  target_link_libraries(client PRIVATE
-    ftxui::component ftxui::dom ftxui::screen)
-endif()
 torrent_warnings(client)
 
 add_executable(tracker tracker/tracker.cpp)

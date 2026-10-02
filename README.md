@@ -1,8 +1,6 @@
 # Torrent Atlas
 
-Torrent Atlas is an interview-sized BitTorrent-style file sharing system written in C++17. It keeps the hard parts visible: replicated tracker metadata, deterministic load balancing, direct peer transfer, framed TCP, AES-256-GCM piece exchange, SHA-1 integrity checks, resumable parallel downloads, rarest-first scheduling, a CLI, and an optional FTXUI dashboard.
-
-![Torrent Atlas during a transfer](images/during.png)
+Torrent Atlas is an interview-sized BitTorrent-style file sharing system written in C++17. It keeps the hard parts visible: replicated tracker metadata, deterministic load balancing, direct peer transfer, framed TCP, AES-256-GCM piece exchange, SHA-1 integrity checks, resumable parallel downloads, rarest-first scheduling, and a command-line client.
 
 ## Architecture
 
@@ -26,18 +24,12 @@ For the wire formats and failure-state details, see [ARCHITECTURE.md](ARCHITECTU
 
 ## Build and test
 
-Requirements: CMake 3.16+, a C++17 compiler, OpenSSL, and network access during the default FTXUI configure.
+Requirements: CMake 3.16+, a C++17 compiler, and OpenSSL.
 
 ```sh
 cmake -S . -B build
 cmake --build build -j
 ctest --test-dir build --output-on-failure
-```
-
-FTXUI is enabled by default. For a dependency-light CLI build:
-
-```sh
-cmake -S . -B build -DTORRENT_ENABLE_FTXUI=OFF
 ```
 
 The Makefile is only a convenience wrapper:
@@ -58,7 +50,7 @@ Committed example configs use LB `5000`, tracker 1 `6000`, and tracker 2 `7000`.
 ./build/tracker config/trackers.conf 2
 ./build/tracker_lb config/load_balancer.conf
 ./build/client 127.0.0.1:8001 config/client.conf
-./build/client 127.0.0.1:8002 config/client.conf --tui
+./build/client 127.0.0.1:8002 config/client.conf
 ```
 
 Common commands accept either spaced or underscore spelling:
@@ -85,7 +77,7 @@ quit
 
 1. Start both trackers and the LB; point out that clients know only `:5000`.
 2. Start two clients, create Alice and Bob, create a group, join it, and accept Bob.
-3. Upload a multi-piece file from Alice and download it from Bob. Show rarest-first piece state and live throughput in the TUI.
+3. Upload a multi-piece file from Alice and download it from Bob. Use `show downloads` and `stats` to show rarest-first progress and throughput.
 4. Stop the owner tracker. Create another group or share another file through the LB to demonstrate survivor writes.
 5. Restart the tracker. Explain snapshot recovery and show that ownership fails back only after applied vectors match.
 

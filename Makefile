@@ -14,7 +14,7 @@ test: build
 	ctest --test-dir $(BUILD_DIR) --output-on-failure
 
 sanitize:
-	cmake -S . -B $(SANITIZE_DIR) -DTORRENT_ENABLE_SANITIZERS=ON -DTORRENT_ENABLE_FTXUI=OFF
+	cmake -S . -B $(SANITIZE_DIR) -DTORRENT_ENABLE_SANITIZERS=ON
 	cmake --build $(SANITIZE_DIR) -j
 	ctest --test-dir $(SANITIZE_DIR) --output-on-failure
 

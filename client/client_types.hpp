@@ -26,54 +26,6 @@ struct PeerInfo {
     Endpoint endpoint;
 };
 
-enum class PieceState {
-    Unavailable,
-    Available,
-    Reserved,
-    Downloading,
-    Verified,
-    Failed
-};
-
-struct PeerTelemetry {
-    std::string endpoint;
-    std::vector<unsigned char> bitmap;
-    std::size_t availablePieces = 0;
-    double throughputMiB = 0.0;
-    u64 successes = 0;
-    u64 failures = 0;
-};
-
-struct WorkerTelemetry {
-    std::size_t id = 0;
-    std::optional<std::size_t> piece;
-    std::string peer;
-    std::string state = "idle";
-    std::size_t completed = 0;
-    std::size_t failures = 0;
-    u64 bytes = 0;
-    double transferSeconds = 0.0;
-};
-
-struct DownloadTelemetry {
-    std::vector<PieceState> pieces;
-    std::vector<std::size_t> availability;
-    std::vector<std::size_t> rarestQueue;
-    std::map<std::size_t, std::vector<std::string>> reservations;
-    std::vector<PeerTelemetry> peers;
-    std::vector<WorkerTelemetry> workers;
-    std::deque<std::string> events;
-    std::deque<double> speedHistory;
-    std::string destination;
-    std::string failureReason;
-    bool integrityVerified = false;
-    std::size_t peersUsed = 0;
-    std::set<std::string> peerEndpointsUsed;
-    u64 lastSpeedBytes = 0;
-    std::chrono::steady_clock::time_point lastSpeedSample =
-        std::chrono::steady_clock::now();
-};
-
 struct DownloadStatus {
     std::string group;
     std::string name;
@@ -102,10 +54,8 @@ struct DownloadStatus {
     std::atomic<std::size_t> discoveredPeers{0};
     std::atomic<std::size_t> responsivePeers{0};
     std::atomic<u64> finalElapsedMicroseconds{0};
-    mutable std::mutex telemetryMutex;
-    DownloadTelemetry telemetry;
-    std::atomic<bool> summaryPresented{false};
     std::string destinationKey;
+    std::string failureReason;
 };
 
 struct PeerMetrics {

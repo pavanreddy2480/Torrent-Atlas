@@ -6,8 +6,6 @@
 #include "download_storage.hpp"
 #include "network_utils.hpp"
 #include "telemetry.hpp"
-#include "tui_model.hpp"
-#include "tui_theme.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -33,32 +31,13 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef TORRENT_ENABLE_FTXUI
-#include <ftxui/component/component.hpp>
-#include <ftxui/component/event.hpp>
-#include <ftxui/component/screen_interactive.hpp>
-#include <ftxui/dom/elements.hpp>
-#endif
 
 static std::mutex activeDestinationsMutex;
 static std::set<std::string> activeDestinations;
 
 static void finishDownload(const std::shared_ptr<DownloadStatus> &status, bool failed,
                            const std::string &reason = "") {
-    {
-        std::lock_guard<std::mutex> lock(status->telemetryMutex);
-        status->telemetry.failureReason = failed ? reason : "";
-        status->telemetry.integrityVerified = !failed;
-        for (auto &worker : status->telemetry.workers) {
-            worker.piece.reset();
-            worker.peer.clear();
-            worker.state = failed ? "stopped" : "complete";
-        }
-    }
-    sampleDownloadSpeed(status, true);
-    addProtocolEvent(status, failed
-        ? "Download failed: " + (reason.empty() ? std::string("transfer failed") : reason)
-        : "Full-file SHA1 verified; destination committed");
+    status->failureReason = failed ? reason : "";
     status->failed = failed;
     status->finalElapsedMicroseconds = elapsedMicroseconds(status->started);
     status->finished = true;
@@ -382,12 +361,6 @@ static TransferResult fetchPieceData(const PeerInfo &peer, const std::string &gr
     if (result != TransferResult::Success) {
         recordPeerResult(peer, result);
         recordDownloadFailure(status, result);
-        const char *reason = result == TransferResult::NetworkFailure ? "network" :
-                             result == TransferResult::AuthenticationFailure ? "authentication" :
-                             result == TransferResult::IntegrityFailure ? "integrity" :
-                             "unavailable";
-        addProtocolEvent(status, "Piece " + std::to_string(index) + " from " +
-            endpointKey(peer.endpoint) + " failed: " + reason);
         return result;
     }
     const char *data = piece.data();
@@ -397,8 +370,6 @@ static TransferResult fetchPieceData(const PeerInfo &peer, const std::string &gr
     if (pieceHash.finalHex() != expectedHash) {
         recordPeerResult(peer, TransferResult::IntegrityFailure);
         recordDownloadFailure(status, TransferResult::IntegrityFailure);
-        addProtocolEvent(status, "Piece " + std::to_string(index) + " from " +
-            endpointKey(peer.endpoint) + " failed SHA1 verification");
         return TransferResult::IntegrityFailure;
     }
 
@@ -451,17 +422,6 @@ static void downloadFile(std::string group, std::string name, std::string destin
     struct stat info{};
     if (stat(destination.c_str(), &info) == 0 && S_ISDIR(info.st_mode))
         destination += (destination.back() == '/' ? "" : "/") + name;
-    {
-        std::lock_guard<std::mutex> lock(status->telemetryMutex);
-        status->telemetry.destination = destination;
-        status->telemetry.pieces.assign(
-            metadata.pieceHashes.size(), PieceState::Unavailable);
-        status->telemetry.availability.assign(metadata.pieceHashes.size(), 0);
-        status->telemetry.lastSpeedSample = std::chrono::steady_clock::now();
-        status->telemetry.events.push_back(
-            "Metadata accepted: " + std::to_string(metadata.pieceHashes.size()) +
-            " pieces from " + std::to_string(peers.size()) + " peers");
-    }
     std::string manifestPath = destination + ".resume";
     std::string temporary = destination + ".part";
     std::vector<unsigned char> resumedPieces;
@@ -496,17 +456,6 @@ static void downloadFile(std::string group, std::string name, std::string destin
     }
     status->verifiedBytes = resumedBytes;
     status->resumedVerifiedBytes = resumedBytes;
-    {
-        std::lock_guard<std::mutex> lock(status->telemetryMutex);
-        status->telemetry.lastSpeedBytes = resumedBytes;
-        for (std::size_t piece = 0; piece < resumedPieces.size(); ++piece)
-            if (resumedPieces[piece])
-                status->telemetry.pieces[piece] = PieceState::Verified;
-        if (status->completed)
-            status->telemetry.events.push_back(
-                "Resume validation retained " +
-                std::to_string(status->completed.load()) + " pieces");
-    }
     auto resume = std::make_shared<ResumeState>();
     resume->manifestPath = manifestPath;
     resume->temporaryPath = temporary;
@@ -533,34 +482,6 @@ static void downloadFile(std::string group, std::string name, std::string destin
     for (const auto &bitmap : peerBitmaps)
         for (std::size_t piece = 0; piece < std::min(pieceCount, bitmap.size()); ++piece)
             rarity[piece] += bitmap[piece] != 0;
-    {
-        std::lock_guard<std::mutex> metricsLock(peerMetricsMutex);
-        std::lock_guard<std::mutex> telemetryLock(status->telemetryMutex);
-        status->telemetry.availability = rarity;
-        status->telemetry.peers.clear();
-        for (std::size_t index = 0; index < peers.size(); ++index) {
-            const std::string endpoint = endpointKey(peers[index].endpoint);
-            const PeerMetrics &observed = peerMetrics[endpoint];
-            PeerTelemetry peer;
-            peer.endpoint = endpoint;
-            peer.bitmap = peerBitmaps[index];
-            peer.availablePieces = static_cast<std::size_t>(
-                std::count(peer.bitmap.begin(), peer.bitmap.end(),
-                           static_cast<unsigned char>(1)));
-            peer.throughputMiB = observed.transferSeconds > 0.0
-                ? static_cast<double>(observed.bytes) / observed.transferSeconds /
-                  (1024.0 * 1024.0) : 0.0;
-            peer.successes = observed.successes;
-            peer.failures = observed.networkFailures +
-                            observed.authenticationFailures +
-                            observed.integrityFailures;
-            status->telemetry.peers.push_back(std::move(peer));
-        }
-        for (std::size_t piece = 0; piece < rarity.size(); ++piece)
-            if (!resumedPieces[piece])
-                status->telemetry.pieces[piece] =
-                    rarity[piece] ? PieceState::Available : PieceState::Unavailable;
-    }
     if (!rarity.empty()) {
         std::size_t minimum = *std::min_element(rarity.begin(), rarity.end());
         status->rarePieces = static_cast<std::size_t>(
@@ -574,13 +495,6 @@ static void downloadFile(std::string group, std::string name, std::string destin
         if (rarity[left] != rarity[right]) return rarity[left] < rarity[right];
         return left < right;
     });
-    {
-        std::lock_guard<std::mutex> lock(status->telemetryMutex);
-        status->telemetry.rarestQueue = order;
-        status->telemetry.events.push_back(
-            "Rarest-first queue built with " + std::to_string(order.size()) +
-            " pending pieces");
-    }
 
     LocalFile partial = metadata;
     partial.path = temporary;
@@ -629,105 +543,37 @@ static void downloadFile(std::string group, std::string name, std::string destin
     std::atomic<std::size_t> nextOrder{0};
     std::size_t workerCount = normalCount == 0 ? 0 : std::min<std::size_t>(
         8, std::max<std::size_t>(1, std::min(peers.size(), normalCount)));
-    {
-        std::lock_guard<std::mutex> lock(status->telemetryMutex);
-        status->telemetry.workers.clear();
-        for (std::size_t worker = 0; worker < workerCount; ++worker)
-            status->telemetry.workers.push_back({worker + 1, std::nullopt, "", "idle"});
-    }
     std::vector<std::thread> workers;
     for (std::size_t worker = 0; worker < workerCount; ++worker) {
-        workers.emplace_back([&, worker] {
+        workers.emplace_back([&] {
             for (;;) {
                 if (status->cancelRequested) break;
                 std::size_t position = nextOrder.fetch_add(1);
                 if (position >= normalCount) break;
                 std::size_t piece = order[position];
                 bool obtained = false;
-                {
-                    std::lock_guard<std::mutex> lock(status->telemetryMutex);
-                    status->telemetry.workers[worker].piece = piece;
-                    status->telemetry.workers[worker].state = "reserved";
-                    status->telemetry.pieces[piece] = PieceState::Reserved;
-                }
                 for (int round = 0;
                      round < 3 && !obtained && !status->cancelRequested; ++round) {
                     std::vector<std::size_t> candidates = candidatesFor(piece);
-                    {
-                        std::lock_guard<std::mutex> lock(status->telemetryMutex);
-                        auto &reserved = status->telemetry.reservations[piece];
-                        reserved.clear();
-                        for (std::size_t peer : candidates)
-                            reserved.push_back(endpointKey(peers[peer].endpoint));
-                    }
                     for (std::size_t peer : candidates) {
                         if (status->cancelRequested) break;
-                        const std::string selected = endpointKey(peers[peer].endpoint);
-                        {
-                            std::lock_guard<std::mutex> lock(status->telemetryMutex);
-                            status->telemetry.workers[worker].peer = selected;
-                            status->telemetry.workers[worker].state = "downloading";
-                            status->telemetry.pieces[piece] = PieceState::Downloading;
-                            status->telemetry.events.push_back(
-                                "W" + std::to_string(worker + 1) + " requested piece " +
-                                std::to_string(piece) + " from " + selected);
-                            while (status->telemetry.events.size() > 80)
-                                status->telemetry.events.pop_front();
-                        }
-                        auto transferStarted = std::chrono::steady_clock::now();
                         TransferResult result = fetchPiece(
                             peers[peer], group, name, metadata.capability, piece,
                             metadata.pieceHashes[piece], output, status);
-                        double transferSeconds = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - transferStarted).count();
-                        {
-                            std::lock_guard<std::mutex> lock(status->telemetryMutex);
-                            auto &workerStatus = status->telemetry.workers[worker];
-                            workerStatus.transferSeconds += transferSeconds;
-                            if (result == TransferResult::Success) {
-                                ++workerStatus.completed;
-                                workerStatus.bytes += std::min<u64>(
-                                    PIECE_SIZE, metadata.size -
-                                    static_cast<u64>(piece) * PIECE_SIZE);
-                            } else {
-                                ++workerStatus.failures;
-                            }
-                        }
                         if (result == TransferResult::IntegrityFailure)
                             ++status->integrityFailures;
                         if (result == TransferResult::Success) {
                             obtained = true;
                             markAvailable(piece);
                             ++status->completed;
-                            sampleDownloadSpeed(status);
-                            {
-                                std::lock_guard<std::mutex> lock(status->telemetryMutex);
-                                status->telemetry.pieces[piece] = PieceState::Verified;
-                                status->telemetry.reservations.erase(piece);
-                                status->telemetry.peerEndpointsUsed.insert(selected);
-                                status->telemetry.peersUsed =
-                                    status->telemetry.peerEndpointsUsed.size();
-                                status->telemetry.events.push_back(
-                                    "Piece " + std::to_string(piece) +
-                                    " verified and committed");
-                            }
                             break;
                         }
                     }
                     if (!obtained && !status->cancelRequested)
                         std::this_thread::sleep_for(retryDelay(round));
                 }
-                if (!obtained && !status->cancelRequested) {
-                    failure = true;
-                    std::lock_guard<std::mutex> lock(status->telemetryMutex);
-                    status->telemetry.pieces[piece] = PieceState::Failed;
-                    status->telemetry.reservations.erase(piece);
-                }
+                if (!obtained && !status->cancelRequested) failure = true;
             }
-            std::lock_guard<std::mutex> lock(status->telemetryMutex);
-            status->telemetry.workers[worker].piece.reset();
-            status->telemetry.workers[worker].peer.clear();
-            status->telemetry.workers[worker].state = "idle";
         });
     }
     for (auto &worker : workers) worker.join();
@@ -746,7 +592,6 @@ static void downloadFile(std::string group, std::string name, std::string destin
         finishDownload(status, true, "one or more pieces could not be reconstructed");
         return;
     }
-    addProtocolEvent(status, "Reconstruction complete; running full-file SHA1");
     auto finalHashStarted = std::chrono::steady_clock::now();
     bool hashOk = hashFile(temporary, verifiedSize, verifiedHash, verifiedPieces);
     status->diskMicroseconds += elapsedMicroseconds(finalHashStarted);
@@ -905,6 +750,8 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
                 output << " rare=" << status->rarePieces
                        << " resumed=" << status->resumedPieces
                        << " integrity-failures=" << status->integrityFailures;
+                if (status->failed && !status->failureReason.empty())
+                    output << " reason=\"" << status->failureReason << '"';
                 output << '\n';
             }
             return false;
@@ -1060,667 +907,6 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
         return false;
 }
 
-#ifdef TORRENT_ENABLE_FTXUI
-
-static std::vector<DownloadView> captureDownloadViews() {
-    std::vector<std::shared_ptr<DownloadStatus>> statuses;
-    std::unordered_map<std::string, PeerMetrics> metricsSnapshot;
-    {
-        std::lock_guard<std::mutex> lock(downloadsMutex);
-        statuses = downloads;
-    }
-    {
-        std::lock_guard<std::mutex> lock(peerMetricsMutex);
-        metricsSnapshot = peerMetrics;
-    }
-    return buildDownloadViews(statuses, metricsSnapshot);
-}
-
-static void appendLog(std::deque<std::string> &log, const std::string &text) {
-    std::istringstream lines(text);
-    std::string line;
-    while (std::getline(lines, line)) {
-        if (!line.empty()) log.push_back(line);
-    }
-    while (log.size() > 100) log.pop_front();
-}
-
-static ftxui::Color stateColor(PieceState state) {
-    const CatppuccinMocha &mocha = catppuccinMocha();
-    switch (state) {
-        case PieceState::Unavailable: return mocha.overlay;
-        case PieceState::Available: return mocha.blue;
-        case PieceState::Reserved: return mocha.yellow;
-        case PieceState::Downloading: return mocha.peach;
-        case PieceState::Verified: return mocha.green;
-        case PieceState::Failed: return mocha.red;
-    }
-    return mocha.text;
-}
-
-static ftxui::Element pieceGrid(const DownloadView &view, int columns) {
-    using namespace ftxui;
-    const CatppuccinMocha &mocha = catppuccinMocha();
-    Elements rows;
-    Elements row;
-    for (std::size_t index = 0; index < view.telemetry.pieces.size(); ++index) {
-        PieceState state = view.telemetry.pieces[index];
-        std::string glyph = state == PieceState::Verified ? "■" :
-                            state == PieceState::Downloading ? "▼" :
-                            state == PieceState::Reserved ? "◆" :
-                            state == PieceState::Available ? "□" :
-                            state == PieceState::Failed ? "!" : "·";
-        row.push_back(text(glyph) | color(stateColor(state)));
-        if (row.size() == static_cast<std::size_t>(columns)) {
-            rows.push_back(hbox(std::move(row)));
-            row.clear();
-        }
-    }
-    if (!row.empty()) rows.push_back(hbox(std::move(row)));
-    if (rows.empty())
-        rows.push_back(text("No pieces (empty file)") | color(mocha.subtext));
-    return vbox(std::move(rows));
-}
-
-static ftxui::Element speedGraph(const DownloadView &view, std::size_t maxColumns) {
-    using namespace ftxui;
-    const CatppuccinMocha &mocha = catppuccinMocha();
-    static const char *levels[] = {"▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"};
-    if (view.telemetry.speedHistory.empty())
-        return text("waiting for samples") | color(mocha.subtext);
-    double maximum = *std::max_element(
-        view.telemetry.speedHistory.begin(), view.telemetry.speedHistory.end());
-    maximum = std::max({0.01, maximum, viewSpeedMiB(view)});
-    std::string graph;
-    std::size_t first = view.telemetry.speedHistory.size() > maxColumns
-        ? view.telemetry.speedHistory.size() - maxColumns : 0;
-    for (std::size_t index = first;
-         index < view.telemetry.speedHistory.size(); ++index) {
-        double sample = view.telemetry.speedHistory[index];
-        std::size_t level = std::min<std::size_t>(
-            7, static_cast<std::size_t>(sample / maximum * 7.0));
-        graph += levels[level];
-    }
-    std::ostringstream label;
-    label << std::fixed << std::setprecision(2) << viewSpeedMiB(view)
-          << " MiB/s avg  peak " << maximum;
-    return vbox({text(graph) | color(mocha.blue),
-                 text(label.str()) | color(mocha.subtext)});
-}
-
-static ftxui::Element completionModal(const DownloadView &view) {
-    using namespace ftxui;
-    const CatppuccinMocha &mocha = catppuccinMocha();
-    double seconds = std::max(0.001, view.elapsedMicros / 1000000.0);
-    double average = static_cast<double>(view.verifiedBytes) / seconds /
-                     (1024.0 * 1024.0);
-    std::ostringstream speed;
-    speed << std::fixed << std::setprecision(2) << average << " MiB/s";
-    Elements rows = {
-        text(view.failed ? "TRANSFER FAILED" : "TRANSFER COMPLETE") |
-            bold | color(view.failed ? mocha.red : mocha.green) | center,
-        separator() | color(mocha.surface1),
-        hbox({text("File          ") | color(mocha.subtext), text(view.name)}),
-        hbox({text("Size          ") | color(mocha.subtext),
-              text(formatBytes(view.totalBytes))}),
-        hbox({text("Pieces        ") | color(mocha.subtext),
-              text(std::to_string(view.completed) + "/" + std::to_string(view.total))}),
-        hbox({text("Duration      ") | color(mocha.subtext),
-              text(formatDuration(view.elapsedMicros))}),
-        hbox({text("Average speed ") | color(mocha.subtext), text(speed.str())}),
-        hbox({text("Peers used    ") | color(mocha.subtext),
-              text(std::to_string(view.telemetry.peersUsed))}),
-        hbox({text("Integrity     ") | color(mocha.subtext),
-              text(view.telemetry.integrityVerified ? "SHA1 verified" : "not verified") |
-                  color(view.telemetry.integrityVerified ? mocha.green : mocha.red)}),
-        hbox({text("Destination   ") | color(mocha.subtext),
-              text(view.telemetry.destination)}),
-    };
-    if (view.failed)
-        rows.push_back(hbox({text("Reason        ") | color(mocha.subtext),
-                            text(view.telemetry.failureReason) | color(mocha.red)}));
-    rows.push_back(separator() | color(mocha.surface1));
-    rows.push_back(text("Enter or Escape returns to the dashboard") |
-                   color(mocha.subtext) | center);
-    return themedPanel(" Result ", vbox(std::move(rows)), mocha.mantle) |
-           size(ftxui::WIDTH, ftxui::GREATER_THAN, 64) | clear_under | center;
-}
-
-static int runTui() {
-    using namespace ftxui;
-    const CatppuccinMocha &mocha = catppuccinMocha();
-
-    auto screen = ScreenInteractive::Fullscreen();
-    std::string commandInput;
-    std::deque<std::string> commandLog;
-    std::vector<std::string> commandHistory;
-    std::size_t historyCursor = 0;
-    commandLog.push_back("Ready. Press : to enter a command.");
-    std::size_t selected = 0;
-    std::optional<std::size_t> summary;
-    bool commandMode = false;
-    bool help = false;
-    std::atomic<bool> refreshing{true};
-    std::size_t observedDownloadCount = 0;
-    std::size_t eventScroll = 0;
-
-    auto renderer = Renderer([&] {
-        std::vector<DownloadView> views = captureDownloadViews();
-        if (!views.empty()) selected = std::min(selected, views.size() - 1);
-        else selected = 0;
-
-        u64 currentSession;
-        {
-            std::lock_guard<std::mutex> lock(trackerMutex);
-            currentSession = sessionId;
-        }
-        double aggregateSpeed = 0.0;
-        for (const auto &view : views)
-            if (!view.finished) aggregateSpeed += viewSpeedMiB(view);
-        std::ostringstream aggregate;
-        aggregate << views.size() << " transfers  ·  " << std::fixed
-                  << std::setprecision(2) << aggregateSpeed << " MiB/s";
-        Element header = vbox({
-            hbox({
-                text(" TORRENT ") | bold | bgcolor(mocha.blue) | color(mocha.crust),
-                text("  secure swarm telemetry") | color(mocha.text),
-                filler(),
-                text(aggregate.str()) | color(mocha.blue) | bold,
-                text("  ")
-            }),
-            hbox({
-                text(" " + endpointKey(peerEndpoint)) | color(mocha.subtext),
-                text("  LB " + endpointKey(trackerEndpoint)) |
-                    color(mocha.subtext),
-                text(currentSession ? "  authenticated" : "  signed out") |
-                    color(currentSession ? mocha.green : mocha.yellow),
-                filler(),
-                text("↑↓ select   c cancel   : command   F1 help   F10 exit ") |
-                    color(mocha.subtext)
-            }),
-            separator() | color(mocha.blue),
-        }) | bgcolor(mocha.base);
-
-        Elements transferRows;
-        if (views.empty()) {
-            transferRows.push_back(
-                text("No downloads. Press : and run download file …") |
-                    color(mocha.subtext));
-        }
-        for (std::size_t index = 0; index < views.size(); ++index) {
-            const auto &view = views[index];
-            std::string marker = view.failed ? "FAIL" : view.finished ? "DONE" : "LIVE";
-            double progress = view.totalBytes
-                ? static_cast<double>(view.verifiedBytes) / view.totalBytes
-                : (view.finished && !view.failed ? 1.0 : 0.0);
-            std::ostringstream line;
-            line << (index == selected ? "› " : "  ") << marker << "  ["
-                 << view.group << "] " << view.name << "  " << std::fixed
-                 << std::setprecision(1) << progress * 100.0 << "%  "
-                 << view.completed << "/" << view.total << "  "
-                 << std::setprecision(2) << viewSpeedMiB(view) << " MiB/s";
-            Element item = text(line.str()) |
-                color(view.failed ? mocha.red :
-                      view.finished ? mocha.green : mocha.text);
-            if (index == selected)
-                item = item | color(mocha.blue) | bgcolor(mocha.surface1) | focus;
-            transferRows.push_back(item);
-        }
-        Element transferList = themedPanel(" Swarm transfers ",
-            vbox(std::move(transferRows)) | frame, mocha.base) |
-            size(HEIGHT, LESS_THAN, 7);
-
-        Element details;
-        if (views.empty()) {
-            details = vbox({
-                filler(),
-                text("The dashboard will populate when a download starts.") |
-                    center | color(mocha.subtext),
-                filler(),
-            });
-        } else {
-            const DownloadView &view = views[selected];
-            double progress = view.totalBytes
-                ? static_cast<double>(view.verifiedBytes) / view.totalBytes
-                : (view.finished && !view.failed ? 1.0 : 0.0);
-            std::ostringstream progressText;
-            progressText << std::fixed << std::setprecision(1) << progress * 100.0
-                         << "%  " << formatBytes(view.verifiedBytes) << " / "
-                         << formatBytes(view.totalBytes) << "  ·  "
-                         << view.completed << "/" << view.total << " pieces";
-            Color progressColor = view.failed ? mocha.red :
-                                  view.finished ? mocha.green : mocha.blue;
-            Element torrentInfo = themedPanel(" Torrent information ", vbox({
-                hbox({text(view.name) | bold, filler(),
-                      text(view.telemetry.destination) | color(mocha.subtext)}),
-                gauge(static_cast<float>(progress)) | color(progressColor),
-                text(progressText.str()) | color(mocha.blue),
-            }), mocha.base);
-
-            std::size_t minAvailability = view.telemetry.availability.empty() ? 0 :
-                *std::min_element(view.telemetry.availability.begin(),
-                                  view.telemetry.availability.end());
-            double averageAvailability = view.telemetry.availability.empty() ? 0.0 :
-                static_cast<double>(std::accumulate(
-                    view.telemetry.availability.begin(),
-                    view.telemetry.availability.end(), std::size_t{0})) /
-                view.telemetry.availability.size();
-            std::ostringstream swarm;
-            swarm << view.responsivePeers << "/" << view.discoveredPeers
-                  << " responsive  ·  availability min " << minAvailability
-                  << " avg " << std::fixed << std::setprecision(1)
-                  << averageAvailability << "  ·  " << view.activeRequests
-                  << " active";
-            Element health = themedPanel(" Swarm health ",
-                text(swarm.str()) | color(mocha.blue), mocha.mantle);
-
-            Element legend = hbox({
-                text("■ verified ") | color(stateColor(PieceState::Verified)),
-                text("▼ active ") | color(stateColor(PieceState::Downloading)),
-                text("◆ reserved ") | color(stateColor(PieceState::Reserved)),
-                text("□ available ") | color(stateColor(PieceState::Available)),
-                text("· unavailable ") | color(stateColor(PieceState::Unavailable)),
-                text("! failed") | color(stateColor(PieceState::Failed)),
-            });
-            Element pieces = themedPanel(" Piece lifecycle ",
-                vbox({pieceGrid(view, screen.dimx() >= 150 ? 48 : 32),
-                      separator() | color(mocha.surface1), legend}), mocha.base);
-            int dashboardWidth = std::max(40, screen.dimx());
-            int leftWidth = dashboardWidth < 120 ? dashboardWidth :
-                            std::max(60, dashboardWidth * 2 / 3);
-            int rightWidth = std::max(40, dashboardWidth - leftWidth);
-            std::size_t graphColumns = static_cast<std::size_t>(
-                std::max(12, (leftWidth - 8) / 2));
-            Element graph = themedPanel(
-                " Rolling speed ", speedGraph(view, graphColumns), mocha.mantle);
-
-            Elements peerRows = {
-                hbox({text("endpoint") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 24),
-                      text("pieces") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 9),
-                      text("ok/fail") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 8),
-                      text("MiB/s") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 9),
-                      text("state") | bold | color(mocha.mauve)})
-            };
-            for (const auto &peer : view.telemetry.peers) {
-                std::ostringstream observations, speed;
-                observations << peer.successes << '/' << peer.failures;
-                speed << std::fixed << std::setprecision(2) << peer.throughputMiB;
-                peerRows.push_back(hbox({
-                    text(peer.endpoint) | size(WIDTH, EQUAL, 24),
-                    text(std::to_string(peer.availablePieces) + "/" +
-                         std::to_string(view.total)) | size(WIDTH, EQUAL, 9),
-                    text(observations.str()) | size(WIDTH, EQUAL, 8),
-                    text(speed.str()) | size(WIDTH, EQUAL, 9),
-                    text("observed") | color(mocha.green),
-                }));
-            }
-            if (view.telemetry.peers.empty())
-                peerRows.push_back(text("Waiting for peer bitmaps") |
-                                   color(mocha.subtext));
-            Element peersPanel = themedPanel(" Connected peers ",
-                vbox(std::move(peerRows)) | frame, mocha.base);
-
-            Elements queueRows;
-            std::size_t queueShown = 0;
-            for (std::size_t piece : view.telemetry.rarestQueue) {
-                if (piece < view.telemetry.pieces.size() &&
-                    view.telemetry.pieces[piece] == PieceState::Verified) continue;
-                std::ostringstream row;
-                std::size_t availability = piece < view.telemetry.availability.size()
-                    ? view.telemetry.availability[piece] : 0;
-                row << "#" << piece << "  availability " << availability;
-                auto reservation = view.telemetry.reservations.find(piece);
-                if (reservation != view.telemetry.reservations.end())
-                    row << "  reserved ×" << reservation->second.size();
-                queueRows.push_back(text(row.str()));
-                if (++queueShown == 6) break;
-            }
-            if (queueRows.empty())
-                queueRows.push_back(text("Queue drained") | color(mocha.green));
-            Element scheduler = themedPanel(" Rarest-first scheduler ",
-                vbox(std::move(queueRows)), mocha.mantle);
-
-            Elements workerRows = {
-                hbox({text("worker") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 7),
-                      text("piece") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 7),
-                      text("peer") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 20),
-                      text("done") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 6),
-                      text("fail") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 6),
-                      text("MiB/s") | bold | color(mocha.mauve) |
-                          size(WIDTH, EQUAL, 8),
-                      text("state") | bold | color(mocha.mauve)})
-            };
-            for (const auto &worker : view.telemetry.workers) {
-                double workerSpeed = worker.transferSeconds > 0.0
-                    ? static_cast<double>(worker.bytes) / worker.transferSeconds /
-                      (1024.0 * 1024.0) : 0.0;
-                std::ostringstream workerSpeedText;
-                workerSpeedText << std::fixed << std::setprecision(1) << workerSpeed;
-                workerRows.push_back(hbox({
-                    text("W" + std::to_string(worker.id)) | size(WIDTH, EQUAL, 7),
-                    text(worker.piece ? std::to_string(*worker.piece) : "—") |
-                        size(WIDTH, EQUAL, 7),
-                    text(worker.peer.empty() ? "—" : worker.peer) |
-                        size(WIDTH, EQUAL, 20),
-                    text(std::to_string(worker.completed)) |
-                        size(WIDTH, EQUAL, 6),
-                    text(std::to_string(worker.failures)) |
-                        size(WIDTH, EQUAL, 6),
-                    text(workerSpeedText.str()) | size(WIDTH, EQUAL, 8),
-                    text(worker.state) |
-                        color(worker.state == "downloading" ?
-                              mocha.peach : mocha.subtext),
-                }));
-            }
-            if (view.telemetry.workers.empty())
-                workerRows.push_back(text("No active workers") |
-                                     color(mocha.subtext));
-            Element workersPanel = themedPanel(" Workers ",
-                vbox(std::move(workerRows)), mocha.base);
-
-            Elements eventRows;
-            std::size_t eventCount = view.telemetry.events.size();
-            std::size_t visibleEvents = 7;
-            std::size_t maximumScroll = eventCount > visibleEvents
-                ? eventCount - visibleEvents : 0;
-            eventScroll = std::min(eventScroll, maximumScroll);
-            std::size_t end = eventCount - eventScroll;
-            std::size_t first = end > visibleEvents ? end - visibleEvents : 0;
-            for (std::size_t i = first; i < end; ++i)
-                eventRows.push_back(text("• " + view.telemetry.events[i]));
-            if (eventRows.empty())
-                eventRows.push_back(text("Waiting for protocol activity") |
-                                    color(mocha.subtext));
-            Element events = themedPanel(" Protocol events ",
-                vbox(std::move(eventRows)), mocha.base);
-
-            if (screen.dimx() < 120 || screen.dimy() < 35) {
-                int halfWidth = std::max(20, dashboardWidth / 2);
-                details = vbox({
-                    torrentInfo,
-                    hbox({
-                        health | size(WIDTH, EQUAL, halfWidth),
-                        graph | size(WIDTH, EQUAL, dashboardWidth - halfWidth),
-                    }),
-                    pieces,
-                    events | flex,
-                });
-            } else {
-                Element left = vbox({
-                    torrentInfo,
-                    hbox({
-                        health | size(WIDTH, EQUAL, leftWidth / 2),
-                        graph | size(WIDTH, EQUAL, leftWidth - leftWidth / 2),
-                    }),
-                    pieces | flex,
-                    events | flex,
-                }) | size(WIDTH, EQUAL, leftWidth);
-                Element right = vbox({
-                    peersPanel | flex,
-                    scheduler | flex,
-                    workersPanel | flex,
-                }) | size(WIDTH, EQUAL, rightWidth);
-                details = hbox({left, right});
-            }
-        }
-
-        Elements activityRows;
-        std::size_t activityFirst = commandLog.size() > 3 ? commandLog.size() - 3 : 0;
-        for (std::size_t i = activityFirst; i < commandLog.size(); ++i) {
-            bool error = commandLog[i].rfind("ERR", 0) == 0;
-            activityRows.push_back(text(commandLog[i]) |
-                                   color(error ? mocha.red : mocha.subtext));
-        }
-        Element activity = themedPanel(" Command activity ",
-            vbox(std::move(activityRows)), mocha.mantle) |
-            size(HEIGHT, LESS_THAN, 5);
-        Element commandBar = commandMode
-            ? hbox({text(" : ") | bold | color(mocha.mauve), text(commandInput),
-                    text("█") | color(mocha.mauve), filler(),
-                    text("Enter run · Esc cancel ") | color(mocha.subtext)})
-            : hbox({text(" : command") | color(mocha.subtext), filler(),
-                    text("FTXUI live view ") | color(mocha.blue)});
-        commandBar = commandBar | color(mocha.text) | bgcolor(mocha.mantle);
-
-        Element dashboard = vbox({
-            header,
-            transferList,
-            details | flex,
-            activity,
-            separator() | color(mocha.surface1),
-            commandBar,
-        }) | color(mocha.text) | bgcolor(mocha.crust);
-
-        if (help) {
-            Element helpModal = themedPanel(" Keyboard and commands ", vbox({
-                text("↑ ↓ ← →   select a download / command history"),
-                text("PgUp/PgDn  scroll protocol events"),
-                text("c           cancel selected active download"),
-                text(":           open command bar"),
-                text("Enter       execute command / close result"),
-                text("Escape      close command bar, help, or result"),
-                text("F1          toggle this help"),
-                text("F10         exit"),
-                separator() | color(mocha.surface1),
-                text("The command bar accepts every classic CLI command.") |
-                    color(mocha.subtext),
-                text("Passwords are masked in command activity history.") |
-                    color(mocha.subtext),
-            }), mocha.mantle) |
-                size(WIDTH, GREATER_THAN, 62) | clear_under | center;
-            dashboard = dbox({dashboard, helpModal});
-        } else if (summary && *summary < views.size()) {
-            dashboard = dbox({dashboard, completionModal(views[*summary])});
-        }
-        return dashboard;
-    });
-
-    auto runCommand = [&](std::string line) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty() && line.front() == ':') line.erase(line.begin());
-        std::size_t first = line.find_first_not_of(" \t");
-        if (first == std::string::npos) return false;
-        line.erase(0, first);
-        commandLog.push_back("> " + safeCommandForLog(line));
-        if (!commandContainsPassword(line) &&
-            (commandHistory.empty() || commandHistory.back() != line))
-            commandHistory.push_back(line);
-        historyCursor = commandHistory.size();
-        std::ostringstream output;
-        bool quit = executeCommand(line, output);
-        appendLog(commandLog, output.str());
-        if (commandContainsPassword(line)) secureErase(line);
-        if (quit) {
-            refreshing = false;
-            screen.ExitLoopClosure()();
-        }
-        return quit;
-    };
-
-    auto component = CatchEvent(renderer, [&](Event event) {
-        if (event == Event::F10) {
-            refreshing = false;
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        if (event == Event::Custom) {
-            std::vector<std::shared_ptr<DownloadStatus>> statuses;
-            {
-                std::lock_guard<std::mutex> lock(downloadsMutex);
-                statuses = downloads;
-            }
-            if (statuses.size() > observedDownloadCount) {
-                selected = statuses.size() - 1;
-                eventScroll = 0;
-                observedDownloadCount = statuses.size();
-            } else if (statuses.size() < observedDownloadCount) {
-                observedDownloadCount = statuses.size();
-            }
-            for (std::size_t index = 0; index < statuses.size(); ++index) {
-                if (statuses[index]->finished &&
-                    !statuses[index]->summaryPresented.exchange(true)) {
-                    selected = index;
-                    summary = index;
-                    commandMode = false;
-                    help = false;
-                    break;
-                }
-            }
-            return true;
-        }
-        if (summary) {
-            if (event == Event::Return || event == Event::Escape) {
-                summary.reset();
-                return true;
-            }
-            return true;
-        }
-        if (help) {
-            if (event == Event::F1 || event == Event::Escape ||
-                event == Event::Return) {
-                help = false;
-                return true;
-            }
-            return true;
-        }
-        if (event == Event::F1) {
-            help = true;
-            commandMode = false;
-            return true;
-        }
-        if (commandMode) {
-            if (event == Event::Escape) {
-                commandMode = false;
-                commandInput.clear();
-                return true;
-            }
-            if (event == Event::Backspace) {
-                if (!commandInput.empty()) commandInput.pop_back();
-                return true;
-            }
-            if (event == Event::ArrowUp) {
-                if (!commandHistory.empty() && historyCursor > 0) {
-                    --historyCursor;
-                    commandInput = commandHistory[historyCursor];
-                }
-                return true;
-            }
-            if (event == Event::ArrowDown) {
-                if (historyCursor + 1 < commandHistory.size()) {
-                    ++historyCursor;
-                    commandInput = commandHistory[historyCursor];
-                } else {
-                    historyCursor = commandHistory.size();
-                    commandInput.clear();
-                }
-                return true;
-            }
-            if (event == Event::Return) {
-                if (commandInput.empty()) {
-                    commandMode = false;
-                    return true;
-                }
-                runCommand(commandInput);
-                if (commandContainsPassword(commandInput))
-                    secureErase(commandInput);
-                else
-                    commandInput.clear();
-                return true;
-            }
-            if (event.is_character()) {
-                std::string pasted = event.character();
-                commandInput += pasted;
-                for (;;) {
-                    std::size_t newline = commandInput.find_first_of("\r\n");
-                    if (newline == std::string::npos) break;
-                    std::string line = commandInput.substr(0, newline);
-                    std::size_t consumed = newline + 1;
-                    if (commandInput[newline] == '\r' &&
-                        consumed < commandInput.size() &&
-                        commandInput[consumed] == '\n')
-                        ++consumed;
-                    commandInput.erase(0, consumed);
-                    if (runCommand(std::move(line))) {
-                        commandInput.clear();
-                        return true;
-                    }
-                }
-                return true;
-            }
-            return true;
-        }
-        if (event == Event::Character(":")) {
-            commandMode = true;
-            commandInput.clear();
-            historyCursor = commandHistory.size();
-            return true;
-        }
-        if (event == Event::Character("c")) {
-            std::lock_guard<std::mutex> lock(downloadsMutex);
-            if (selected < downloads.size() && !downloads[selected]->finished) {
-                downloads[selected]->cancelRequested = true;
-                commandLog.push_back("Cancellation requested for " +
-                                     downloads[selected]->name);
-            }
-            return true;
-        }
-        if (event == Event::PageUp) {
-            eventScroll += 6;
-            return true;
-        }
-        if (event == Event::PageDown) {
-            eventScroll = eventScroll > 6 ? eventScroll - 6 : 0;
-            return true;
-        }
-        if (event == Event::ArrowUp || event == Event::ArrowLeft) {
-            if (selected > 0) {
-                --selected;
-                eventScroll = 0;
-            }
-            return true;
-        }
-        if (event == Event::ArrowDown || event == Event::ArrowRight) {
-            std::lock_guard<std::mutex> lock(downloadsMutex);
-            if (selected + 1 < downloads.size()) {
-                ++selected;
-                eventScroll = 0;
-            }
-            return true;
-        }
-        return false;
-    });
-
-    std::thread refresher([&] {
-        while (refreshing) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            if (refreshing) screen.PostEvent(Event::Custom);
-        }
-    });
-    screen.Loop(component);
-    refreshing = false;
-    refresher.join();
-    return 0;
-}
-
-#else
-
-static int runTui() {
-    std::cerr << "This binary was built without FTXUI support. "
-                 "Use the CMake build for --tui.\n";
-    return 1;
-}
-
-#endif
-
 static int runCli() {
     std::cout << "Client listening on " << peerEndpoint.ip << ':' << peerEndpoint.port << '\n';
     std::string line;
@@ -1731,15 +917,14 @@ static int runCli() {
 }
 
 int main(int argc, char **argv) {
-    bool tui = argc == 4 && std::string(argv[3]) == "--tui";
-    if ((argc != 3 && !tui) || !parseEndpoint(argv[1], peerEndpoint) ||
+    if (argc != 3 || !parseEndpoint(argv[1], peerEndpoint) ||
         !loadTrackerInfo(argv[2], trackerEndpoint)) {
         std::cerr << "usage: " << argv[0]
-                  << " <peer-ip:port> lb_client_info.txt [--tui]\n";
+                  << " <peer-ip:port> lb_client_info.txt\n";
         return 1;
     }
     std::thread peerThread(peerServer);
-    int result = tui ? runTui() : runCli();
+    int result = runCli();
     {
         std::lock_guard<std::mutex> lock(downloadsMutex);
         for (const auto &download : downloads)
