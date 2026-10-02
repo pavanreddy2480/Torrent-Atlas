@@ -2,15 +2,17 @@
 
 ## Scope
 
-Torrent Atlas implements the assignment’s tracker and peer workflows while keeping one advanced distributed-systems feature: a consistency-aware load balancer in front of two replicated trackers. Metadata is ephemeral by design; file bytes never pass through the tracker tier.
+Torrent Atlas implements the assignment’s tracker and peer workflows while keeping one advanced distributed-systems feature: one write server replicating synchronously to two read servers behind a consistency-aware load balancer. Metadata is ephemeral by design; file bytes never pass through the tracker tier.
 
 ## Consistency model
 
-Stable FNV-1a ownership keeps user and group aggregates deterministic. The LB serializes mutations and trackers replicate each mutation with an origin-specific monotonic sequence. Replicas deduplicate deliveries, buffer gaps, and expose a two-element applied vector. Immediate replication is attempted before success is returned; failure places the operation in a FIFO retry queue.
+All mutations run on the write server, which assigns each one the next sequence number and sends it to every in-sync read server before replying. Read servers apply entries strictly in order. A duplicate is acknowledged; a gap or an entry that conflicts with local state is answered with `RESYNC`, and the write server replaces that read server's state with a snapshot.
 
-Snapshot recovery transfers metadata and the applied vector as one checked envelope. The LB returns a recovered shard to its normal owner only when both ready vectors match. A replay result that contradicts local state is treated as replica degradation, not an endlessly retried poison message.
+The load balancer sends reads only to read servers whose applied sequence equals the write server's, falling back to the write server itself. That gives read-your-writes consistency through the LB. With the write server down, the LB serves reads from the most advanced read server and refuses writes.
 
-This is intentionally weaker and smaller than Raft: there is one LB, no durable log, no election, and no quorum commit. Within those assumptions it provides deterministic ownership, ordered at-least-once delivery, idempotent replay, and catch-up-gated failback.
+A background loop on the write server checks both read servers every 250 ms and pushes a snapshot to any that is behind, which covers restarts and missed entries. A restarted write server starts by copying the most advanced read server's snapshot.
+
+This is intentionally simpler than consensus: one fixed writer, no election, no durable log.
 
 ## Transfer engine
 
@@ -35,8 +37,8 @@ Resume manifests record immutable metadata, the temporary path, and a verified-p
 
 ## Verification
 
-CTest covers parser strictness, frame boundaries, SHA-1 vectors, cryptography, resume manifests, tracker edge cases, replication gaps/duplicates/degradation, tracker integration, LB routing/failover/restart, peer rejection, and a complete encrypted client transfer through the LB. CI runs a release configuration and an AddressSanitizer/UndefinedBehaviorSanitizer configuration on Ubuntu.
+CTest covers parser strictness, frame boundaries, SHA-1 vectors, cryptography, resume manifests, tracker edge cases, replication gaps, duplicates and snapshot resync, three-node tracker integration, LB read/write routing and read/write server failure and restart, peer rejection, and a complete encrypted client transfer through the LB. CI runs a release configuration and an AddressSanitizer/UndefinedBehaviorSanitizer configuration on Ubuntu.
 
 ## Known limits
 
-The LB is a single point of failure. All tracker state and retry queues are in memory. Tracker traffic assumes a trusted network. SHA-1 remains only for assignment compatibility. The replication model is neither consensus nor a general-purpose CRDT.
+The LB is a single point of failure, and the write server is one for writes. All tracker state is in memory. Tracker traffic assumes a trusted network. SHA-1 remains only for assignment compatibility. There is no leader election: if the write server stays down, the cluster is read-only.

@@ -68,28 +68,37 @@ int main() {
            "ERR too many login attempts; try again later");
 
     TrackerState ordered(2);
-    ReplicationManager orderedReplication(
-        ordered, {"127.0.0.1", 1}, 2, std::array<u64, 2>{});
-    assert(orderedReplication.receive(
-               1, 2, 0, "create_user bob secret") == "QUEUED");
-    assert(orderedReplication.receive(
-               1, 1, 0, "create_user alice secret") == "APPLIED");
-    assert(orderedReplication.receive(
-               1, 1, 0, "create_user alice secret") == "DUPLICATE");
+    ReplicaLog orderedReplica(ordered);
+    assert(orderedReplica.receive(2, 0, "create_user bob secret") == "RESYNC");
+    assert(orderedReplica.receive(1, 0, "create_user alice secret") == "APPLIED");
+    assert(orderedReplica.receive(1, 0, "create_user alice secret") == "DUPLICATE");
+    assert(orderedReplica.receive(2, 0, "create_user bob secret") == "APPLIED");
     assert(ordered.handle(0, "login alice secret", false).response ==
            "OK logged in");
     assert(ordered.handle(0, "login bob secret", false).response ==
            "OK logged in");
-    assert(orderedReplication.appliedVector()[0] == 2);
+    assert(orderedReplica.applied() == 2);
 
-    TrackerState conflicting(1);
-    assert(conflicting.handle(0, "create_user alice secret", false).response ==
+    TrackerState conflicting(2);
+    ReplicaLog conflictingReplica(conflicting);
+    assert(conflictingReplica.receive(1, 0, "create_group demo") == "RESYNC");
+    assert(conflictingReplica.applied() == 0);
+
+    TrackerState source(1);
+    assert(source.handle(0, "create_user carol secret", false).response ==
            "OK user created");
-    ReplicationManager conflictingReplication(
-        conflicting, {"127.0.0.1", 1}, 1, std::array<u64, 2>{});
-    assert(conflictingReplication.receive(
-               2, 1, 0, "create_user alice different") == "DEGRADED");
-    assert(conflictingReplication.degraded());
+    assert(conflictingReplica.install(7, source.serialize()) == "APPLIED");
+    assert(conflictingReplica.applied() == 7);
+    assert(conflictingReplica.receive(8, 0, "create_user dave secret") == "APPLIED");
+    assert(conflicting.handle(0, "login carol secret", false).response ==
+           "OK logged in");
+    assert(conflictingReplica.install(9, "not a snapshot") == "ERR invalid snapshot");
+    assert(conflictingReplica.applied() == 8);
+
+    assert(isTrackerMutation("login alice secret"));
+    assert(isTrackerMutation("upload_file demo x"));
+    assert(!isTrackerMutation("list_files demo"));
+    assert(!isTrackerMutation("download_file demo x"));
 
     std::cout << "tracker state tests passed\n";
 }

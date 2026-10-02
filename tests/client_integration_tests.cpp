@@ -167,11 +167,12 @@ int main(int argc, char **argv) {
     if (argc != 4) return 2;
     int trackerOnePort = unusedPort();
     int trackerTwoPort = unusedPort();
+    int trackerThreePort = unusedPort();
     int lbPort = unusedPort();
     int seederPort = unusedPort();
     int downloaderPort = unusedPort();
     int secondDownloaderPort = unusedPort();
-    if (trackerOnePort < 0 || trackerTwoPort < 0 || lbPort < 0 ||
+    if (trackerOnePort < 0 || trackerTwoPort < 0 || trackerThreePort < 0 || lbPort < 0 ||
         seederPort < 0 || downloaderPort < 0 || secondDownloaderPort < 0) {
         std::cout << "client integration tests skipped: local sockets unavailable\n";
         return 77;
@@ -188,13 +189,15 @@ int main(int argc, char **argv) {
     {
         std::ofstream output(trackerInfo);
         output << "127.0.0.1:" << trackerOnePort << '\n'
-               << "127.0.0.1:" << trackerTwoPort << '\n';
+               << "127.0.0.1:" << trackerTwoPort << '\n'
+               << "127.0.0.1:" << trackerThreePort << '\n';
     }
     {
         std::ofstream output(lbInfo);
         output << "127.0.0.1:" << lbPort << '\n'
                << "127.0.0.1:" << trackerOnePort << '\n'
-               << "127.0.0.1:" << trackerTwoPort << '\n';
+               << "127.0.0.1:" << trackerTwoPort << '\n'
+               << "127.0.0.1:" << trackerThreePort << '\n';
     }
     {
         std::ofstream output(clientInfo);
@@ -206,13 +209,23 @@ int main(int argc, char **argv) {
             output.put(static_cast<char>((index * 31U + 17U) & 0xffU));
     }
 
-    ChildProcess trackerOne, trackerTwo, lb, seeder, downloader,
+    ChildProcess trackerOne, trackerTwo, trackerThree, lb, seeder, downloader,
                  secondDownloader;
     try {
         trackerOne = startProcess({argv[1], trackerInfo, "1"}, false);
         trackerTwo = startProcess({argv[1], trackerInfo, "2"}, false);
+        trackerThree = startProcess({argv[1], trackerInfo, "3"}, false);
         require(waitForListener(trackerOnePort), "tracker one did not start");
         require(waitForListener(trackerTwoPort), "tracker two did not start");
+        require(waitForListener(trackerThreePort), "tracker three did not start");
+        bool writerReady = false;
+        for (int attempt = 0; attempt < 200 && !writerReady; ++attempt) {
+            std::string status;
+            writerReady = trackerCall({"127.0.0.1", trackerOnePort}, "X\t0\tSTATUS", status) &&
+                          status.find("READY") != std::string::npos;
+            if (!writerReady) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        require(writerReady, "write server did not become ready");
         lb = startProcess({argv[2], lbInfo}, false);
         require(waitForListener(lbPort), "load balancer did not start");
 
@@ -283,6 +296,7 @@ int main(int argc, char **argv) {
         stopProcess(secondDownloader);
         stopProcess(seeder);
         stopProcess(lb);
+        stopProcess(trackerThree);
         stopProcess(trackerTwo);
         stopProcess(trackerOne);
         unlink(trackerInfo.c_str());
@@ -302,6 +316,7 @@ int main(int argc, char **argv) {
     stopProcess(secondDownloader);
     stopProcess(seeder);
     stopProcess(lb);
+    stopProcess(trackerThree);
     stopProcess(trackerTwo);
     stopProcess(trackerOne);
     unlink(trackerInfo.c_str());

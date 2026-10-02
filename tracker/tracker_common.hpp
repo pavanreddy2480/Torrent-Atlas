@@ -12,7 +12,9 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <map>
+#include <memory>
 #include <poll.h>
 #include <sstream>
 #include <thread>
@@ -528,173 +530,254 @@ public:
     }
 };
 
-struct SyncItem {
-    unsigned origin = 0;
-    u64 sequence = 0;
-    u64 session;
-    std::string command;
-};
-
-class ReplicationManager {
-    TrackerState &state_;
-    Endpoint peer_;
-    std::deque<SyncItem> queue_;
-    std::array<std::map<u64, SyncItem>, 2> pending_;
-    std::array<u64, 2> applied_{};
-    unsigned origin_;
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    bool stopping_ = false;
-    bool degraded_ = false;
-
-    bool deliver(const SyncItem &item) {
-        UniqueFd fd(connectTcp(peer_.ip, peer_.port, 2));
-        if (!fd) return false;
-        std::string request = "S\t" + std::to_string(item.origin) + "\t" +
-                              std::to_string(item.sequence) + "\t" +
-                              std::to_string(item.session) + "\t" + item.command;
-        std::string response;
-        if (!sendFrame(fd.get(), request) || !receiveFrame(fd.get(), response))
-            return false;
-        return response == "APPLIED" || response == "DUPLICATE" ||
-               response == "QUEUED" || response == "DEGRADED";
-    }
-
-    bool applyOne(const SyncItem &item) {
-        HandleResult result = state_.handle(item.session, item.command, true);
-        applied_[item.origin - 1] = item.sequence;
-        if (result.response.rfind("ERR", 0) == 0) {
-            degraded_ = true;
-            std::cerr << "Tracker replica degraded after replication conflict from "
-                      << item.origin << ':' << item.sequence << '\n';
-            return false;
-        }
-        return true;
-    }
-
-public:
-    std::mutex localMutationMutex;
-
-    ReplicationManager(TrackerState &state, Endpoint peer, unsigned origin,
-                       std::array<u64, 2> applied)
-        : state_(state), peer_(std::move(peer)), applied_(applied),
-          origin_(origin) {}
-
-    void localCommitted(u64 session, const std::string &command) {
-        SyncItem item;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            item = {origin_, ++applied_[origin_ - 1], session, command};
-        }
-        if (deliver(item)) return;
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!stopping_) {
-            queue_.push_back(std::move(item));
-            condition_.notify_one();
-        }
-    }
-
-    std::string receive(unsigned origin, u64 sequence, u64 session,
-                        const std::string &command) {
-        if (origin < 1 || origin > 2 || sequence == 0)
-            return "ERR malformed replication sequence";
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::size_t index = origin - 1;
-        if (sequence <= applied_[index]) return "DUPLICATE";
-        SyncItem item{origin, sequence, session, command};
-        if (sequence != applied_[index] + 1) {
-            pending_[index].emplace(sequence, std::move(item));
-            return "QUEUED";
-        }
-        if (!applyOne(item)) return "DEGRADED";
-        while (!degraded_) {
-            auto next = pending_[index].find(applied_[index] + 1);
-            if (next == pending_[index].end()) break;
-            SyncItem queued = std::move(next->second);
-            pending_[index].erase(next);
-            if (!applyOne(queued)) return "DEGRADED";
-        }
-        return degraded_ ? "DEGRADED" : "APPLIED";
-    }
-
-    std::array<u64, 2> appliedVector() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return applied_;
-    }
-
-    bool degraded() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return degraded_;
-    }
-
-    std::string status() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return "STATUS\t" + std::to_string(applied_[0]) + "\t" +
-               std::to_string(applied_[1]) + "\t" +
-               (degraded_ ? "DEGRADED" : "READY");
-    }
-
-    void stop() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stopping_ = true;
-        condition_.notify_all();
-    }
-
-    void run() {
-        for (;;) {
-            SyncItem item;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                condition_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
-                if (stopping_) return;
-                item = queue_.front();
-            }
-            bool delivered = deliver(item);
-            if (delivered) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                queue_.pop_front();
-            } else {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-        }
-    }
-};
+// Cluster layout: node 1 is the write server, nodes 2 and 3 are read servers.
+// Every mutation runs on the write server, gets the next sequence number, and
+// is pushed synchronously to each in-sync read server before the client gets
+// its answer. A read server that misses a sequence (it was down, restarted, or
+// rejected an entry) is brought back by a full snapshot push.
+static constexpr unsigned TRACKER_NODES = 3;
+static constexpr unsigned WRITE_NODE = 1;
 
 inline bool parseU64(const std::string &text, u64 &value) {
     return parseUnsignedDecimal(text, value);
 }
 
-inline void trackerConnection(int rawFd, TrackerState &state,
-                              ReplicationManager &replication) {
+inline std::string commandFromFields(const std::vector<std::string> &fields,
+                                     std::size_t first) {
+    std::string command = fields[first];
+    for (std::size_t i = first + 1; i < fields.size(); ++i)
+        command += "\t" + fields[i];
+    return command;
+}
+
+// Read-server side: applies the write server's ordered stream.
+class ReplicaLog {
+    TrackerState &state_;
+    std::mutex mutex_;
+    u64 applied_ = 0;
+
+public:
+    explicit ReplicaLog(TrackerState &state) : state_(state) {}
+
+    // Returns APPLIED, DUPLICATE, or RESYNC (gap or conflict; the write
+    // server answers RESYNC with a snapshot push).
+    std::string receive(u64 sequence, u64 session, const std::string &command) {
+        if (sequence == 0) return "ERR malformed replication sequence";
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (sequence <= applied_) return "DUPLICATE";
+        if (sequence != applied_ + 1) return "RESYNC";
+        HandleResult result = state_.handle(session, command, true);
+        if (result.response.rfind("ERR", 0) == 0) {
+            std::cerr << "Read server rejected sequence " << sequence
+                      << "; requesting snapshot\n";
+            return "RESYNC";
+        }
+        applied_ = sequence;
+        return "APPLIED";
+    }
+
+    std::string install(u64 sequence, const std::string &snapshot) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!state_.replaceFromSnapshot(snapshot)) return "ERR invalid snapshot";
+        applied_ = sequence;
+        return "APPLIED";
+    }
+
+    u64 applied() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return applied_;
+    }
+
+    std::string snapshot() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return "SNAPSHOT\t" + std::to_string(applied_) + "\n" + state_.serialize();
+    }
+};
+
+// Write-server side: owns the sequence and keeps both read servers in sync.
+class WriteReplicator {
+    TrackerState &state_;
+    std::vector<Endpoint> readers_;
+    std::vector<bool> inSync_;
+    std::atomic<u64> sequence_{0};
+    std::atomic<bool> recovered_{false};
+    std::mutex stopMutex_;
+    std::condition_variable stopCondition_;
+    bool stopping_ = false;
+
+    // Caller holds mutationMutex.
+    bool pushSnapshot(std::size_t reader) {
+        std::string response;
+        bool ok = trackerCall(readers_[reader],
+                              "P\t" + std::to_string(sequence_.load()) + "\n" +
+                                  state_.serialize(),
+                              response) &&
+                  response == "APPLIED";
+        if (ok)
+            std::cerr << "Read server " << endpointKey(readers_[reader])
+                      << " synced to sequence " << sequence_.load() << '\n';
+        return ok;
+    }
+
+    static bool readSequence(const std::string &header, const char *kind, u64 &value) {
+        std::vector<std::string> fields = split(header, '\t');
+        return fields.size() >= 2 && fields[0] == kind && parseU64(fields[1], value);
+    }
+
+    // On start the write server has no state of its own. It takes the most
+    // advanced read server's snapshot, or starts empty if every reachable
+    // read server is empty. It needs at least one read server to answer.
+    bool tryRecover() {
+        bool anyAnswered = false;
+        u64 bestSequence = 0;
+        std::string bestState;
+        std::vector<std::optional<u64>> readerSequence(readers_.size());
+        for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
+            std::string response;
+            if (!trackerCall(readers_[reader], "X\t0\tSNAPSHOT", response)) continue;
+            std::size_t newline = response.find('\n');
+            u64 sequence = 0;
+            if (newline == std::string::npos ||
+                !readSequence(response.substr(0, newline), "SNAPSHOT", sequence))
+                continue;
+            anyAnswered = true;
+            readerSequence[reader] = sequence;
+            if (sequence > bestSequence || bestState.empty()) {
+                bestSequence = sequence;
+                bestState = response.substr(newline + 1);
+            }
+        }
+        if (!anyAnswered) return false;
+        std::lock_guard<std::mutex> lock(mutationMutex);
+        if (bestSequence > 0 && !state_.replaceFromSnapshot(bestState)) return false;
+        sequence_ = bestSequence;
+        for (std::size_t reader = 0; reader < readers_.size(); ++reader)
+            inSync_[reader] = readerSequence[reader] == bestSequence;
+        recovered_ = true;
+        std::cerr << "Write server recovered at sequence " << bestSequence << '\n';
+        return true;
+    }
+
+    void syncReaders() {
+        for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
+            std::string response;
+            u64 applied = 0;
+            bool reachable = trackerCall(readers_[reader], "X\t0\tSTATUS", response) &&
+                             readSequence(response.substr(response.find('\t') + 1),
+                                          "replica", applied);
+            std::lock_guard<std::mutex> lock(mutationMutex);
+            if (!reachable) {
+                inSync_[reader] = false;
+            } else if (applied != sequence_) {
+                inSync_[reader] = pushSnapshot(reader);
+            } else {
+                inSync_[reader] = true;
+            }
+        }
+    }
+
+public:
+    std::mutex mutationMutex;
+
+    WriteReplicator(TrackerState &state, std::vector<Endpoint> readers)
+        : state_(state), readers_(std::move(readers)), inSync_(readers_.size(), false) {}
+
+    bool recovered() const { return recovered_; }
+    u64 sequence() const { return sequence_; }
+
+    // Caller holds mutationMutex and has already applied the command locally.
+    void replicate(u64 session, const std::string &command) {
+        u64 sequence = ++sequence_;
+        std::string frame = "S\t" + std::to_string(sequence) + "\t" +
+                            std::to_string(session) + "\t" + command;
+        for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
+            if (!inSync_[reader]) continue;
+            std::string response;
+            if (!trackerCall(readers_[reader], frame, response)) {
+                inSync_[reader] = false;
+                std::cerr << "Read server " << endpointKey(readers_[reader])
+                          << " unreachable; will resync\n";
+            } else if (response != "APPLIED" && response != "DUPLICATE") {
+                inSync_[reader] = pushSnapshot(reader);
+            }
+        }
+    }
+
+    std::string snapshot() {
+        std::lock_guard<std::mutex> lock(mutationMutex);
+        return "SNAPSHOT\t" + std::to_string(sequence_.load()) + "\n" +
+               state_.serialize();
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lock(stopMutex_);
+        stopping_ = true;
+        stopCondition_.notify_all();
+    }
+
+    void run() {
+        for (;;) {
+            if (!recovered_) tryRecover();
+            else syncReaders();
+            std::unique_lock<std::mutex> lock(stopMutex_);
+            if (stopCondition_.wait_for(lock, std::chrono::milliseconds(250),
+                                        [&] { return stopping_; }))
+                return;
+        }
+    }
+};
+
+struct TrackerNode {
+    unsigned number = 0;
+    TrackerState &state;
+    WriteReplicator *writer = nullptr;   // set on the write server
+    ReplicaLog *replica = nullptr;       // set on read servers
+
+    std::string status() const {
+        if (writer)
+            return std::string("STATUS\tprimary\t") + std::to_string(writer->sequence()) +
+                   "\t" + (writer->recovered() ? "READY" : "RECOVERING");
+        return "STATUS\treplica\t" + std::to_string(replica->applied()) + "\tREADY";
+    }
+};
+
+inline void trackerConnection(int rawFd, TrackerNode &node) {
     UniqueFd fd(rawFd);
     std::string request;
     if (!receiveFrame(fd.get(), request)) return;
+
+    // Snapshot push from the write server: "P\t<sequence>\n<state>".
+    if (node.replica && request.rfind("P\t", 0) == 0) {
+        std::size_t newline = request.find('\n');
+        u64 sequence = 0;
+        if (newline == std::string::npos ||
+            !parseU64(request.substr(2, newline - 2), sequence)) {
+            sendFrame(fd.get(), "ERR malformed snapshot push");
+            return;
+        }
+        sendFrame(fd.get(), node.replica->install(sequence, request.substr(newline + 1)));
+        return;
+    }
+
     std::vector<std::string> fields = split(request, '\t');
     if (fields.size() == 3 && fields[0] == "X" && fields[2] == "STATUS") {
-        sendFrame(fd.get(), replication.status());
+        sendFrame(fd.get(), node.status());
         return;
     }
     if (fields.size() == 3 && fields[0] == "X" && fields[2] == "SNAPSHOT") {
-        auto applied = replication.appliedVector();
-        sendFrame(fd.get(), "SNAPSHOT\t" + std::to_string(applied[0]) +
-                            "\t" + std::to_string(applied[1]) + "\t" +
-                            (replication.degraded() ? "DEGRADED" : "READY") +
-                            "\n" + state.serialize());
+        sendFrame(fd.get(), node.writer ? node.writer->snapshot() : node.replica->snapshot());
         return;
     }
-    if (fields.size() >= 5 && fields[0] == "S") {
-        u64 originValue = 0, sequence = 0, session = 0;
-        if (!parseU64(fields[1], originValue) || originValue < 1 ||
-            originValue > 2 || !parseU64(fields[2], sequence) ||
-            !parseU64(fields[3], session)) {
+    if (fields.size() >= 4 && fields[0] == "S") {
+        u64 sequence = 0, session = 0;
+        if (!node.replica) {
+            sendFrame(fd.get(), "ERR not a read server");
+        } else if (!parseU64(fields[1], sequence) || !parseU64(fields[2], session)) {
             sendFrame(fd.get(), "ERR malformed replication frame");
-            return;
+        } else {
+            sendFrame(fd.get(), node.replica->receive(sequence, session,
+                                                      commandFromFields(fields, 3)));
         }
-        std::string command = fields[4];
-        for (std::size_t i = 5; i < fields.size(); ++i)
-            command += "\t" + fields[i];
-        sendFrame(fd.get(), replication.receive(
-            static_cast<unsigned>(originValue), sequence, session, command));
         return;
     }
     if (fields.size() < 3 || fields[0] != "C") {
@@ -706,19 +789,21 @@ inline void trackerConnection(int rawFd, TrackerState &state,
         sendFrame(fd.get(), "ERR malformed session");
         return;
     }
-    std::string command = fields[2];
-    for (std::size_t i = 3; i < fields.size(); ++i) command += "\t" + fields[i];
+    std::string command = commandFromFields(fields, 2);
     HandleResult result;
-    {
-        std::lock_guard<std::mutex> mutationLock(replication.localMutationMutex);
-        result = state.handle(session, command, false);
-        if (result.shouldSync) {
-            u64 replicationSession = command == "logout" ? session : result.session;
-            replication.localCommitted(replicationSession, command);
-        }
+    if (node.replica) {
+        result = isTrackerMutation(command)
+            ? HandleResult{"ERR read-only server; send writes to the write server", session, false}
+            : node.state.handle(session, command, false);
+    } else if (!node.writer->recovered()) {
+        result = {"ERR write server recovering", session, false};
+    } else {
+        std::lock_guard<std::mutex> mutationLock(node.writer->mutationMutex);
+        result = node.state.handle(session, command, false);
+        if (result.shouldSync)
+            node.writer->replicate(command == "logout" ? session : result.session, command);
     }
-    std::string response = result.response + "\t" + std::to_string(result.session);
-    sendFrame(fd.get(), response);
+    sendFrame(fd.get(), result.response + "\t" + std::to_string(result.session));
 }
 
 inline bool readTrackerInfo(const std::string &path, std::vector<Endpoint> &trackers) {
@@ -731,67 +816,54 @@ inline bool readTrackerInfo(const std::string &path, std::vector<Endpoint> &trac
         if (!parseEndpoint(token, endpoint)) return false;
         loaded.push_back(endpoint);
     }
-    if (loaded.size() != 2 ||
-        (loaded[0].ip == loaded[1].ip &&
-         loaded[0].port == loaded[1].port))
-        return false;
+    if (loaded.size() != TRACKER_NODES) return false;
+    for (std::size_t i = 0; i < loaded.size(); ++i)
+        for (std::size_t j = i + 1; j < loaded.size(); ++j)
+            if (endpointKey(loaded[i]) == endpointKey(loaded[j])) return false;
     trackers = std::move(loaded);
     return true;
 }
 
-inline int runTracker(int argc, char **argv, unsigned defaultNumber) {
-    std::vector<Endpoint> trackers;
-    unsigned number = defaultNumber;
-    if (argc == 3) {
-        if (!readTrackerInfo(argv[1], trackers)) {
-            std::cerr << "tracker info must contain exactly two IP:PORT entries\n";
-            return 1;
-        }
-        u64 parsedNumber = 0;
-        if (!parseUnsignedDecimal(argv[2], parsedNumber) ||
-            parsedNumber < 1 || parsedNumber > 2) {
-            std::cerr << "tracker number must be 1 or 2\n";
-            return 1;
-        }
-        number = static_cast<unsigned>(parsedNumber);
-    } else {
-        std::cerr << "usage: " << argv[0] << " tracker_info.txt tracker_no\n";
+inline int runTracker(int argc, char **argv) {
+    if (argc != 3) {
+        std::cerr << "usage: " << argv[0] << " trackers.conf <1|2|3>\n";
         return 1;
     }
-
-    Endpoint local = trackers[number - 1];
-    Endpoint peer = trackers[2 - number];
-    TrackerState state(number);
-    std::array<u64, 2> applied{};
-    if (state.empty()) {
-        UniqueFd peerFd(connectTcp(peer.ip, peer.port, 2));
-        if (peerFd) {
-            std::string snapshot;
-            if (sendFrame(peerFd.get(), "X\t0\tSNAPSHOT") &&
-                receiveFrame(peerFd.get(), snapshot)) {
-                std::size_t newline = snapshot.find('\n');
-                std::vector<std::string> header = split(
-                    snapshot.substr(0, newline), '\t');
-                u64 first = 0, second = 0;
-                if (newline != std::string::npos && header.size() == 4 &&
-                    header[0] == "SNAPSHOT" && header[3] == "READY" &&
-                    parseU64(header[1], first) && parseU64(header[2], second) &&
-                    state.replaceFromSnapshot(snapshot.substr(newline + 1))) {
-                    applied = {first, second};
-                    std::cerr << "Recovered sequence-aware in-memory snapshot from peer\n";
-                }
-            }
-        }
+    std::vector<Endpoint> trackers;
+    if (!readTrackerInfo(argv[1], trackers)) {
+        std::cerr << "tracker config must list three distinct IP:PORT entries: "
+                     "the write server, then two read servers\n";
+        return 1;
     }
+    u64 parsedNumber = 0;
+    if (!parseUnsignedDecimal(argv[2], parsedNumber) || parsedNumber < 1 ||
+        parsedNumber > TRACKER_NODES) {
+        std::cerr << "tracker number must be 1 (write) or 2-3 (read)\n";
+        return 1;
+    }
+    unsigned number = static_cast<unsigned>(parsedNumber);
+    Endpoint local = trackers[number - 1];
+
+    TrackerState state(number);
+    std::unique_ptr<WriteReplicator> writer;
+    std::unique_ptr<ReplicaLog> replica;
+    if (number == WRITE_NODE)
+        writer.reset(new WriteReplicator(
+            state, std::vector<Endpoint>(trackers.begin() + 1, trackers.end())));
+    else
+        replica.reset(new ReplicaLog(state));
+    TrackerNode node{number, state, writer.get(), replica.get()};
+
     int listener = createListener(local.ip, local.port);
     if (listener < 0) {
         perror("tracker listen");
         return 1;
     }
-    ReplicationManager replication(state, peer, number, applied);
-    std::thread syncThread(&ReplicationManager::run, &replication);
-    std::cerr << "Tracker " << number << " listening on " << local.ip << ':' << local.port
-              << ", peer " << peer.ip << ':' << peer.port << '\n';
+    std::thread syncThread;
+    if (writer) syncThread = std::thread(&WriteReplicator::run, writer.get());
+    std::cerr << "Tracker " << number << " ("
+              << (writer ? "write server" : "read server") << ") listening on "
+              << endpointKey(local) << '\n';
 
     bool running = true;
     bool monitorConsole = true;
@@ -833,7 +905,7 @@ inline int runTracker(int argc, char **argv, unsigned defaultNumber) {
                 ++activeWorkers;
             }
             std::thread([&, client] {
-                trackerConnection(client, state, replication);
+                trackerConnection(client, node);
                 {
                     std::lock_guard<std::mutex> lock(workersMutex);
                     --activeWorkers;
@@ -847,7 +919,9 @@ inline int runTracker(int argc, char **argv, unsigned defaultNumber) {
         std::unique_lock<std::mutex> lock(workersMutex);
         workersCondition.wait(lock, [&] { return activeWorkers == 0; });
     }
-    replication.stop();
-    syncThread.join();
+    if (writer) {
+        writer->stop();
+        syncThread.join();
+    }
     return 0;
 }

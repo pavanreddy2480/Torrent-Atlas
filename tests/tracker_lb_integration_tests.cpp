@@ -115,18 +115,29 @@ static std::pair<std::string, u64> eventuallyRequest(
     return result;
 }
 
+static void cleanup(ChildProcess &lb, ChildProcess (&nodes)[3],
+                    const std::vector<std::string> &paths) {
+    stopProcess(lb);
+    for (auto &node : nodes) stopProcess(node);
+    for (const auto &path : paths) unlink(path.c_str());
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
 
-    int firstPort = unusedPort();
-    int secondPort = unusedPort();
+    int ports[3];
     int lbPort = unusedPort();
-    if (firstPort < 0 || secondPort < 0 || lbPort < 0) {
-        std::cout << "tracker lb integration tests skipped: local sockets unavailable\n";
-        return 77;
+    for (int index = 0; index < 3; ++index) {
+        ports[index] = unusedPort();
+        if (ports[index] < 0 || lbPort < 0) {
+            std::cout << "tracker lb integration tests skipped: local sockets unavailable\n";
+            return 77;
+        }
+        for (int earlier = 0; earlier < index; ++earlier)
+            while (ports[index] == ports[earlier] || ports[index] == lbPort)
+                ports[index] = unusedPort();
     }
-    while (secondPort == firstPort) secondPort = unusedPort();
-    while (lbPort == firstPort || lbPort == secondPort) lbPort = unusedPort();
+    const int writePort = ports[0], readPortA = ports[1], readPortB = ports[2];
 
     std::string prefix = "/tmp/torrent-tracker-lb-integration-" +
                          std::to_string(getpid());
@@ -135,32 +146,28 @@ int main(int argc, char **argv) {
     std::string lbLog = prefix + "-lb.log";
     {
         std::ofstream output(trackerInfo);
-        output << "127.0.0.1:" << firstPort << '\n'
-               << "127.0.0.1:" << secondPort << '\n';
+        for (int port : ports) output << "127.0.0.1:" << port << '\n';
     }
     {
         std::ofstream output(lbInfo);
-        output << "127.0.0.1:" << lbPort << '\n'
-               << "127.0.0.1:" << firstPort << '\n'
-               << "127.0.0.1:" << secondPort << '\n';
+        output << "127.0.0.1:" << lbPort << '\n';
+        for (int port : ports) output << "127.0.0.1:" << port << '\n';
     }
 
-    ChildProcess first, second, lb;
+    ChildProcess nodes[3], lb;
     try {
-        first = startProcess({argv[1], trackerInfo, "1"});
-        second = startProcess({argv[1], trackerInfo, "2"});
-        require(waitForListener(firstPort), "tracker one did not start");
-        require(waitForListener(secondPort), "tracker two did not start");
+        for (int index = 0; index < 3; ++index)
+            nodes[index] = startProcess({argv[1], trackerInfo, std::to_string(index + 1)});
+        for (int port : ports) require(waitForListener(port), "tracker did not start");
 
         lb = startProcess({argv[2], lbInfo}, lbLog);
         require(waitForListener(lbPort), "load balancer did not start");
 
-        require(request(lbPort, 0, "create_user alice secret").first ==
+        require(eventuallyRequest(lbPort, 0, "create_user alice secret", "OK").first ==
                     "OK user created",
                 "create_user did not succeed through load balancer");
         auto aliceLogin = request(lbPort, 0, "login alice secret");
-        require(aliceLogin.first == "OK logged in",
-                "login did not return to create_user backend");
+        require(aliceLogin.first == "OK logged in", "login failed");
         require(aliceLogin.second != 0, "login did not return a session");
 
         require(request(lbPort, aliceLogin.second, "create_group demo").first ==
@@ -168,7 +175,7 @@ int main(int argc, char **argv) {
                 "post-login create_group failed");
         auto groups = request(lbPort, aliceLogin.second, "list_groups");
         require(groups.first.find("demo") != std::string::npos,
-                "post-login list_groups lost read-your-writes");
+                "read after write through load balancer lost the write");
 
         std::string encodedName = hexEncode("notes.txt");
         std::string upload =
@@ -179,60 +186,60 @@ int main(int argc, char **argv) {
         require(request(lbPort, aliceLogin.second, upload).first ==
                     "OK file shared "
                     "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-                "upload metadata failed through session route");
+                "upload metadata failed");
         auto files = request(lbPort, aliceLogin.second, "list_files demo");
         require(files.first.find(encodedName) != std::string::npos,
                 "state-changing command was not immediately readable");
 
-        std::uint8_t primaryTag =
-            static_cast<std::uint8_t>((aliceLogin.second >> 56U) & 0xffU);
-        require(primaryTag == 1 || primaryTag == 2, "session missing tracker tag");
-        int primaryPort = primaryTag == 1 ? firstPort : secondPort;
-        int peerPort = primaryTag == 1 ? secondPort : firstPort;
-
-        auto replicated = eventuallyRequest(
-            peerPort, aliceLogin.second, "list_files demo", "OK");
-        require(replicated.first.find(encodedName) != std::string::npos,
-                "replication did not reach peer tracker");
-
-        if (primaryPort == firstPort) stopProcess(first);
-        else stopProcess(second);
-
-        auto failedOver = request(lbPort, aliceLogin.second, "list_files demo");
-        require(failedOver.first.find(encodedName) != std::string::npos,
-                "load balancer did not fail over to replicated peer");
-
-        require(request(lbPort, aliceLogin.second,
-                        "create_group afterfail").first ==
-                    "OK group created",
-                "surviving tracker did not accept a mutation");
-
-        if (primaryPort == firstPort) {
-            first = startProcess({argv[1], trackerInfo, "1"});
-            require(waitForListener(firstPort), "tracker one did not restart");
-        } else {
-            second = startProcess({argv[1], trackerInfo, "2"});
-            require(waitForListener(secondPort), "tracker two did not restart");
+        // Both read servers hold every acknowledged write.
+        for (int port : {readPortA, readPortB}) {
+            auto replicated = eventuallyRequest(port, aliceLogin.second, "list_files demo",
+                                                "OK " + encodedName);
+            require(replicated.first == "OK " + encodedName,
+                    "write did not reach a read server");
         }
-        auto caughtUp = eventuallyRequest(
-            lbPort, aliceLogin.second, "list_groups", "OK");
-        require(caughtUp.first.find("afterfail") != std::string::npos,
-                "restarted tracker did not recover the survivor mutation");
 
-        stopProcess(first);
-        stopProcess(second);
+        // One read server down: reads and writes keep working.
+        stopProcess(nodes[1]);
+        require(request(lbPort, aliceLogin.second, "create_group onedown").first ==
+                    "OK group created",
+                "write failed with one read server down");
+        for (int attempt = 0; attempt < 4; ++attempt)
+            require(request(lbPort, aliceLogin.second, "list_groups").first ==
+                        "OK demo onedown",
+                    "read failed with one read server down");
+        nodes[1] = startProcess({argv[1], trackerInfo, "2"});
+        require(waitForListener(readPortA), "read server did not restart");
+        require(eventuallyRequest(readPortA, aliceLogin.second, "list_groups",
+                                  "OK demo onedown").first == "OK demo onedown",
+                "restarted read server was not caught up");
+
+        // Write server down: reads still served, writes refused.
+        stopProcess(nodes[0]);
+        require(request(lbPort, aliceLogin.second, "list_files demo").first.find(
+                    encodedName) != std::string::npos,
+                "reads failed with the write server down");
+        require(request(lbPort, aliceLogin.second, "create_group nowriter").first ==
+                    "ERR write server unavailable",
+                "write did not fail cleanly without the write server");
+
+        // Write server restarts, recovers from the read servers, accepts writes.
+        nodes[0] = startProcess({argv[1], trackerInfo, "1"});
+        require(waitForListener(writePort), "write server did not restart");
+        require(eventuallyRequest(lbPort, aliceLogin.second, "create_group afterfail",
+                                  "OK").first == "OK group created",
+                "recovered write server did not accept a write");
+        require(request(lbPort, aliceLogin.second, "list_groups").first ==
+                    "OK afterfail demo onedown",
+                "recovered write server lost earlier writes");
+
+        for (auto &node : nodes) stopProcess(node);
         auto unavailable = request(lbPort, aliceLogin.second, "list_groups");
         require(unavailable.first == "ERR tracker service unavailable",
-                "LB did not report both trackers unavailable");
-
+                "LB did not report all trackers unavailable");
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
-        stopProcess(lb);
-        stopProcess(second);
-        stopProcess(first);
-        unlink(trackerInfo.c_str());
-        unlink(lbInfo.c_str());
-        unlink(lbLog.c_str());
+        cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog});
         return 1;
     }
 
@@ -243,17 +250,11 @@ int main(int argc, char **argv) {
                          std::istreambuf_iterator<char>());
         if (logs.find("secret") != std::string::npos) {
             std::cerr << "load balancer log leaked a password\n";
-            unlink(trackerInfo.c_str());
-            unlink(lbInfo.c_str());
-            unlink(lbLog.c_str());
+            cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog});
             return 1;
         }
     }
-    stopProcess(second);
-    stopProcess(first);
-    unlink(trackerInfo.c_str());
-    unlink(lbInfo.c_str());
-    unlink(lbLog.c_str());
+    cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog});
     std::cout << "tracker lb integration tests passed\n";
     return 0;
 }

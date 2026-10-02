@@ -2,36 +2,36 @@
 
 ## Components
 
-The system has one load balancer, two trackers, and any number of clients. The LB and trackers hold metadata only. File bytes move directly between clients.
+The system has one load balancer, three trackers, and any number of clients. Tracker 1 is the write server; trackers 2 and 3 are read servers. The LB and trackers hold metadata only. File bytes move directly between clients.
 
 ```text
-Client command -> LB -> owning tracker -> ordered replication -> response
-Download metadata <- LB <- tracker
-Encrypted pieces: client <---------------------------------> client
+Write:  client -> LB -> write server -> sync to both read servers -> response
+Read:   client -> LB -> an in-sync read server -> response
+Pieces: client <-------------- encrypted --------------> client
 ```
 
 The supported process forms are:
 
 ```text
-tracker <two-endpoint-config> <1|2>
-tracker_lb <listen-and-two-backends-config>
+tracker <three-endpoint-config> <1|2|3>      # 1 = write server, 2-3 = read servers
+tracker_lb <listen-write-read-read-config>
 client <peer-ip:port> <one-LB-endpoint-config>
 ```
 
 ## Routing
 
-The LB applies 64-bit FNV-1a to the user ID for `create_user` and `login`, and to the group ID for group/file commands. Commands without an aggregate key use the tracker tag in the high byte of the session ID. This gives each aggregate one normal owner while replicated sessions let group ownership differ from account ownership.
+The LB classifies each request by its command. `create_user`, `login`, `logout`, `create_group`, `join_group`, `leave_group`, `accept_request`, `upload_file` and `stop_share` are writes and go only to the write server. Everything else is a read.
 
-All state-changing requests pass through one LB mutation mutex. Read requests do not take that mutex. The LB never logs request payloads, so passwords are not written to its logs.
-
-Before routing, the LB queries both trackers:
+For a read, the LB asks all three trackers for their status:
 
 ```text
 X\t0\tSTATUS
-STATUS\t<origin-1-seq>\t<origin-2-seq>\t<READY|DEGRADED>
+STATUS\t<primary|replica>\t<sequence>\t<READY|RECOVERING>
 ```
 
-If both ready vectors match, the normal owner is used. If only one tracker is ready, or one vector component-wise dominates the other, the current replica is used. Incomparable vectors and two unavailable/degraded backends return `ERR tracker service unavailable\t<session>`.
+If the write server is ready, the read goes round-robin to a read server whose sequence equals the write server's, or to the write server if neither read server is in sync. If the write server is unreachable, the read goes to the read server with the highest sequence. With no tracker reachable the LB answers `ERR tracker service unavailable`; with the write server unreachable a write gets `ERR write server unavailable`.
+
+The LB never logs request payloads, so passwords are not written to its logs.
 
 ## Tracker protocol
 
@@ -44,23 +44,28 @@ C\t<session>\t<command>
 <response-text>\t<session>
 ```
 
-Replication:
+Read servers answer client writes with `ERR read-only server; send writes to the write server`.
+
+Replication, from the write server to each read server, holding the write server's mutation lock so entries are strictly ordered:
 
 ```text
-S\t<origin>\t<sequence>\t<session>\t<command>
-APPLIED | DUPLICATE | QUEUED | DEGRADED
+S\t<sequence>\t<session>\t<command>
+APPLIED | DUPLICATE | RESYNC
 ```
 
-Each tracker stores an applied sequence for both origins. `sequence <= applied` is a duplicate. A sequence above `applied + 1` is queued. Applying the missing sequence drains the contiguous queued suffix. A replay conflict advances past the poison item, marks the replica degraded, and prevents the FIFO from blocking forever.
+A read server applies only `applied + 1`. Older sequences are `DUPLICATE`. A gap, or an entry that fails against local state, is `RESYNC`, and the write server immediately pushes a full snapshot:
 
-Snapshot:
+```text
+P\t<sequence>\n<state>
+APPLIED
+```
+
+Snapshot read, used by a restarting write server:
 
 ```text
 X\t0\tSNAPSHOT
-SNAPSHOT\t<origin-1-seq>\t<origin-2-seq>\t<READY|DEGRADED>\n<state>
+SNAPSHOT\t<sequence>\n<state>
 ```
-
-A restarting tracker accepts only a ready, structurally valid snapshot. It restores the state and applied vector together. The surviving tracker may subsequently redeliver queued mutations; sequence deduplication makes that safe.
 
 ## Peer protocol
 
@@ -74,9 +79,9 @@ After a piece passes SHA-1 it is written, fsynced, recorded in the resume manife
 
 ## Failure model
 
-- A failed replication attempt is retained in an origin-ordered in-memory retry queue.
-- The LB can keep using a surviving tracker and will not send traffic back to a stale owner.
-- A restart obtains a sequence-aware snapshot from the survivor.
-- Two tracker failures lose metadata because persistence is intentionally out of scope.
-- The single LB is not replicated.
-- The model assumes one LB serializes client mutations; it is not Byzantine fault tolerant or a consensus protocol.
+- **Read server down.** The write server marks it out of sync and stops sending to it. Writes and reads continue on the other two nodes. A background loop checks both read servers every 250 ms and pushes a snapshot to any that is reachable but behind, so a restarted read server rejoins on its own.
+- **Write server down.** Reads continue from the most advanced read server. Writes fail with `ERR write server unavailable`. There is no election.
+- **Write server restart.** It answers `ERR write server recovering` until a read server responds, then copies the most advanced read server's snapshot and sequence. Read servers at that sequence are marked in sync; others are caught up by snapshot.
+- **Data loss window.** If the write server restarts while the only reachable read server is behind, writes that only the other read server had are lost when that server is resynced.
+- **All trackers down.** State is in memory only, so metadata is lost.
+- The single LB is not replicated, and tracker traffic assumes a trusted network.

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <fstream>
 #include <iostream>
@@ -9,36 +10,25 @@
 #include <poll.h>
 #include <sstream>
 #include <thread>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace {
 
-struct Route {
-    std::size_t owner = 0;
-    u64 session = 0;
-    bool sessionParseable = false;
-    bool mutation = false;
-};
+// Load balancer for one write server and two read servers.
+//   writes -> write server only
+//   reads  -> round-robin over read servers that have applied everything the
+//             write server has; the write server itself if none are in sync;
+//             the most up-to-date read server if the write server is down.
 
-struct BackendStatus {
+struct NodeStatus {
     bool reachable = false;
-    bool degraded = true;
-    std::array<u64, 2> applied{};
+    bool ready = false;
+    u64 sequence = 0;
 };
-
-std::uint64_t stableHash(const std::string &value) {
-    std::uint64_t hash = 14695981039346656037ULL;
-    for (unsigned char byte : value) {
-        hash ^= byte;
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
 
 bool readLbInfo(const std::string &path, Endpoint &listen,
-                std::array<Endpoint, 2> &backends) {
+                std::array<Endpoint, 3> &backends) {
     std::ifstream input(path);
     if (!input) return false;
     std::vector<Endpoint> endpoints;
@@ -48,100 +38,60 @@ bool readLbInfo(const std::string &path, Endpoint &listen,
         if (!parseEndpoint(token, endpoint)) return false;
         endpoints.push_back(endpoint);
     }
-    if (endpoints.size() != 3) return false;
+    if (endpoints.size() != 4) return false;
     listen = endpoints[0];
-    backends = {endpoints[1], endpoints[2]};
-    return endpointKey(listen) != endpointKey(backends[0]) &&
-           endpointKey(listen) != endpointKey(backends[1]) &&
-           endpointKey(backends[0]) != endpointKey(backends[1]);
-}
-
-Route chooseRoute(const std::string &request) {
-    Route route;
-    std::vector<std::string> fields = split(request, '\t');
-    if (fields.size() < 3 || fields[0] != "C") return route;
-    if (!parseUnsignedDecimal(fields[1], route.session)) return route;
-    route.sessionParseable = true;
-
-    std::string commandLine = fields[2];
-    for (std::size_t index = 3; index < fields.size(); ++index)
-        commandLine += "\t" + fields[index];
-    std::istringstream input(commandLine);
-    std::string command, key;
-    input >> command >> key;
-
-    static const std::unordered_set<std::string> mutations = {
-        "create_user", "login", "logout", "create_group", "join_group",
-        "leave_group", "accept_request", "upload_file", "stop_share"};
-    static const std::unordered_set<std::string> groupCommands = {
-        "create_group", "join_group", "leave_group", "list_requests",
-        "accept_request", "upload_file", "list_files", "download_file",
-        "stop_share"};
-    route.mutation = mutations.count(command) != 0;
-
-    if ((command == "create_user" || command == "login") && !key.empty()) {
-        route.owner = static_cast<std::size_t>(stableHash(key) % 2U);
-    } else if (groupCommands.count(command) && !key.empty()) {
-        route.owner = static_cast<std::size_t>(stableHash(key) % 2U);
-    } else if (route.session != 0) {
-        std::uint8_t tag =
-            static_cast<std::uint8_t>((route.session >> 56U) & 0xffU);
-        if (tag == 1 || tag == 2)
-            route.owner = static_cast<std::size_t>(tag - 1);
-    }
-    return route;
-}
-
-bool dominates(const BackendStatus &left, const BackendStatus &right) {
-    return left.applied[0] >= right.applied[0] &&
-           left.applied[1] >= right.applied[1];
+    backends = {endpoints[1], endpoints[2], endpoints[3]};
+    for (std::size_t i = 0; i < endpoints.size(); ++i)
+        for (std::size_t j = i + 1; j < endpoints.size(); ++j)
+            if (endpointKey(endpoints[i]) == endpointKey(endpoints[j])) return false;
+    return true;
 }
 
 class LoadBalancer {
+    static constexpr std::size_t WRITER = 0;
     Endpoint listen_;
-    std::array<Endpoint, 2> backends_;
-    std::mutex mutationMutex_;
+    std::array<Endpoint, 3> backends_;
+    std::atomic<std::size_t> nextReader_{0};
 
-    BackendStatus queryStatus(std::size_t backend) const {
-        BackendStatus status;
-        UniqueFd fd(connectTcp(backends_[backend].ip,
-                               backends_[backend].port, 2));
-        if (!fd) return status;
+    NodeStatus queryStatus(std::size_t backend) const {
+        NodeStatus status;
         std::string response;
-        if (!sendFrame(fd.get(), "X\t0\tSTATUS") ||
-            !receiveFrame(fd.get(), response))
-            return status;
+        if (!trackerCall(backends_[backend], "X\t0\tSTATUS", response)) return status;
         std::vector<std::string> fields = split(response, '\t');
         if (fields.size() != 4 || fields[0] != "STATUS" ||
-            !parseUnsignedDecimal(fields[1], status.applied[0]) ||
-            !parseUnsignedDecimal(fields[2], status.applied[1]) ||
-            (fields[3] != "READY" && fields[3] != "DEGRADED"))
+            !parseUnsignedDecimal(fields[2], status.sequence))
             return status;
         status.reachable = true;
-        status.degraded = fields[3] == "DEGRADED";
+        status.ready = fields[3] == "READY";
         return status;
     }
 
-    std::vector<std::size_t> backendOrder(std::size_t owner) const {
-        std::array<BackendStatus, 2> status = {queryStatus(0), queryStatus(1)};
-        bool usable0 = status[0].reachable && !status[0].degraded;
-        bool usable1 = status[1].reachable && !status[1].degraded;
-        if (!usable0 && !usable1) return {};
-        if (usable0 && !usable1) return {0};
-        if (!usable0 && usable1) return {1};
-        if (status[0].applied == status[1].applied)
-            return {owner, owner == 0 ? 1U : 0U};
-        if (dominates(status[0], status[1])) return {0};
-        if (dominates(status[1], status[0])) return {1};
-        return {};
+    std::vector<std::size_t> readOrder() {
+        std::array<NodeStatus, 3> status = {queryStatus(0), queryStatus(1), queryStatus(2)};
+        std::vector<std::size_t> readers;
+        std::size_t start = nextReader_++ % 2;
+        for (std::size_t offset = 0; offset < 2; ++offset) {
+            std::size_t reader = 1 + (start + offset) % 2;
+            if (status[reader].reachable) readers.push_back(reader);
+        }
+        const NodeStatus &writer = status[WRITER];
+        if (writer.reachable && writer.ready) {
+            std::vector<std::size_t> order;
+            for (std::size_t reader : readers)
+                if (status[reader].sequence == writer.sequence) order.push_back(reader);
+            order.push_back(WRITER);
+            return order;
+        }
+        // No write server: nothing newer than the best read server exists.
+        std::stable_sort(readers.begin(), readers.end(), [&](std::size_t a, std::size_t b) {
+            return status[a].sequence > status[b].sequence;
+        });
+        return readers;
     }
 
     bool forward(std::size_t backend, const std::string &request,
                  std::string &response) const {
-        UniqueFd fd(connectTcp(backends_[backend].ip,
-                               backends_[backend].port, 2));
-        return fd && sendFrame(fd.get(), request) &&
-               receiveFrame(fd.get(), response);
+        return trackerCall(backends_[backend], request, response);
     }
 
     void handleClient(int rawFd) {
@@ -153,11 +103,15 @@ class LoadBalancer {
 
         std::string request;
         if (!receiveFrame(fd.get(), request)) return;
-        Route route = chooseRoute(request);
-        std::unique_lock<std::mutex> mutationLock(mutationMutex_, std::defer_lock);
-        if (route.mutation) mutationLock.lock();
+        std::vector<std::string> fields = split(request, '\t');
+        u64 session = 0;
+        bool sessionParseable = fields.size() >= 3 && fields[0] == "C" &&
+                                parseUnsignedDecimal(fields[1], session);
+        bool write = sessionParseable && isTrackerMutation(fields[2]);
 
-        for (std::size_t backend : backendOrder(route.owner)) {
+        std::vector<std::size_t> order = write ? std::vector<std::size_t>{WRITER}
+                                               : readOrder();
+        for (std::size_t backend : order) {
             std::string response;
             if (forward(backend, request, response)) {
                 sendFrame(fd.get(), response);
@@ -166,14 +120,14 @@ class LoadBalancer {
             std::cerr << "tracker_lb: backend " << (backend + 1)
                       << " unavailable\n";
         }
-        std::string response = "ERR tracker service unavailable";
-        if (route.sessionParseable)
-            response += "\t" + std::to_string(route.session);
+        std::string response = write ? "ERR write server unavailable"
+                                      : "ERR tracker service unavailable";
+        if (sessionParseable) response += "\t" + std::to_string(session);
         sendFrame(fd.get(), response);
     }
 
 public:
-    LoadBalancer(Endpoint listen, std::array<Endpoint, 2> backends)
+    LoadBalancer(Endpoint listen, std::array<Endpoint, 3> backends)
         : listen_(std::move(listen)), backends_(std::move(backends)) {}
 
     int run() {
@@ -183,8 +137,9 @@ public:
             return 1;
         }
         std::cerr << "tracker_lb listening on " << endpointKey(listen_)
-                  << ", backends " << endpointKey(backends_[0]) << " and "
-                  << endpointKey(backends_[1]) << '\n';
+                  << ", write server " << endpointKey(backends_[0])
+                  << ", read servers " << endpointKey(backends_[1]) << " and "
+                  << endpointKey(backends_[2]) << '\n';
 
         bool running = true;
         bool monitorConsole = true;
@@ -242,9 +197,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     Endpoint listen;
-    std::array<Endpoint, 2> backends;
+    std::array<Endpoint, 3> backends;
     if (!readLbInfo(argv[1], listen, backends)) {
-        std::cerr << "LB config must contain listen, tracker-1, and tracker-2 IP:PORT entries\n";
+        std::cerr << "LB config must list the listen address, the write server, and two read servers as IP:PORT entries\n";
         return 1;
     }
     return LoadBalancer(std::move(listen), std::move(backends)).run();

@@ -7,18 +7,20 @@ Torrent Atlas is an interview-sized BitTorrent-style file sharing system written
 ```text
 clients ── framed TCP ──> load balancer :5000
                               │
-                    ┌─────────┴─────────┐
-                    v                   v
-               tracker 1 :6000 <──> tracker 2 :7000
+              writes ─────────┼───────── reads
+                 v            │            v
+       write server :6000 ──sync──> read servers :6001, :6002
 
 peer :8001 <──── encrypted piece traffic ────> peer :8002
 ```
 
-The load balancer is the only supported tracker endpoint for clients. It uses stable FNV-1a hashing for user and group ownership, and the tracker tag embedded in session IDs for session-only commands. Mutations are serialized at the LB; reads may run concurrently.
+The tracker tier has one write server and two read servers. Clients only talk to the load balancer.
 
-Each tracker applies local mutations in sequence and replicates them as `S\t<origin>\t<sequence>\t<session>\t<command>`. Replicas deduplicate old sequences and queue gaps. A successful mutation is returned only after immediate replication has been attempted. If the peer is unavailable, the mutation remains in an ordered in-memory retry queue.
+Every state-changing command (`create_user`, `login`, `upload_file`, ...) goes to the write server. It applies the command, gives it the next sequence number, and pushes it to both read servers before answering. So once a client sees `OK`, both in-sync read servers already have the change.
 
-`STATUS` and sequence-aware `SNAPSHOT` messages expose each tracker’s applied vector. Normal shard ownership resumes only when both vectors match. A replica that encounters an impossible replay conflict marks itself degraded and stays out of LB rotation until restart and snapshot recovery.
+Reads (`list_groups`, `list_files`, `download_file`, ...) are spread round-robin over the read servers that are at the write server's sequence number. A read server that is behind is skipped until it catches up, so reads never return older data than a write the client already saw.
+
+A read server that was down, restarted, or missed an entry is caught up with a full snapshot push from the write server. A restarted write server copies its state from the most up-to-date read server before accepting writes. While the write server is down, reads keep working from the read servers and writes return `ERR write server unavailable`.
 
 For the wire formats and failure-state details, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -43,11 +45,12 @@ make clean
 
 ## Local demo
 
-Committed example configs use LB `5000`, tracker 1 `6000`, and tracker 2 `7000`.
+Committed example configs use LB `5000`, write server `6000`, and read servers `6001` and `6002`. Tracker number 1 is always the write server.
 
 ```sh
-./build/tracker config/trackers.conf 1
 ./build/tracker config/trackers.conf 2
+./build/tracker config/trackers.conf 3
+./build/tracker config/trackers.conf 1
 ./build/tracker_lb config/load_balancer.conf
 ./build/client 127.0.0.1:8001 config/client.conf
 ./build/client 127.0.0.1:8002 config/client.conf
@@ -75,13 +78,13 @@ quit
 
 ## Five-minute interview demo
 
-1. Start both trackers and the LB; point out that clients know only `:5000`.
+1. Start the three trackers and the LB; point out that clients know only `:5000`.
 2. Start two clients, create Alice and Bob, create a group, join it, and accept Bob.
 3. Upload a multi-piece file from Alice and download it from Bob. Use `show downloads` and `stats` to show rarest-first progress and throughput.
-4. Stop the owner tracker. Create another group or share another file through the LB to demonstrate survivor writes.
-5. Restart the tracker. Explain snapshot recovery and show that ownership fails back only after applied vectors match.
+4. Stop one read server. Reads and writes keep working; restart it and show it is caught up by a snapshot push.
+5. Stop the write server. Reads still work and writes are refused. Restart it and show it recovers its state from the read servers.
 
-The useful interview tradeoff is deliberately narrow: this is ordered primary/replica metadata with deterministic ownership, not consensus. That makes failover and catch-up concrete without hiding the direct peer-transfer path behind a large framework.
+The tradeoff is deliberately simple: one writer orders every change and replicates synchronously, so reads from in-sync read servers are consistent without a consensus protocol. The cost is that writes stop while the write server is down.
 
 ## Transfer behavior
 
@@ -97,11 +100,11 @@ The useful interview tradeoff is deliberately narrow: this is ordered primary/re
 
 ## Design limits
 
-- The LB is a single point of failure.
-- Tracker state, sequence counters, snapshots, and retry queues are in memory. Total tracker shutdown loses metadata.
+- The LB is a single point of failure, and so is the write server for writes.
+- Tracker state and sequence numbers are in memory. Shutting down all three trackers loses metadata.
+- A restarted write server recovers from the most up-to-date read server it can reach. If the only read server reachable at that moment is behind, writes it missed are lost.
 - Tracker traffic assumes a trusted network and is not encrypted.
 - SHA-1 is retained because the assignment requires it; it is not recommended for new security designs.
-- Ordered replication plus catch-up-gated failback is not consensus and is not a general CRDT design.
 - Peer authorization uses tracker-issued file capabilities; it is not an internet-facing identity system.
 
 ## Documentation

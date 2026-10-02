@@ -100,60 +100,81 @@ static std::pair<std::string, u64> eventuallyRequest(
 
 int main(int argc, char **argv) {
     assert(argc == 2);
-    int firstPort = unusedPort();
-    int secondPort = unusedPort();
-    if (firstPort < 0 || secondPort < 0) {
-        std::cout << "tracker integration tests skipped: local sockets unavailable\n";
-        return 77;
+    int ports[3];
+    for (int index = 0; index < 3; ++index) {
+        ports[index] = unusedPort();
+        if (ports[index] < 0) {
+            std::cout << "tracker integration tests skipped: local sockets unavailable\n";
+            return 77;
+        }
+        for (int earlier = 0; earlier < index; ++earlier)
+            while (ports[index] == ports[earlier]) ports[index] = unusedPort();
     }
-    while (secondPort == firstPort) secondPort = unusedPort();
+    const int writePort = ports[0], readPortA = ports[1], readPortB = ports[2];
     std::string infoPath = "/tmp/torrent-tracker-integration-" +
                            std::to_string(getpid()) + ".txt";
     {
         std::ofstream output(infoPath);
-        output << "127.0.0.1:" << firstPort << '\n'
-               << "127.0.0.1:" << secondPort << '\n';
+        for (int port : ports) output << "127.0.0.1:" << port << '\n';
     }
 
-    TrackerProcess first = startTracker(argv[1], infoPath, 1);
-    TrackerProcess second = startTracker(argv[1], infoPath, 2);
-    assert(waitForTracker(firstPort));
-    assert(waitForTracker(secondPort));
+    TrackerProcess nodes[3];
+    for (int index = 0; index < 3; ++index)
+        nodes[index] = startTracker(argv[1], infoPath, index + 1);
+    for (int port : ports) assert(waitForTracker(port));
 
-    assert(request(firstPort, 0, "create_user alice secret").first ==
-           "OK user created");
-    auto aliceLogin = request(firstPort, 0, "login alice secret");
+    // Writes go to the write server once it has found a read server.
+    auto created = eventuallyRequest(writePort, 0, "create_user alice secret", "OK");
+    assert(created.first == "OK user created");
+    auto aliceLogin = request(writePort, 0, "login alice secret");
     assert(aliceLogin.first == "OK logged in");
-    assert(request(firstPort, aliceLogin.second, "create_group demo").first ==
+    assert(request(writePort, aliceLogin.second, "create_group demo").first ==
            "OK group created");
 
-    assert(request(secondPort, 0, "create_user bob secret").first ==
-           "OK user created");
-    auto bobLogin = request(secondPort, 0, "login bob secret");
-    assert(bobLogin.first == "OK logged in");
-    auto joined = eventuallyRequest(
-        secondPort, bobLogin.second, "join_group demo", "OK");
-    assert(joined.first == "OK join requested");
+    // Replication is synchronous once the read servers are in sync, so the
+    // next read on either read server sees the write.
+    auto groupsA = eventuallyRequest(readPortA, aliceLogin.second, "list_groups", "OK demo");
+    auto groupsB = eventuallyRequest(readPortB, aliceLogin.second, "list_groups", "OK demo");
+    assert(groupsA.first == "OK demo");
+    assert(groupsB.first == "OK demo");
+    assert(request(writePort, aliceLogin.second, "create_group second").first ==
+           "OK group created");
+    assert(request(readPortA, aliceLogin.second, "list_groups").first == "OK demo second");
+    assert(request(readPortB, aliceLogin.second, "list_groups").first == "OK demo second");
 
-    auto accepted = eventuallyRequest(
-        firstPort, aliceLogin.second, "accept_request demo bob", "OK");
-    assert(accepted.first == "OK request accepted");
-    auto groups = eventuallyRequest(
-        secondPort, bobLogin.second, "list_groups", "OK");
-    assert(groups.first.find("demo") != std::string::npos);
+    // Read servers refuse writes.
+    assert(request(readPortA, 0, "create_user bob secret").first.rfind(
+               "ERR read-only server", 0) == 0);
 
-    stopTracker(first);
-    stopTracker(second);
+    // A restarted read server is caught up by a snapshot push.
+    stopTracker(nodes[2]);
+    assert(request(writePort, aliceLogin.second, "create_group third").first ==
+           "OK group created");
+    nodes[2] = startTracker(argv[1], infoPath, 3);
+    assert(waitForTracker(readPortB));
+    assert(eventuallyRequest(readPortB, aliceLogin.second, "list_groups",
+                             "OK demo second third").first == "OK demo second third");
 
-    first = startTracker(argv[1], infoPath, 1);
-    second = startTracker(argv[1], infoPath, 2);
-    assert(waitForTracker(firstPort));
-    assert(waitForTracker(secondPort));
-    assert(request(firstPort, 0, "login alice secret").first ==
+    // A restarted write server recovers its state from the read servers.
+    stopTracker(nodes[0]);
+    nodes[0] = startTracker(argv[1], infoPath, 1);
+    assert(waitForTracker(writePort));
+    assert(eventuallyRequest(writePort, aliceLogin.second, "list_groups",
+                             "OK demo second third").first == "OK demo second third");
+    assert(request(writePort, aliceLogin.second, "create_group fourth").first ==
+           "OK group created");
+    assert(request(readPortA, aliceLogin.second, "list_groups").first ==
+           "OK demo fourth second third");
+
+    // State is in memory only: restarting every node starts empty.
+    for (auto &node : nodes) stopTracker(node);
+    for (int index = 0; index < 3; ++index)
+        nodes[index] = startTracker(argv[1], infoPath, index + 1);
+    for (int port : ports) assert(waitForTracker(port));
+    assert(eventuallyRequest(writePort, 0, "login alice secret", "ERR no such user").first ==
            "ERR no such user");
 
-    stopTracker(first);
-    stopTracker(second);
+    for (auto &node : nodes) stopTracker(node);
     unlink(infoPath.c_str());
     std::cout << "tracker integration tests passed\n";
 }

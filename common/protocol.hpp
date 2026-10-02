@@ -290,3 +290,25 @@ inline std::vector<std::string> split(const std::string &text, char delimiter) {
     }
     return parts;
 }
+
+// Tracker commands that change cluster state. Only the write server runs
+// them; the read servers receive them through replication.
+inline bool isTrackerMutation(const std::string &commandLine) {
+    std::string command = commandLine.substr(0, commandLine.find_first_of(" \t"));
+    static const char *const mutations[] = {
+        "create_user", "login", "logout", "create_group", "join_group",
+        "leave_group", "accept_request", "upload_file", "stop_share"};
+    for (const char *mutation : mutations)
+        if (command == mutation) return true;
+    return false;
+}
+
+// One request/response exchange with a tracker node.
+inline bool trackerCall(const Endpoint &endpoint, const std::string &request,
+                        std::string &response, int timeoutSeconds = 2) {
+    int fd = connectTcp(endpoint.ip, endpoint.port, timeoutSeconds);
+    if (fd < 0) return false;
+    bool ok = sendFrame(fd, request) && receiveFrame(fd, response);
+    close(fd);
+    return ok;
+}
