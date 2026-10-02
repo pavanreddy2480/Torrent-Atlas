@@ -41,6 +41,7 @@ receive a small error response without file data.
 - Five failed logins temporarily lock the account.
 - SHA-1 remains only for assignment-required piece and full-file integrity verification.
 - Resume manifests containing capabilities are written with mode `0600`.
+- The load balancer logs backend health only, never command payloads or passwords.
 
 ## Tradeoffs
 
@@ -49,8 +50,8 @@ does not provide peer identity authentication or forward secrecy. It intentional
 small protocol that is easy to explain: the tracker distributes a secret file key, and peers use
 AES-GCM with that key to encrypt and authenticate requests and responses.
 
-Run the security tests with:
+Run the complete test suite with:
 
 ```sh
-make security-test
+make test
 ```

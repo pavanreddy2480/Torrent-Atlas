@@ -61,11 +61,9 @@ bool loadResume(const std::string &manifestPath, const std::string &group,
     std::string storedGroup;
     std::string storedName;
     u64 storedSize = 0;
-    try {
-        storedSize = static_cast<u64>(std::stoull(sizeText));
-    } catch (...) {
+    std::string extra;
+    if (!parseUnsignedDecimal(sizeText, storedSize) || std::getline(input, extra))
         return false;
-    }
     if (!hexDecode(encodedGroup, storedGroup) ||
         !hexDecode(encodedName, storedName) ||
         !hexDecode(encodedTemporary, temporaryPath) ||
@@ -114,8 +112,8 @@ bool verifyStoredPieces(int descriptor, const LocalFile &metadata,
 
 bool hashFile(const std::string &path, u64 &size, std::string &fullHash,
               std::vector<std::string> &pieceHashes) {
-    int descriptor = open(path.c_str(), O_RDONLY);
-    if (descriptor < 0) return false;
+    UniqueFd descriptor(open(path.c_str(), O_RDONLY));
+    if (!descriptor) return false;
     Sha1 complete;
     std::vector<char> buffer(PIECE_SIZE);
     size = 0;
@@ -124,10 +122,9 @@ bool hashFile(const std::string &path, u64 &size, std::string &fullHash,
         std::size_t used = 0;
         while (used < buffer.size()) {
             ssize_t count =
-                read(descriptor, buffer.data() + used, buffer.size() - used);
+                read(descriptor.get(), buffer.data() + used, buffer.size() - used);
             if (count < 0) {
                 if (errno == EINTR) continue;
-                close(descriptor);
                 return false;
             }
             if (count == 0) break;
@@ -141,7 +138,6 @@ bool hashFile(const std::string &path, u64 &size, std::string &fullHash,
         size += used;
         if (used < buffer.size()) break;
     }
-    close(descriptor);
     fullHash = complete.finalHex();
     return true;
 }

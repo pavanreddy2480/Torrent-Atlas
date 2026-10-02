@@ -1,9 +1,14 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
+#include <limits>
+#include <poll.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -14,6 +19,75 @@ using u64 = std::uint64_t;
 
 static const std::size_t MAX_FRAME = 16U * 1024U * 1024U;
 static const std::size_t PIECE_SIZE = 512U * 1024U;
+
+struct Endpoint {
+    std::string ip;
+    int port = 0;
+};
+
+class UniqueFd {
+    int fd_ = -1;
+
+public:
+    UniqueFd() = default;
+    explicit UniqueFd(int fd) : fd_(fd) {}
+    ~UniqueFd() { reset(); }
+    UniqueFd(const UniqueFd &) = delete;
+    UniqueFd &operator=(const UniqueFd &) = delete;
+    UniqueFd(UniqueFd &&other) noexcept : fd_(other.release()) {}
+    UniqueFd &operator=(UniqueFd &&other) noexcept {
+        if (this != &other) reset(other.release());
+        return *this;
+    }
+    int get() const { return fd_; }
+    explicit operator bool() const { return fd_ >= 0; }
+    int release() {
+        int value = fd_;
+        fd_ = -1;
+        return value;
+    }
+    void reset(int fd = -1) {
+        if (fd_ >= 0) close(fd_);
+        fd_ = fd;
+    }
+};
+
+inline std::string endpointKey(const Endpoint &endpoint) {
+    return endpoint.ip + ":" + std::to_string(endpoint.port);
+}
+
+inline bool parseUnsignedDecimal(const std::string &text, u64 &value) {
+    if (text.empty()) return false;
+    u64 parsed = 0;
+    for (unsigned char character : text) {
+        if (character < '0' || character > '9') return false;
+        unsigned digit = character - '0';
+        if (parsed > (std::numeric_limits<u64>::max() - digit) / 10U)
+            return false;
+        parsed = parsed * 10U + digit;
+    }
+    value = parsed;
+    return true;
+}
+
+inline bool parseEndpoint(const std::string &text, Endpoint &endpoint) {
+    std::size_t colon = text.rfind(':');
+    if (colon == std::string::npos || colon == 0 ||
+        text.find(':') != colon || colon + 1 == text.size())
+        return false;
+    Endpoint parsed;
+    parsed.ip = text.substr(0, colon);
+    sockaddr_in address{};
+    if (inet_pton(AF_INET, parsed.ip.c_str(), &address.sin_addr) != 1)
+        return false;
+    u64 port = 0;
+    if (!parseUnsignedDecimal(text.substr(colon + 1), port) ||
+        port == 0 || port > 65535)
+        return false;
+    parsed.port = static_cast<int>(port);
+    endpoint = std::move(parsed);
+    return true;
+}
 
 inline u64 hostToNet64(u64 value) {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -84,23 +158,52 @@ inline bool receiveFrame(int fd, std::string &payload) {
 }
 
 inline int connectTcp(const std::string &ip, int port, int timeoutSeconds = 5) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (port <= 0 || port > 65535 || timeoutSeconds < 0) return -1;
+    UniqueFd socketFd(socket(AF_INET, SOCK_STREAM, 0));
+    if (!socketFd) return -1;
 
-    timeval timeout{};
-    timeout.tv_sec = timeoutSeconds;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    int originalFlags = fcntl(socketFd.get(), F_GETFL, 0);
+    if (originalFlags < 0 ||
+        fcntl(socketFd.get(), F_SETFL, originalFlags | O_NONBLOCK) < 0)
+        return -1;
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(static_cast<std::uint16_t>(port));
-    if (inet_pton(AF_INET, ip.c_str(), &address.sin_addr) != 1 ||
-        connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
-        close(fd);
-        return -1;
+    if (inet_pton(AF_INET, ip.c_str(), &address.sin_addr) != 1) return -1;
+    if (connect(socketFd.get(), reinterpret_cast<sockaddr *>(&address),
+                sizeof(address)) < 0) {
+        if (errno != EINPROGRESS) return -1;
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(timeoutSeconds);
+        for (;;) {
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (remaining.count() < 0) return -1;
+            pollfd descriptor{socketFd.get(), POLLOUT, 0};
+            int waitMilliseconds = static_cast<int>(std::min<long long>(
+                remaining.count(), std::numeric_limits<int>::max()));
+            int ready = poll(&descriptor, 1, waitMilliseconds);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready <= 0) return -1;
+            int error = 0;
+            socklen_t length = sizeof(error);
+            if (getsockopt(socketFd.get(), SOL_SOCKET, SO_ERROR, &error,
+                           &length) != 0 || error != 0) {
+                if (error != 0) errno = error;
+                return -1;
+            }
+            break;
+        }
     }
-    return fd;
+    if (fcntl(socketFd.get(), F_SETFL, originalFlags) < 0) return -1;
+    timeval timeout{};
+    timeout.tv_sec = timeoutSeconds;
+    setsockopt(socketFd.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
+               sizeof(timeout));
+    setsockopt(socketFd.get(), SOL_SOCKET, SO_SNDTIMEO, &timeout,
+               sizeof(timeout));
+    return socketFd.release();
 }
 
 inline int createListener(const std::string &ip, int port, int backlog = 64) {
@@ -161,6 +264,18 @@ inline bool isHexInteger(const std::string &value,
         bool upper = character >= 'A' && character <= 'F';
         if (!digit && !lower && !upper) return false;
     }
+    return true;
+}
+
+inline bool isSha1Hex(const std::string &value) {
+    return isHexInteger(value, 40, 40);
+}
+
+inline bool pieceCountForSize(u64 size, std::size_t &count) {
+    u64 pieces = size / PIECE_SIZE + (size % PIECE_SIZE != 0 ? 1U : 0U);
+    if (pieces > static_cast<u64>(std::numeric_limits<std::size_t>::max()))
+        return false;
+    count = static_cast<std::size_t>(pieces);
     return true;
 }
 

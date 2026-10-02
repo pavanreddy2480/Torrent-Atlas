@@ -3,14 +3,13 @@
 #include "telemetry.hpp"
 
 #include <algorithm>
-#include <ctime>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
 
 std::vector<DownloadView> buildDownloadViews(
     const std::vector<std::shared_ptr<DownloadStatus>> &statuses,
-    const std::unordered_map<std::string, PeerReputation> &reputations) {
+    const std::unordered_map<std::string, PeerMetrics> &metrics) {
     std::vector<DownloadView> result;
     result.reserve(statuses.size());
     for (const auto &status : statuses) {
@@ -39,31 +38,23 @@ std::vector<DownloadView> buildDownloadViews(
         view.discoveredPeers = status->discoveredPeers.load();
         view.responsivePeers = status->responsivePeers.load();
         view.rarePieces = status->rarePieces.load();
-        view.duplicateRequests = status->duplicateRequests.load();
         {
             std::lock_guard<std::mutex> lock(status->telemetryMutex);
             view.telemetry = status->telemetry;
         }
         for (auto &peer : view.telemetry.peers) {
-            auto found = reputations.find(peer.endpoint);
-            if (found == reputations.end()) continue;
-            const PeerReputation &reputation = found->second;
-            peer.trust = std::max(
-                0.0, std::min(100.0,
-                              100.0 -
-                                  reputation.networkFailures * 2.0 -
-                                  reputation.authenticationFailures * 20.0 -
-                                  reputation.integrityFailures * 30.0));
+            auto found = metrics.find(peer.endpoint);
+            if (found == metrics.end()) continue;
+            const PeerMetrics &observed = found->second;
             peer.throughputMiB =
-                reputation.transferSeconds > 0.0
-                    ? static_cast<double>(reputation.bytes) /
-                          reputation.transferSeconds / (1024.0 * 1024.0)
+                observed.transferSeconds > 0.0
+                    ? static_cast<double>(observed.bytes) /
+                          observed.transferSeconds / (1024.0 * 1024.0)
                     : 0.0;
-            peer.failures = reputation.networkFailures +
-                            reputation.authenticationFailures +
-                            reputation.integrityFailures;
-            peer.blacklisted =
-                reputation.blacklistedUntil > std::time(nullptr);
+            peer.successes = observed.successes;
+            peer.failures = observed.networkFailures +
+                            observed.authenticationFailures +
+                            observed.integrityFailures;
         }
         result.push_back(std::move(view));
     }

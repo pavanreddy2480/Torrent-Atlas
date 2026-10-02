@@ -72,55 +72,38 @@ static std::mutex sharedMutex;
 static std::unordered_map<std::string, LocalFile> sharedFiles;
 static std::mutex downloadsMutex;
 static std::vector<std::shared_ptr<DownloadStatus>> downloads;
-static std::vector<Endpoint> trackers;
-static std::size_t preferredTracker = 0;
+static std::mutex downloadThreadsMutex;
+static std::vector<std::thread> downloadThreads;
+static Endpoint trackerEndpoint;
 static std::mutex trackerMutex;
 static u64 sessionId = 0;
 static Endpoint peerEndpoint;
-static std::mutex reputationMutex;
-static std::unordered_map<std::string, PeerReputation> reputations;
-
-static double reputationScore(const PeerInfo &peer) {
-    std::lock_guard<std::mutex> lock(reputationMutex);
-    const PeerReputation &reputation = reputations[endpointKey(peer.endpoint)];
-    if (reputation.blacklistedUntil > std::time(nullptr)) return -1e12;
-    double throughput = reputation.transferSeconds > 0.0
-        ? static_cast<double>(reputation.bytes) / reputation.transferSeconds / (1024.0 * 1024.0)
-        : 0.0;
-    return 100.0 + std::min(throughput, 100.0) + reputation.successes * 0.5 -
-           reputation.networkFailures * 2.0 - reputation.authenticationFailures * 25.0 -
-           reputation.integrityFailures * 40.0;
-}
-
-static bool peerBlacklisted(const PeerInfo &peer) {
-    std::lock_guard<std::mutex> lock(reputationMutex);
-    return reputations[endpointKey(peer.endpoint)].blacklistedUntil > std::time(nullptr);
-}
+static std::atomic<bool> peerStopping{false};
+static std::mutex peerMetricsMutex;
+static std::unordered_map<std::string, PeerMetrics> peerMetrics;
 
 static void recordPeerResult(const PeerInfo &peer, TransferResult result,
                              std::size_t bytes = 0, double seconds = 0.0) {
-    std::lock_guard<std::mutex> lock(reputationMutex);
-    PeerReputation &reputation = reputations[endpointKey(peer.endpoint)];
+    std::lock_guard<std::mutex> lock(peerMetricsMutex);
+    PeerMetrics &observed = peerMetrics[endpointKey(peer.endpoint)];
     switch (result) {
         case TransferResult::Success:
-            ++reputation.successes;
-            reputation.bytes += bytes;
-            reputation.transferSeconds += seconds;
+            ++observed.successes;
+            observed.bytes += bytes;
+            observed.transferSeconds += seconds;
             break;
         case TransferResult::NetworkFailure:
-            ++reputation.networkFailures;
+            ++observed.networkFailures;
             break;
         case TransferResult::AuthenticationFailure:
-            ++reputation.authenticationFailures;
+            ++observed.authenticationFailures;
             break;
         case TransferResult::IntegrityFailure:
-            ++reputation.integrityFailures;
+            ++observed.integrityFailures;
             break;
         case TransferResult::Unavailable:
             break;
     }
-    if (reputation.authenticationFailures + reputation.integrityFailures >= 3)
-        reputation.blacklistedUntil = std::time(nullptr) + 300;
 }
 
 static std::string keyFor(const std::string &group, const std::string &name) {
@@ -129,24 +112,24 @@ static std::string keyFor(const std::string &group, const std::string &name) {
 
 static bool trackerRequest(const std::string &command, std::string &response) {
     std::lock_guard<std::mutex> lock(trackerMutex);
-    for (std::size_t attempt = 0; attempt < trackers.size(); ++attempt) {
-        std::size_t index = (preferredTracker + attempt) % trackers.size();
-        int fd = connectTcp(trackers[index].ip, trackers[index].port);
-        if (fd < 0) continue;
-        std::string request = "C\t" + std::to_string(sessionId) + "\t" + command;
-        bool ok = sendFrame(fd, request) && receiveFrame(fd, response);
-        close(fd);
-        if (!ok) continue;
-        std::size_t tab = response.rfind('\t');
-        if (tab == std::string::npos) return false;
-        try { sessionId = static_cast<u64>(std::stoull(response.substr(tab + 1))); }
-        catch (...) { return false; }
-        response.resize(tab);
-        preferredTracker = index;
-        return true;
+    UniqueFd fd(connectTcp(trackerEndpoint.ip, trackerEndpoint.port));
+    if (!fd) {
+        response = "ERR tracker service unavailable";
+        return false;
     }
-    response = "ERR both trackers are unavailable";
-    return false;
+    std::string request = "C\t" + std::to_string(sessionId) + "\t" + command;
+    if (!sendFrame(fd.get(), request) || !receiveFrame(fd.get(), response)) {
+        response = "ERR tracker service unavailable";
+        return false;
+    }
+    std::size_t tab = response.rfind('\t');
+    u64 returnedSession = 0;
+    if (tab == std::string::npos ||
+        !parseUnsignedDecimal(response.substr(tab + 1), returnedSession))
+        return false;
+    sessionId = returnedSession;
+    response.resize(tab);
+    return true;
 }
 
 static std::string uploadCommand(const std::string &group, const std::string &name,
@@ -210,8 +193,12 @@ static void peerConnection(int fd) {
     }
     std::string operation = requestParts[0];
     std::size_t pieceIndex = 0;
-    try { pieceIndex = static_cast<std::size_t>(std::stoull(requestParts[1])); }
-    catch (...) { sendFrame(fd, "60|piece"); close(fd); return; }
+    u64 parsedPiece = 0;
+    if (!parseUnsignedDecimal(requestParts[1], parsedPiece) ||
+        parsedPiece > std::numeric_limits<std::size_t>::max()) {
+        sendFrame(fd, "60|piece"); close(fd); return;
+    }
+    pieceIndex = static_cast<std::size_t>(parsedPiece);
     if (operation != "BITMAP" &&
         (operation != "GET" || pieceIndex >= file.pieceHashes.size() ||
          pieceIndex >= file.available.size() || !file.available[pieceIndex])) {
@@ -227,8 +214,8 @@ static void peerConnection(int fd) {
         std::size_t expected = static_cast<std::size_t>(
             std::min<u64>(PIECE_SIZE, file.size - static_cast<u64>(pieceIndex) * PIECE_SIZE));
         responsePlain.assign(expected, '\0');
-        int fileFd = open(file.path.c_str(), O_RDONLY);
-        if (fileFd < 0) {
+        UniqueFd fileFd(open(file.path.c_str(), O_RDONLY));
+        if (!fileFd) {
             sendFrame(fd, "60|open");
             close(fd);
             return;
@@ -236,13 +223,12 @@ static void peerConnection(int fd) {
         std::size_t received = 0;
         off_t offset = static_cast<off_t>(pieceIndex * PIECE_SIZE);
         while (received < expected) {
-            ssize_t count = pread(fileFd, &responsePlain[received], expected - received,
+            ssize_t count = pread(fileFd.get(), &responsePlain[received], expected - received,
                                   offset + static_cast<off_t>(received));
             if (count < 0 && errno == EINTR) continue;
             if (count <= 0) break;
             received += static_cast<std::size_t>(count);
         }
-        close(fileFd);
         if (received != expected) {
             sendFrame(fd, "60|read");
             close(fd);
@@ -267,20 +253,44 @@ static void peerConnection(int fd) {
 }
 
 static void peerServer() {
-    int listener = createListener(peerEndpoint.ip, peerEndpoint.port);
-    if (listener < 0) {
+    UniqueFd listener(createListener(peerEndpoint.ip, peerEndpoint.port));
+    if (!listener) {
         perror("peer listener");
         return;
     }
-    for (;;) {
-        int fd = accept(listener, nullptr, nullptr);
+    std::mutex workersMutex;
+    std::condition_variable workersCondition;
+    std::size_t activeWorkers = 0;
+    while (!peerStopping) {
+        pollfd descriptor{listener.get(), POLLIN, 0};
+        int ready = poll(&descriptor, 1, 200);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) continue;
+        int fd = accept(listener.get(), nullptr, nullptr);
         if (fd < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        std::thread(peerConnection, fd).detach();
+        if (peerStopping) {
+            close(fd);
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lock(workersMutex);
+            ++activeWorkers;
+        }
+        std::thread([&, fd] {
+            peerConnection(fd);
+            {
+                std::lock_guard<std::mutex> lock(workersMutex);
+                --activeWorkers;
+            }
+            workersCondition.notify_all();
+        }).detach();
     }
-    close(listener);
+    listener.reset();
+    std::unique_lock<std::mutex> lock(workersMutex);
+    workersCondition.wait(lock, [&] { return activeWorkers == 0; });
 }
 
 static TransferResult securePeerRequest(const PeerInfo &peer,
@@ -524,30 +534,26 @@ static void downloadFile(std::string group, std::string name, std::string destin
         for (std::size_t piece = 0; piece < std::min(pieceCount, bitmap.size()); ++piece)
             rarity[piece] += bitmap[piece] != 0;
     {
-        std::lock_guard<std::mutex> reputationLock(reputationMutex);
+        std::lock_guard<std::mutex> metricsLock(peerMetricsMutex);
         std::lock_guard<std::mutex> telemetryLock(status->telemetryMutex);
         status->telemetry.availability = rarity;
         status->telemetry.peers.clear();
         for (std::size_t index = 0; index < peers.size(); ++index) {
             const std::string endpoint = endpointKey(peers[index].endpoint);
-            const PeerReputation &reputation = reputations[endpoint];
+            const PeerMetrics &observed = peerMetrics[endpoint];
             PeerTelemetry peer;
             peer.endpoint = endpoint;
             peer.bitmap = peerBitmaps[index];
             peer.availablePieces = static_cast<std::size_t>(
                 std::count(peer.bitmap.begin(), peer.bitmap.end(),
                            static_cast<unsigned char>(1)));
-            peer.trust = std::max(0.0, std::min(100.0,
-                100.0 - reputation.networkFailures * 2.0 -
-                reputation.authenticationFailures * 20.0 -
-                reputation.integrityFailures * 30.0));
-            peer.throughputMiB = reputation.transferSeconds > 0.0
-                ? static_cast<double>(reputation.bytes) / reputation.transferSeconds /
+            peer.throughputMiB = observed.transferSeconds > 0.0
+                ? static_cast<double>(observed.bytes) / observed.transferSeconds /
                   (1024.0 * 1024.0) : 0.0;
-            peer.failures = reputation.networkFailures +
-                            reputation.authenticationFailures +
-                            reputation.integrityFailures;
-            peer.blacklisted = reputation.blacklistedUntil > std::time(nullptr);
+            peer.successes = observed.successes;
+            peer.failures = observed.networkFailures +
+                            observed.authenticationFailures +
+                            observed.integrityFailures;
             status->telemetry.peers.push_back(std::move(peer));
         }
         for (std::size_t piece = 0; piece < rarity.size(); ++piece)
@@ -589,15 +595,9 @@ static void downloadFile(std::string group, std::string name, std::string destin
     auto candidatesFor = [&](std::size_t piece) {
         std::vector<std::size_t> candidates;
         for (std::size_t peer = 0; peer < peers.size(); ++peer)
-            if (piece < peerBitmaps[peer].size() && peerBitmaps[peer][piece] &&
-                !peerBlacklisted(peers[peer]))
+            if (piece < peerBitmaps[peer].size() && peerBitmaps[peer][piece])
                 candidates.push_back(peer);
-        std::sort(candidates.begin(), candidates.end(), [&](std::size_t left, std::size_t right) {
-            return reputationScore(peers[left]) > reputationScore(peers[right]);
-        });
-        if (candidates.size() > 1 &&
-            std::abs(reputationScore(peers[candidates.front()]) -
-                     reputationScore(peers[candidates.back()])) < 1.0)
+        if (candidates.size() > 1)
             std::rotate(candidates.begin(),
                         candidates.begin() + static_cast<std::ptrdiff_t>(piece % candidates.size()),
                         candidates.end());
@@ -625,8 +625,7 @@ static void downloadFile(std::string group, std::string name, std::string destin
 
     std::atomic<bool> failure{false};
     const std::size_t missingCount = order.size();
-    const std::size_t endgameCount = std::min<std::size_t>(3, missingCount);
-    const std::size_t normalCount = missingCount - endgameCount;
+    const std::size_t normalCount = missingCount;
     std::atomic<std::size_t> nextOrder{0};
     std::size_t workerCount = normalCount == 0 ? 0 : std::min<std::size_t>(
         8, std::max<std::size_t>(1, std::min(peers.size(), normalCount)));
@@ -738,132 +737,6 @@ static void downloadFile(std::string group, std::string name, std::string destin
         return;
     }
 
-    // Endgame mode duplicates the final few requests across the two best peers. The first
-    // verified response wins, reducing tail latency from one slow or disconnected seeder.
-    if (endgameCount) {
-        std::lock_guard<std::mutex> lock(status->telemetryMutex);
-        status->telemetry.workers.push_back(
-            {workerCount + 1, std::nullopt, "", "endgame"});
-    }
-    for (std::size_t position = normalCount; position < missingCount; ++position) {
-        if (status->cancelRequested) break;
-        std::size_t piece = order[position];
-        std::vector<std::size_t> candidates = candidatesFor(piece);
-        if (candidates.empty()) {
-            failure = true;
-            std::lock_guard<std::mutex> lock(status->telemetryMutex);
-            status->telemetry.pieces[piece] = PieceState::Failed;
-            continue;
-        }
-        std::size_t requestCount = std::min<std::size_t>(2, candidates.size());
-        if (requestCount > 1) status->duplicateRequests += requestCount - 1;
-        {
-            std::lock_guard<std::mutex> lock(status->telemetryMutex);
-            auto &reserved = status->telemetry.reservations[piece];
-            reserved.clear();
-            for (std::size_t request = 0; request < requestCount; ++request)
-                reserved.push_back(endpointKey(peers[candidates[request]].endpoint));
-            status->telemetry.pieces[piece] = PieceState::Downloading;
-            auto &worker = status->telemetry.workers.back();
-            worker.piece = piece;
-            worker.peer = requestCount > 1 ? "fastest of " + std::to_string(requestCount)
-                                           : reserved.front();
-            worker.state = "endgame";
-            status->telemetry.events.push_back(
-                "Endgame duplicated piece " + std::to_string(piece) +
-                " across " + std::to_string(requestCount) + " peers");
-        }
-        struct EndgameState {
-            std::mutex mutex;
-            std::condition_variable condition;
-            std::size_t completed = 0;
-            bool won = false;
-            std::string piece;
-            std::string winner;
-        };
-        auto endgame = std::make_shared<EndgameState>();
-        for (std::size_t request = 0; request < requestCount; ++request) {
-            PeerInfo peer = peers[candidates[request]];
-            std::string groupCopy = group, nameCopy = name;
-            std::string capabilityCopy = metadata.capability;
-            std::string expectedHash = metadata.pieceHashes[piece];
-            std::string peerEndpoint = endpointKey(peer.endpoint);
-            auto statusCopy = status;
-            std::thread([endgame, peer, groupCopy, nameCopy, capabilityCopy, expectedHash,
-                         statusCopy, piece, peerEndpoint] {
-                std::string data;
-                auto transferStarted = std::chrono::steady_clock::now();
-                TransferResult result = fetchPieceData(
-                    peer, groupCopy, nameCopy, capabilityCopy, piece, expectedHash,
-                    data, statusCopy);
-                double transferSeconds = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - transferStarted).count();
-                if (result == TransferResult::IntegrityFailure)
-                    ++statusCopy->integrityFailures;
-                {
-                    std::lock_guard<std::mutex> telemetryLock(
-                        statusCopy->telemetryMutex);
-                    auto &worker = statusCopy->telemetry.workers.back();
-                    worker.transferSeconds += transferSeconds;
-                    if (result != TransferResult::Success) ++worker.failures;
-                }
-                {
-                    std::lock_guard<std::mutex> lock(endgame->mutex);
-                    ++endgame->completed;
-                    if (result == TransferResult::Success && !endgame->won) {
-                        endgame->won = true;
-                        endgame->piece = std::move(data);
-                        endgame->winner = peerEndpoint;
-                    }
-                }
-                endgame->condition.notify_one();
-            }).detach();
-        }
-        {
-            std::unique_lock<std::mutex> lock(endgame->mutex);
-            endgame->condition.wait(lock, [&] {
-                return endgame->won || endgame->completed == requestCount;
-            });
-            auto diskStarted = std::chrono::steady_clock::now();
-            bool written = endgame->won && writePiece(output, piece, endgame->piece);
-            status->diskMicroseconds += elapsedMicroseconds(diskStarted);
-            if (written) {
-                markAvailable(piece);
-                ++status->completed;
-                sampleDownloadSpeed(status);
-                std::lock_guard<std::mutex> telemetryLock(status->telemetryMutex);
-                status->telemetry.pieces[piece] = PieceState::Verified;
-                status->telemetry.reservations.erase(piece);
-                status->telemetry.peerEndpointsUsed.insert(endgame->winner);
-                status->telemetry.peersUsed =
-                    status->telemetry.peerEndpointsUsed.size();
-                auto &worker = status->telemetry.workers.back();
-                ++worker.completed;
-                worker.bytes += std::min<u64>(
-                    PIECE_SIZE, metadata.size - static_cast<u64>(piece) * PIECE_SIZE);
-                status->telemetry.events.push_back(
-                    "Piece " + std::to_string(piece) +
-                    " won by " + endgame->winner + " and verified");
-            } else {
-                failure = true;
-                std::lock_guard<std::mutex> telemetryLock(status->telemetryMutex);
-                status->telemetry.pieces[piece] = PieceState::Failed;
-                status->telemetry.reservations.erase(piece);
-            }
-        }
-    }
-    if (status->cancelRequested) {
-        close(output);
-        finishDownload(status, true, "cancelled by user; resume data retained");
-        return;
-    }
-    if (endgameCount) {
-        std::lock_guard<std::mutex> lock(status->telemetryMutex);
-        auto &worker = status->telemetry.workers.back();
-        worker.piece.reset();
-        worker.peer.clear();
-        worker.state = failure ? "stopped" : "complete";
-    }
     close(output);
 
     u64 verifiedSize = 0;
@@ -975,6 +848,24 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
             metadataStream >> marker >> metadata.size >> metadata.fullHash >> metadata.capability >>
                 hashes >> peersText;
             metadata.pieceHashes = hashes == "-" ? std::vector<std::string>{} : split(hashes, ',');
+            std::string capabilityBytes;
+            std::size_t expectedPieces = 0;
+            metadataStream >> std::ws;
+            bool metadataValid = metadataStream.eof() && marker == "META" &&
+                isSha1Hex(metadata.fullHash) &&
+                isHexInteger(metadata.capability, 64, 64) &&
+                hexDecode(metadata.capability, capabilityBytes) &&
+                capabilityBytes.size() == 32 &&
+                pieceCountForSize(metadata.size, expectedPieces) &&
+                metadata.pieceHashes.size() == expectedPieces &&
+                std::all_of(metadata.pieceHashes.begin(),
+                            metadata.pieceHashes.end(), isSha1Hex);
+            if (!metadataValid) {
+                std::lock_guard<std::mutex> lock(activeDestinationsMutex);
+                activeDestinations.erase(destinationKey);
+                output << "ERR invalid tracker metadata\n";
+                return false;
+            }
             std::vector<PeerInfo> peers;
             for (const auto &peerText : split(peersText, ',')) {
                 Endpoint endpoint;
@@ -996,7 +887,11 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
                 std::lock_guard<std::mutex> lock(downloadsMutex);
                 downloads.push_back(status);
             }
-            std::thread(downloadFile, group, name, destination, metadata, peers, status).detach();
+            {
+                std::lock_guard<std::mutex> lock(downloadThreadsMutex);
+                downloadThreads.emplace_back(
+                    downloadFile, group, name, destination, metadata, peers, status);
+            }
             output << "OK download started\n";
             return false;
         }
@@ -1009,7 +904,6 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
                     output << " (" << status->completed << '/' << status->total << " pieces)";
                 output << " rare=" << status->rarePieces
                        << " resumed=" << status->resumedPieces
-                       << " endgame-duplicates=" << status->duplicateRequests
                        << " integrity-failures=" << status->integrityFailures;
                 output << '\n';
             }
@@ -1033,29 +927,25 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
             return false;
         }
         if (command == "peer_stats" || command == "show_peers") {
-            std::lock_guard<std::mutex> lock(reputationMutex);
-            if (reputations.empty()) {
+            std::lock_guard<std::mutex> lock(peerMetricsMutex);
+            if (peerMetrics.empty()) {
                 output << "No peer observations yet\n";
                 return false;
             }
-            for (const auto &entry : reputations) {
-                const PeerReputation &reputation = entry.second;
-                double throughput = reputation.transferSeconds > 0.0
-                    ? static_cast<double>(reputation.bytes) / reputation.transferSeconds /
+            std::map<std::string, PeerMetrics> sortedMetrics(
+                peerMetrics.begin(), peerMetrics.end());
+            for (const auto &entry : sortedMetrics) {
+                const PeerMetrics &observed = entry.second;
+                double throughput = observed.transferSeconds > 0.0
+                    ? static_cast<double>(observed.bytes) / observed.transferSeconds /
                       (1024.0 * 1024.0)
                     : 0.0;
-                double trust = std::max(0.0, std::min(100.0,
-                    100.0 - reputation.networkFailures * 2.0 -
-                    reputation.authenticationFailures * 20.0 -
-                    reputation.integrityFailures * 30.0));
-                bool blacklisted = reputation.blacklistedUntil > std::time(nullptr);
-                output << entry.first << " trust=" << std::fixed << std::setprecision(1)
-                       << trust << " speed=" << throughput << "MiB/s"
-                       << " ok=" << reputation.successes
-                       << " network=" << reputation.networkFailures
-                       << " auth=" << reputation.authenticationFailures
-                       << " corrupt=" << reputation.integrityFailures
-                       << " status=" << (blacklisted ? "BLACKLISTED" : "ACTIVE") << '\n';
+                output << entry.first << " speed=" << std::fixed
+                       << std::setprecision(1) << throughput << "MiB/s"
+                       << " ok=" << observed.successes
+                       << " network=" << observed.networkFailures
+                       << " auth=" << observed.authenticationFailures
+                       << " corrupt=" << observed.integrityFailures << '\n';
             }
             return false;
         }
@@ -1093,12 +983,6 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
                 u64 measured = crypto + network + disk;
                 double cryptoPercent = measured
                     ? 100.0 * static_cast<double>(crypto) / measured : 0.0;
-                std::size_t blacklisted = 0;
-                {
-                    std::lock_guard<std::mutex> lock(reputationMutex);
-                    for (const auto &peer : reputations)
-                        if (peer.second.blacklistedUntil > std::time(nullptr)) ++blacklisted;
-                }
                 char state = status->finished ? (status->failed ? 'F' : 'C') : 'D';
                 output << '[' << state << "] [" << status->group << "] " << status->name << '\n'
                        << "  progress: " << std::fixed << std::setprecision(1)
@@ -1110,11 +994,9 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
                        << "  eta: " << eta << "s\n"
                        << "  peers: " << status->responsivePeers << '/'
                        << status->discoveredPeers << " responsive, "
-                       << status->activeRequests << " requests active, "
-                       << blacklisted << " blacklisted\n"
+                       << status->activeRequests << " requests active\n"
                        << "  scheduler: rare=" << status->rarePieces
-                       << " resumed=" << status->resumedPieces
-                       << " endgame-duplicates=" << status->duplicateRequests << '\n'
+                       << " resumed=" << status->resumedPieces << '\n'
                        << "  reliability: retries=" << status->retries
                        << " network=" << status->networkFailures
                        << " auth=" << status->authenticationFailures
@@ -1182,16 +1064,16 @@ static bool executeCommand(const std::string &line, std::ostream &output) {
 
 static std::vector<DownloadView> captureDownloadViews() {
     std::vector<std::shared_ptr<DownloadStatus>> statuses;
-    std::unordered_map<std::string, PeerReputation> reputationSnapshot;
+    std::unordered_map<std::string, PeerMetrics> metricsSnapshot;
     {
         std::lock_guard<std::mutex> lock(downloadsMutex);
         statuses = downloads;
     }
     {
-        std::lock_guard<std::mutex> lock(reputationMutex);
-        reputationSnapshot = reputations;
+        std::lock_guard<std::mutex> lock(peerMetricsMutex);
+        metricsSnapshot = peerMetrics;
     }
-    return buildDownloadViews(statuses, reputationSnapshot);
+    return buildDownloadViews(statuses, metricsSnapshot);
 }
 
 static void appendLog(std::deque<std::string> &log, const std::string &text) {
@@ -1327,11 +1209,9 @@ static int runTui() {
         if (!views.empty()) selected = std::min(selected, views.size() - 1);
         else selected = 0;
 
-        std::size_t trackerIndex;
         u64 currentSession;
         {
             std::lock_guard<std::mutex> lock(trackerMutex);
-            trackerIndex = preferredTracker;
             currentSession = sessionId;
         }
         double aggregateSpeed = 0.0;
@@ -1350,7 +1230,7 @@ static int runTui() {
             }),
             hbox({
                 text(" " + endpointKey(peerEndpoint)) | color(mocha.subtext),
-                text("  tracker " + std::to_string(trackerIndex + 1)) |
+                text("  LB " + endpointKey(trackerEndpoint)) |
                     color(mocha.subtext),
                 text(currentSession ? "  authenticated" : "  signed out") |
                     color(currentSession ? mocha.green : mocha.yellow),
@@ -1459,24 +1339,23 @@ static int runTui() {
                           size(WIDTH, EQUAL, 24),
                       text("pieces") | bold | color(mocha.mauve) |
                           size(WIDTH, EQUAL, 9),
-                      text("trust") | bold | color(mocha.mauve) |
+                      text("ok/fail") | bold | color(mocha.mauve) |
                           size(WIDTH, EQUAL, 8),
                       text("MiB/s") | bold | color(mocha.mauve) |
                           size(WIDTH, EQUAL, 9),
                       text("state") | bold | color(mocha.mauve)})
             };
             for (const auto &peer : view.telemetry.peers) {
-                std::ostringstream trust, speed;
-                trust << std::fixed << std::setprecision(0) << peer.trust;
+                std::ostringstream observations, speed;
+                observations << peer.successes << '/' << peer.failures;
                 speed << std::fixed << std::setprecision(2) << peer.throughputMiB;
                 peerRows.push_back(hbox({
                     text(peer.endpoint) | size(WIDTH, EQUAL, 24),
                     text(std::to_string(peer.availablePieces) + "/" +
                          std::to_string(view.total)) | size(WIDTH, EQUAL, 9),
-                    text(trust.str()) | size(WIDTH, EQUAL, 8),
+                    text(observations.str()) | size(WIDTH, EQUAL, 8),
                     text(speed.str()) | size(WIDTH, EQUAL, 9),
-                    text(peer.blacklisted ? "blocked" : "active") |
-                        color(peer.blacklisted ? mocha.red : mocha.green),
+                    text("observed") | color(mocha.green),
                 }));
             }
             if (view.telemetry.peers.empty())
@@ -1538,8 +1417,7 @@ static int runTui() {
                         size(WIDTH, EQUAL, 6),
                     text(workerSpeedText.str()) | size(WIDTH, EQUAL, 8),
                     text(worker.state) |
-                        color(worker.state == "downloading" ||
-                              worker.state == "endgame" ?
+                        color(worker.state == "downloading" ?
                               mocha.peach : mocha.subtext),
                 }));
             }
@@ -1855,11 +1733,25 @@ static int runCli() {
 int main(int argc, char **argv) {
     bool tui = argc == 4 && std::string(argv[3]) == "--tui";
     if ((argc != 3 && !tui) || !parseEndpoint(argv[1], peerEndpoint) ||
-        !loadTrackerInfo(argv[2], trackers)) {
+        !loadTrackerInfo(argv[2], trackerEndpoint)) {
         std::cerr << "usage: " << argv[0]
-                  << " <peer-ip:port> tracker_info.txt [--tui]\n";
+                  << " <peer-ip:port> lb_client_info.txt [--tui]\n";
         return 1;
     }
-    std::thread(peerServer).detach();
-    return tui ? runTui() : runCli();
+    std::thread peerThread(peerServer);
+    int result = tui ? runTui() : runCli();
+    {
+        std::lock_guard<std::mutex> lock(downloadsMutex);
+        for (const auto &download : downloads)
+            if (!download->finished) download->cancelRequested = true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(downloadThreadsMutex);
+        for (auto &thread : downloadThreads)
+            if (thread.joinable()) thread.join();
+        downloadThreads.clear();
+    }
+    peerStopping = true;
+    peerThread.join();
+    return result;
 }

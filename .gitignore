@@ -1,6 +1,7 @@
 open.dmg
-CMakeLists.txt
 test_piano.pdf
 bin/
 build/
 build-sanitize/
+build-*/
+.DS_Store

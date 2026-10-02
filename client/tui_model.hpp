@@ -28,13 +28,12 @@ struct DownloadView {
     std::size_t discoveredPeers = 0;
     std::size_t responsivePeers = 0;
     std::size_t rarePieces = 0;
-    std::size_t duplicateRequests = 0;
     DownloadTelemetry telemetry;
 };
 
 std::vector<DownloadView> buildDownloadViews(
     const std::vector<std::shared_ptr<DownloadStatus>> &statuses,
-    const std::unordered_map<std::string, PeerReputation> &reputations);
+    const std::unordered_map<std::string, PeerMetrics> &metrics);
 
 double viewSpeedMiB(const DownloadView &view);
 std::string formatBytes(u64 bytes);

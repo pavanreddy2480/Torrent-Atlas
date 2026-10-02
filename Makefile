@@ -1,64 +1,23 @@
-CXX      = g++
-CXXFLAGS = -Wall -Wextra -O2 -pthread -std=c++17
-OPENSSL_CFLAGS = $(shell pkg-config --cflags openssl 2>/dev/null)
-OPENSSL_LIBS   = $(shell pkg-config --libs openssl 2>/dev/null || echo -lcrypto)
-BIN_DIR = bin
+BUILD_DIR ?= build
+SANITIZE_DIR ?= build-sanitize
+CMAKE_FLAGS ?=
 
-# directories
-CLIENT_DIR  = client
-TRACKER_DIR = tracker
+.PHONY: all build test sanitize clean
 
-# targets
-CLIENT   = $(BIN_DIR)/client
-TRACKER  = $(BIN_DIR)/tracker
-TRACKER1 = $(BIN_DIR)/tracker1
-TRACKER2 = $(BIN_DIR)/tracker2
-SECURITY_TEST = $(BIN_DIR)/tests/security_tests
-PEER_REJECTION_TEST = $(BIN_DIR)/tests/peer_rejection_test
-TRACKER_STATE_TEST = $(BIN_DIR)/tests/tracker_state_tests
-COMMAND_PARSER_TEST = $(BIN_DIR)/tests/command_parser_tests
+all: build
 
-# default target
-all: $(CLIENT) $(TRACKER) $(TRACKER1) $(TRACKER2)
+build:
+	cmake -S . -B $(BUILD_DIR) $(CMAKE_FLAGS)
+	cmake --build $(BUILD_DIR) -j
 
-# ----- build rules -----
-$(CLIENT): $(CLIENT_DIR)/client.cpp $(CLIENT_DIR)/command_utils.cpp $(CLIENT_DIR)/command_utils.hpp $(CLIENT_DIR)/download_storage.cpp $(CLIENT_DIR)/download_storage.hpp $(CLIENT_DIR)/network_utils.cpp $(CLIENT_DIR)/network_utils.hpp $(CLIENT_DIR)/telemetry.cpp $(CLIENT_DIR)/telemetry.hpp $(CLIENT_DIR)/tui_model.cpp $(CLIENT_DIR)/tui_model.hpp $(CLIENT_DIR)/client_types.hpp $(CLIENT_DIR)/tui_theme.hpp common/protocol.hpp common/sha1.hpp common/secure_crypto.hpp common/command_parser.hpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $@ $(CLIENT_DIR)/client.cpp $(CLIENT_DIR)/command_utils.cpp $(CLIENT_DIR)/download_storage.cpp $(CLIENT_DIR)/network_utils.cpp $(CLIENT_DIR)/telemetry.cpp $(CLIENT_DIR)/tui_model.cpp $(OPENSSL_LIBS)
+test: build
+	ctest --test-dir $(BUILD_DIR) --output-on-failure
 
-$(TRACKER): $(TRACKER_DIR)/tracker.cpp $(TRACKER_DIR)/tracker_common.hpp common/protocol.hpp common/secure_crypto.hpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $@ $< $(OPENSSL_LIBS)
-
-$(TRACKER1): $(TRACKER_DIR)/tracker1.cpp $(TRACKER_DIR)/tracker_common.hpp common/protocol.hpp common/secure_crypto.hpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $@ $< $(OPENSSL_LIBS)
-
-$(TRACKER2): $(TRACKER_DIR)/tracker2.cpp $(TRACKER_DIR)/tracker_common.hpp common/protocol.hpp common/secure_crypto.hpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $@ $< $(OPENSSL_LIBS)
+sanitize:
+	cmake -S . -B $(SANITIZE_DIR) -DTORRENT_ENABLE_SANITIZERS=ON -DTORRENT_ENABLE_FTXUI=OFF
+	cmake --build $(SANITIZE_DIR) -j
+	ctest --test-dir $(SANITIZE_DIR) --output-on-failure
 
 clean:
-	rm -rf $(BIN_DIR) client/client tracker/tracker tracker/tracker1 tracker/tracker2 \
-		tests/security_tests tests/peer_rejection_test tests/tracker_state_tests \
-		tests/command_parser_tests
-
-security-test: tests/security_tests.cpp common/secure_crypto.hpp common/protocol.hpp
-	@mkdir -p $(dir $(SECURITY_TEST))
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $(SECURITY_TEST) $< $(OPENSSL_LIBS)
-	./$(SECURITY_TEST)
-
-peer-rejection-test: tests/peer_rejection_test.cpp common/protocol.hpp
-	@mkdir -p $(dir $(PEER_REJECTION_TEST))
-	$(CXX) $(CXXFLAGS) -o $(PEER_REJECTION_TEST) $<
-	./$(PEER_REJECTION_TEST) $(PORT)
-
-tracker-state-test: tests/tracker_state_tests.cpp tracker/tracker_common.hpp common/protocol.hpp common/secure_crypto.hpp
-	@mkdir -p $(dir $(TRACKER_STATE_TEST))
-	$(CXX) $(CXXFLAGS) $(OPENSSL_CFLAGS) -o $(TRACKER_STATE_TEST) $< $(OPENSSL_LIBS)
-	./$(TRACKER_STATE_TEST)
-
-command-parser-test: tests/command_parser_tests.cpp common/command_parser.hpp
-	@mkdir -p $(dir $(COMMAND_PARSER_TEST))
-	$(CXX) $(CXXFLAGS) -o $(COMMAND_PARSER_TEST) $<
-	./$(COMMAND_PARSER_TEST)
+	cmake -E remove_directory $(BUILD_DIR)
+	cmake -E remove_directory $(SANITIZE_DIR)

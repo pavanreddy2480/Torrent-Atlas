@@ -164,13 +164,15 @@ static bool filesEqual(const std::string &left, const std::string &right) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) return 2;
+    if (argc != 4) return 2;
     int trackerOnePort = unusedPort();
     int trackerTwoPort = unusedPort();
+    int lbPort = unusedPort();
     int seederPort = unusedPort();
     int downloaderPort = unusedPort();
-    if (trackerOnePort < 0 || trackerTwoPort < 0 ||
-        seederPort < 0 || downloaderPort < 0) {
+    int secondDownloaderPort = unusedPort();
+    if (trackerOnePort < 0 || trackerTwoPort < 0 || lbPort < 0 ||
+        seederPort < 0 || downloaderPort < 0 || secondDownloaderPort < 0) {
         std::cout << "client integration tests skipped: local sockets unavailable\n";
         return 77;
     }
@@ -178,12 +180,25 @@ int main(int argc, char **argv) {
     std::string prefix = "/tmp/torrent-client-integration-" +
                          std::to_string(getpid());
     std::string trackerInfo = prefix + "-trackers.txt";
+    std::string lbInfo = prefix + "-lb.txt";
+    std::string clientInfo = prefix + "-client.txt";
     std::string source = prefix + "-source.bin";
     std::string destination = prefix + "-copy.bin";
+    std::string secondDestination = prefix + "-copy-2.bin";
     {
         std::ofstream output(trackerInfo);
         output << "127.0.0.1:" << trackerOnePort << '\n'
                << "127.0.0.1:" << trackerTwoPort << '\n';
+    }
+    {
+        std::ofstream output(lbInfo);
+        output << "127.0.0.1:" << lbPort << '\n'
+               << "127.0.0.1:" << trackerOnePort << '\n'
+               << "127.0.0.1:" << trackerTwoPort << '\n';
+    }
+    {
+        std::ofstream output(clientInfo);
+        output << "127.0.0.1:" << lbPort << '\n';
     }
     {
         std::ofstream output(source, std::ios::binary);
@@ -191,19 +206,27 @@ int main(int argc, char **argv) {
             output.put(static_cast<char>((index * 31U + 17U) & 0xffU));
     }
 
-    ChildProcess trackerOne, trackerTwo, seeder, downloader;
+    ChildProcess trackerOne, trackerTwo, lb, seeder, downloader,
+                 secondDownloader;
     try {
         trackerOne = startProcess({argv[1], trackerInfo, "1"}, false);
         trackerTwo = startProcess({argv[1], trackerInfo, "2"}, false);
         require(waitForListener(trackerOnePort), "tracker one did not start");
         require(waitForListener(trackerTwoPort), "tracker two did not start");
+        lb = startProcess({argv[2], lbInfo}, false);
+        require(waitForListener(lbPort), "load balancer did not start");
 
         seeder = startProcess({
-            argv[2], "127.0.0.1:" + std::to_string(seederPort), trackerInfo}, true);
+            argv[3], "127.0.0.1:" + std::to_string(seederPort), clientInfo}, true);
         downloader = startProcess({
-            argv[2], "127.0.0.1:" + std::to_string(downloaderPort), trackerInfo}, true);
+            argv[3], "127.0.0.1:" + std::to_string(downloaderPort), clientInfo}, true);
+        secondDownloader = startProcess({
+            argv[3], "127.0.0.1:" + std::to_string(secondDownloaderPort),
+            clientInfo}, true);
         require(waitForListener(seederPort), "seeder did not start");
         require(waitForListener(downloaderPort), "downloader did not start");
+        require(waitForListener(secondDownloaderPort),
+                "second downloader did not start");
 
         command(seeder, "create user alice secret", "OK user created");
         command(seeder, "login alice secret", "OK logged in");
@@ -214,6 +237,10 @@ int main(int argc, char **argv) {
         command(downloader, "login bob secret", "OK logged in");
         command(downloader, "join group demo", "OK join requested");
         command(seeder, "accept request demo bob", "OK request accepted");
+        command(secondDownloader, "create user charlie secret", "OK user created");
+        command(secondDownloader, "login charlie secret", "OK logged in");
+        command(secondDownloader, "join group demo", "OK join requested");
+        command(seeder, "accept request demo charlie", "OK request accepted");
         command(downloader, "download file demo " + fileName(source) +
                             " \"" + destination + "\"", "OK download started");
 
@@ -231,27 +258,57 @@ int main(int argc, char **argv) {
         require(filesEqual(source, destination), "downloaded file differs from source");
 
         command(downloader, "show downloads", "[C]");
+        stopProcess(seeder);
+        command(secondDownloader, "download file demo " + fileName(source) +
+                                  " \"" + secondDestination + "\"",
+                "OK download started");
+        completed = false;
+        for (int attempt = 0; attempt < 600; ++attempt) {
+            struct stat info{};
+            if (stat(secondDestination.c_str(), &info) == 0 &&
+                static_cast<std::size_t>(info.st_size) ==
+                    PIECE_SIZE * 2 + 12345) {
+                completed = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        require(completed, "download did not retry after a seeder disconnected");
+        require(filesEqual(source, secondDestination),
+                "retry download differs from source");
         std::cout << "client integration tests passed\n";
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         stopProcess(downloader);
+        stopProcess(secondDownloader);
         stopProcess(seeder);
+        stopProcess(lb);
         stopProcess(trackerTwo);
         stopProcess(trackerOne);
         unlink(trackerInfo.c_str());
+        unlink(lbInfo.c_str());
+        unlink(clientInfo.c_str());
         unlink(source.c_str());
         unlink(destination.c_str());
+        unlink(secondDestination.c_str());
         unlink((destination + ".part").c_str());
         unlink((destination + ".resume").c_str());
+        unlink((secondDestination + ".part").c_str());
+        unlink((secondDestination + ".resume").c_str());
         return 1;
     }
 
     stopProcess(downloader);
+    stopProcess(secondDownloader);
     stopProcess(seeder);
+    stopProcess(lb);
     stopProcess(trackerTwo);
     stopProcess(trackerOne);
     unlink(trackerInfo.c_str());
+    unlink(lbInfo.c_str());
+    unlink(clientInfo.c_str());
     unlink(source.c_str());
     unlink(destination.c_str());
+    unlink(secondDestination.c_str());
     return 0;
 }

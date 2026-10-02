@@ -1,10 +1,18 @@
 #include "../common/protocol.hpp"
 #include "../common/secure_crypto.hpp"
+#include "../common/sha1.hpp"
 
 #include <cassert>
 #include <iostream>
 
 int main() {
+    Sha1 emptySha1;
+    assert(emptySha1.finalHex() ==
+           "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    Sha1 abcSha1;
+    abcSha1.update("abc", 3);
+    assert(abcSha1.finalHex() ==
+           "a9993e364706816aba3e25717850c26c9cd0d89d");
     assert(hexEncode(pbkdf2HmacSha256("password", "salt", 1, 32)) ==
            "120fb6cffcf8b32c43e7225256c4f837"
            "a86548c92ccc35480805987cb70be17b");

@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTORRENT_ENABLE_FTXUI=OFF
+      - run: cmake --build build -j2
+      - run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - run: cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug -DTORRENT_ENABLE_SANITIZERS=ON -DTORRENT_ENABLE_FTXUI=OFF
+      - run: cmake --build build-sanitize -j2
+      - run: ctest --test-dir build-sanitize --output-on-failure

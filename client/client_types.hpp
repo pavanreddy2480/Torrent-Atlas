@@ -4,7 +4,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <ctime>
 #include <deque>
 #include <map>
 #include <memory>
@@ -13,11 +12,6 @@
 #include <set>
 #include <string>
 #include <vector>
-
-struct Endpoint {
-    std::string ip;
-    int port = 0;
-};
 
 struct LocalFile {
     std::string path;
@@ -45,10 +39,9 @@ struct PeerTelemetry {
     std::string endpoint;
     std::vector<unsigned char> bitmap;
     std::size_t availablePieces = 0;
-    double trust = 100.0;
     double throughputMiB = 0.0;
+    u64 successes = 0;
     u64 failures = 0;
-    bool blacklisted = false;
 };
 
 struct WorkerTelemetry {
@@ -89,7 +82,6 @@ struct DownloadStatus {
     std::atomic<bool> finished{false};
     std::atomic<bool> failed{false};
     std::atomic<bool> cancelRequested{false};
-    std::atomic<std::size_t> duplicateRequests{0};
     std::atomic<std::size_t> integrityFailures{0};
     std::atomic<std::size_t> rarePieces{0};
     std::atomic<std::size_t> resumedPieces{0};
@@ -116,14 +108,13 @@ struct DownloadStatus {
     std::string destinationKey;
 };
 
-struct PeerReputation {
+struct PeerMetrics {
     u64 successes = 0;
     u64 networkFailures = 0;
     u64 authenticationFailures = 0;
     u64 integrityFailures = 0;
     u64 bytes = 0;
     double transferSeconds = 0.0;
-    std::time_t blacklistedUntil = 0;
 };
 
 struct ResumeState {
