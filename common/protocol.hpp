@@ -303,12 +303,3 @@ inline bool isTrackerMutation(const std::string &commandLine) {
     return false;
 }
 
-// One request/response exchange with a tracker node.
-inline bool trackerCall(const Endpoint &endpoint, const std::string &request,
-                        std::string &response, int timeoutSeconds = 2) {
-    int fd = connectTcp(endpoint.ip, endpoint.port, timeoutSeconds);
-    if (fd < 0) return false;
-    bool ok = sendFrame(fd, request) && receiveFrame(fd, response);
-    close(fd);
-    return ok;
-}

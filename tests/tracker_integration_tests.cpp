@@ -1,4 +1,4 @@
-#include "../common/protocol.hpp"
+#include "../common/secure_channel.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -32,6 +32,9 @@ static int unusedPort() {
     return port;
 }
 
+static std::string clusterKey;
+static std::string clusterKeyPath;
+
 static TrackerProcess startTracker(const std::string &binary,
                                    const std::string &infoPath,
                                    int number) {
@@ -44,7 +47,7 @@ static TrackerProcess startTracker(const std::string &binary,
             close(nullFd);
         }
         std::string numberText = std::to_string(number);
-        execl(binary.c_str(), binary.c_str(), infoPath.c_str(),
+        execl(binary.c_str(), binary.c_str(), infoPath.c_str(), clusterKeyPath.c_str(),
               numberText.c_str(), static_cast<char *>(nullptr));
         _exit(127);
     }
@@ -73,12 +76,9 @@ static bool waitForTracker(int port) {
 
 static std::pair<std::string, u64> request(int port, u64 session,
                                            const std::string &command) {
-    int fd = connectTcp("127.0.0.1", port, 2);
-    assert(fd >= 0);
     std::string response;
-    assert(sendFrame(fd, "C\t" + std::to_string(session) + "\t" + command));
-    assert(receiveFrame(fd, response));
-    close(fd);
+    assert(clusterCall({"127.0.0.1", port}, clusterKey,
+                       "C\t" + std::to_string(session) + "\t" + command, response));
     std::size_t tab = response.rfind('\t');
     assert(tab != std::string::npos);
     u64 returnedSession = static_cast<u64>(std::stoull(response.substr(tab + 1)));
@@ -117,6 +117,9 @@ int main(int argc, char **argv) {
         std::ofstream output(infoPath);
         for (int port : ports) output << "127.0.0.1:" << port << '\n';
     }
+    clusterKey = randomBytes(32);
+    clusterKeyPath = infoPath + ".key";
+    assert(writeKeyFile(clusterKeyPath, clusterKey, true));
 
     TrackerProcess nodes[3];
     for (int index = 0; index < 3; ++index)
@@ -145,6 +148,17 @@ int main(int argc, char **argv) {
     // Read servers refuse writes.
     assert(request(readPortA, 0, "create_user bob secret").first.rfind(
                "ERR read-only server", 0) == 0);
+
+    // Frames without the cluster key are refused, and data is untouched.
+    {
+        UniqueFd fd(connectTcp("127.0.0.1", readPortA, 2));
+        std::string response;
+        assert(fd && sendFrame(fd.get(), "P\t99\n") && receiveFrame(fd.get(), response));
+        assert(response == "ERR unauthenticated cluster frame");
+        std::string forged;
+        assert(!clusterCall({"127.0.0.1", readPortA}, randomBytes(32), "P\t99\n", forged));
+        assert(request(readPortA, aliceLogin.second, "list_groups").first == "OK demo second");
+    }
 
     // A restarted read server is caught up by a snapshot push.
     stopTracker(nodes[2]);
@@ -176,5 +190,6 @@ int main(int argc, char **argv) {
 
     for (auto &node : nodes) stopTracker(node);
     unlink(infoPath.c_str());
+    unlink(clusterKeyPath.c_str());
     std::cout << "tracker integration tests passed\n";
 }

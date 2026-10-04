@@ -33,7 +33,7 @@ Resume manifests record immutable metadata, the temporary path, and a verified-p
 - RAII descriptors cover shared protocol and key storage paths.
 - The client requests cancellation, joins download threads, and joins its peer service on normal exit.
 - User-visible tracker collections and peer metrics are sorted for deterministic demonstrations.
-- Passwords are PBKDF2-HMAC-SHA256 encoded with random salts and are never logged by the LB.
+- Passwords are PBKDF2-HMAC-SHA256 encoded with random salts, travel only inside the encrypted client channel, and are never logged by the LB.
 
 ## Verification
 
@@ -41,4 +41,4 @@ CTest covers parser strictness, frame boundaries, SHA-1 vectors, cryptography, r
 
 ## Known limits
 
-The LB is a single point of failure, and the write server is one for writes. All tracker state is in memory. Tracker traffic assumes a trusted network. SHA-1 remains only for assignment compatibility. There is no leader election: if the write server stays down, the cluster is read-only.
+The LB is a single point of failure, and the write server is one for writes. All tracker state is in memory. Client-to-LB traffic is encrypted and the LB is authenticated by a pinned Ed25519 key; cluster traffic is encrypted and authenticated with a shared AES-256-GCM key. SHA-1 remains only for assignment compatibility. There is no leader election: if the write server stays down, the cluster is read-only.

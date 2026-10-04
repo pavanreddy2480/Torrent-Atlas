@@ -1,6 +1,6 @@
 #include "../common/protocol.hpp"
 #include "../common/sha1.hpp"
-#include "../common/secure_crypto.hpp"
+#include "../common/secure_channel.hpp"
 #include "client_types.hpp"
 #include "command_utils.hpp"
 #include "download_storage.hpp"
@@ -54,6 +54,7 @@ static std::vector<std::shared_ptr<DownloadStatus>> downloads;
 static std::mutex downloadThreadsMutex;
 static std::vector<std::thread> downloadThreads;
 static Endpoint trackerEndpoint;
+static std::string trackerPublicKey;
 static std::mutex trackerMutex;
 static u64 sessionId = 0;
 static Endpoint peerEndpoint;
@@ -91,14 +92,9 @@ static std::string keyFor(const std::string &group, const std::string &name) {
 
 static bool trackerRequest(const std::string &command, std::string &response) {
     std::lock_guard<std::mutex> lock(trackerMutex);
-    UniqueFd fd(connectTcp(trackerEndpoint.ip, trackerEndpoint.port));
-    if (!fd) {
-        response = "ERR tracker service unavailable";
-        return false;
-    }
     std::string request = "C\t" + std::to_string(sessionId) + "\t" + command;
-    if (!sendFrame(fd.get(), request) || !receiveFrame(fd.get(), response)) {
-        response = "ERR tracker service unavailable";
+    if (!secureLbCall(trackerEndpoint, trackerPublicKey, request, response)) {
+        response = "ERR tracker service unavailable or failed authentication";
         return false;
     }
     std::size_t tab = response.rfind('\t');
@@ -166,9 +162,14 @@ static void peerConnection(int fd) {
     if (!aes256GcmDecrypt(key, requestAad, requestMessage, requestPlain)) {
         sendFrame(fd, "60|aead"); close(fd); return;
     }
+    // "<operation>\n<piece>\n<unix-seconds>"; stale requests are replays.
     std::vector<std::string> requestParts = split(requestPlain, '\n');
-    if (requestParts.size() != 2) {
+    long long requestTime = 0;
+    if (requestParts.size() != 3) {
         sendFrame(fd, "60|request"); close(fd); return;
+    }
+    if (!parseFreshTimestamp(requestParts[2], requestTime)) {
+        sendFrame(fd, "60|stale"); close(fd); return;
     }
     std::string operation = requestParts[0];
     std::size_t pieceIndex = 0;
@@ -310,8 +311,8 @@ static TransferResult securePeerRequest(const PeerInfo &peer,
         "21|" + hexEncode(group) + "|" + hexEncode(name);
     AesGcmMessage requestMessage;
     auto cryptoStarted = std::chrono::steady_clock::now();
-    bool encrypted =
-        aes256GcmEncrypt(key, requestAad, plain, requestMessage);
+    bool encrypted = aes256GcmEncrypt(
+        key, requestAad, plain + "\n" + std::to_string(unixSeconds()), requestMessage);
     telemetry.crypto += elapsedMicroseconds(cryptoStarted);
     if (!encrypted) {
         close(fd);
@@ -918,9 +919,11 @@ static int runCli() {
 
 int main(int argc, char **argv) {
     if (argc != 3 || !parseEndpoint(argv[1], peerEndpoint) ||
-        !loadTrackerInfo(argv[2], trackerEndpoint)) {
+        !loadTrackerInfo(argv[2], trackerEndpoint, trackerPublicKey)) {
         std::cerr << "usage: " << argv[0]
-                  << " <peer-ip:port> lb_client_info.txt\n";
+                  << " <peer-ip:port> client.conf\n"
+                  << "client.conf needs the load balancer's IP:PORT and public key; "
+                     "run torrent_keygen <config-dir> to create it\n";
         return 1;
     }
     std::thread peerThread(peerServer);

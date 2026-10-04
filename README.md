@@ -48,11 +48,17 @@ Build output goes in `build/` (or `build-sanitize/`), which git ignores. Delete 
 
 Committed example configs use LB `5000`, write server `6000`, and read servers `6001` and `6002`. Tracker number 1 is always the write server.
 
+Create keys once. This writes `config/cluster.key` and `config/lb_identity.key` (both secret, git-ignored) and adds the load balancer's public key to `config/client.conf`:
+
 ```sh
-./build/tracker config/trackers.conf 2
-./build/tracker config/trackers.conf 3
-./build/tracker config/trackers.conf 1
-./build/tracker_lb config/load_balancer.conf
+./build/torrent_keygen config
+```
+
+```sh
+./build/tracker config/trackers.conf config/cluster.key 2
+./build/tracker config/trackers.conf config/cluster.key 3
+./build/tracker config/trackers.conf config/cluster.key 1
+./build/tracker_lb config/load_balancer.conf config/cluster.key config/lb_identity.key
 ./build/client 127.0.0.1:8001 config/client.conf
 ./build/client 127.0.0.1:8002 config/client.conf
 ```
@@ -104,7 +110,7 @@ The tradeoff is deliberately simple: one writer orders every change and replicat
 - The LB is a single point of failure, and so is the write server for writes.
 - Tracker state and sequence numbers are in memory. Shutting down all three trackers loses metadata.
 - A restarted write server recovers from the most up-to-date read server it can reach. If the only read server reachable at that moment is behind, writes it missed are lost.
-- Tracker traffic assumes a trusted network and is not encrypted.
+- There is no forward secrecy for peer traffic: file capabilities are long-lived keys. See [SECURITY.md](SECURITY.md).
 - SHA-1 is retained because the assignment requires it; it is not recommended for new security designs.
 - Peer authorization uses tracker-issued file capabilities; it is not an internet-facing identity system.
 

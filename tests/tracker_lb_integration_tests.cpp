@@ -1,4 +1,4 @@
-#include "../common/protocol.hpp"
+#include "../common/secure_channel.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -87,15 +87,20 @@ static bool waitForListener(int port) {
     return false;
 }
 
+static int lbPortGlobal = -1;
+static std::string lbPublicKey;
+static std::string clusterKey;
+
+// Requests to the LB use the client handshake; requests straight to a
+// tracker use the cluster key.
 static std::pair<std::string, u64> request(int port, u64 session,
                                            const std::string &command) {
-    int fd = connectTcp("127.0.0.1", port, 2);
-    require(fd >= 0, "connect failed");
+    std::string frame = "C\t" + std::to_string(session) + "\t" + command;
     std::string response;
-    require(sendFrame(fd, "C\t" + std::to_string(session) + "\t" + command),
-            "send failed");
-    require(receiveFrame(fd, response), "receive failed");
-    close(fd);
+    bool ok = port == lbPortGlobal
+        ? secureLbCall({"127.0.0.1", port}, lbPublicKey, frame, response)
+        : clusterCall({"127.0.0.1", port}, clusterKey, frame, response);
+    require(ok, "request failed");
     std::size_t tab = response.rfind('\t');
     require(tab != std::string::npos, "response missing session suffix: " + response);
     u64 returnedSession = static_cast<u64>(std::stoull(response.substr(tab + 1)));
@@ -144,6 +149,15 @@ int main(int argc, char **argv) {
     std::string trackerInfo = prefix + "-trackers.txt";
     std::string lbInfo = prefix + "-lb.txt";
     std::string lbLog = prefix + "-lb.log";
+    std::string clusterKeyPath = prefix + "-cluster.key";
+    std::string identityPath = prefix + "-identity.key";
+    std::string identityPrivate;
+    clusterKey = randomBytes(32);
+    require(ed25519KeyPair(identityPrivate, lbPublicKey) &&
+                writeKeyFile(clusterKeyPath, clusterKey, true) &&
+                writeKeyFile(identityPath, identityPrivate, true),
+            "could not create keys");
+    lbPortGlobal = lbPort;
     {
         std::ofstream output(trackerInfo);
         for (int port : ports) output << "127.0.0.1:" << port << '\n';
@@ -157,10 +171,10 @@ int main(int argc, char **argv) {
     ChildProcess nodes[3], lb;
     try {
         for (int index = 0; index < 3; ++index)
-            nodes[index] = startProcess({argv[1], trackerInfo, std::to_string(index + 1)});
+            nodes[index] = startProcess({argv[1], trackerInfo, clusterKeyPath, std::to_string(index + 1)});
         for (int port : ports) require(waitForListener(port), "tracker did not start");
 
-        lb = startProcess({argv[2], lbInfo}, lbLog);
+        lb = startProcess({argv[2], lbInfo, clusterKeyPath, identityPath}, lbLog);
         require(waitForListener(lbPort), "load balancer did not start");
 
         require(eventuallyRequest(lbPort, 0, "create_user alice secret", "OK").first ==
@@ -191,6 +205,41 @@ int main(int argc, char **argv) {
         require(files.first.find(encodedName) != std::string::npos,
                 "state-changing command was not immediately readable");
 
+        // Plain-text requests, a wrong pinned key, and replays are refused.
+        {
+            UniqueFd fd(connectTcp("127.0.0.1", lbPort, 2));
+            std::string response;
+            require(fd && sendFrame(fd.get(), "C\t0\tlogin alice secret") &&
+                        !receiveFrame(fd.get(), response),
+                    "LB answered a plain-text request");
+            std::string wrongPrivate, wrongPublic;
+            require(ed25519KeyPair(wrongPrivate, wrongPublic), "keygen failed");
+            require(!secureLbCall({"127.0.0.1", lbPort}, wrongPublic,
+                                  "C\t0\tlist_groups", response),
+                    "client accepted an LB it could not authenticate");
+        }
+        {
+            // Record a full client session, then replay it on a new connection.
+            UniqueFd fd(connectTcp("127.0.0.1", lbPort, 2));
+            std::string sessionKey, response;
+            require(fd && clientHandshake(fd.get(), lbPublicKey, sessionKey),
+                    "handshake failed");
+            AesGcmMessage message;
+            require(aes256GcmEncrypt(sessionKey, "client->lb",
+                                     "C\t0\tcreate_user mallory secret", message),
+                    "encrypt failed");
+            std::string sealed = message.nonce + message.tag + message.ciphertext;
+            require(sendFrame(fd.get(), sealed) &&
+                        sealedReceive(fd.get(), sessionKey, "lb->client", response),
+                    "sealed request failed");
+            UniqueFd replay(connectTcp("127.0.0.1", lbPort, 2));
+            std::string newKey;
+            require(replay && clientHandshake(replay.get(), lbPublicKey, newKey) &&
+                        sendFrame(replay.get(), sealed) &&
+                        !receiveFrame(replay.get(), response),
+                    "LB accepted a replayed request");
+        }
+
         // Both read servers hold every acknowledged write.
         for (int port : {readPortA, readPortB}) {
             auto replicated = eventuallyRequest(port, aliceLogin.second, "list_files demo",
@@ -208,7 +257,7 @@ int main(int argc, char **argv) {
             require(request(lbPort, aliceLogin.second, "list_groups").first ==
                         "OK demo onedown",
                     "read failed with one read server down");
-        nodes[1] = startProcess({argv[1], trackerInfo, "2"});
+        nodes[1] = startProcess({argv[1], trackerInfo, clusterKeyPath, "2"});
         require(waitForListener(readPortA), "read server did not restart");
         require(eventuallyRequest(readPortA, aliceLogin.second, "list_groups",
                                   "OK demo onedown").first == "OK demo onedown",
@@ -224,7 +273,7 @@ int main(int argc, char **argv) {
                 "write did not fail cleanly without the write server");
 
         // Write server restarts, recovers from the read servers, accepts writes.
-        nodes[0] = startProcess({argv[1], trackerInfo, "1"});
+        nodes[0] = startProcess({argv[1], trackerInfo, clusterKeyPath, "1"});
         require(waitForListener(writePort), "write server did not restart");
         require(eventuallyRequest(lbPort, aliceLogin.second, "create_group afterfail",
                                   "OK").first == "OK group created",
@@ -239,7 +288,7 @@ int main(int argc, char **argv) {
                 "LB did not report all trackers unavailable");
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
-        cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog});
+        cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog, clusterKeyPath, identityPath});
         return 1;
     }
 
@@ -250,11 +299,11 @@ int main(int argc, char **argv) {
                          std::istreambuf_iterator<char>());
         if (logs.find("secret") != std::string::npos) {
             std::cerr << "load balancer log leaked a password\n";
-            cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog});
+            cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog, clusterKeyPath, identityPath});
             return 1;
         }
     }
-    cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog});
+    cleanup(lb, nodes, {trackerInfo, lbInfo, lbLog, clusterKeyPath, identityPath});
     std::cout << "tracker lb integration tests passed\n";
     return 0;
 }

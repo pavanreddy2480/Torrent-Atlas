@@ -38,8 +38,12 @@ target_link_libraries(tracker PRIVATE Threads::Threads OpenSSL::Crypto)
 torrent_warnings(tracker)
 
 add_executable(tracker_lb tracker/tracker_lb.cpp)
-target_link_libraries(tracker_lb PRIVATE Threads::Threads)
+target_link_libraries(tracker_lb PRIVATE Threads::Threads OpenSSL::Crypto)
 torrent_warnings(tracker_lb)
+
+add_executable(torrent_keygen tools/keygen.cpp)
+target_link_libraries(torrent_keygen PRIVATE OpenSSL::Crypto)
+torrent_warnings(torrent_keygen)
 
 add_executable(security_tests tests/security_tests.cpp)
 target_link_libraries(security_tests PRIVATE
@@ -50,7 +54,7 @@ target_compile_options(security_tests PRIVATE -UNDEBUG)
 torrent_warnings(security_tests)
 
 add_executable(peer_rejection_test tests/peer_rejection_test.cpp)
-target_link_libraries(peer_rejection_test PRIVATE Threads::Threads)
+target_link_libraries(peer_rejection_test PRIVATE Threads::Threads OpenSSL::Crypto)
 target_compile_options(peer_rejection_test PRIVATE -UNDEBUG)
 torrent_warnings(peer_rejection_test)
 
@@ -80,12 +84,12 @@ target_compile_options(tracker_integration_tests PRIVATE -UNDEBUG)
 torrent_warnings(tracker_integration_tests)
 
 add_executable(tracker_lb_integration_tests tests/tracker_lb_integration_tests.cpp)
-target_link_libraries(tracker_lb_integration_tests PRIVATE Threads::Threads)
+target_link_libraries(tracker_lb_integration_tests PRIVATE Threads::Threads OpenSSL::Crypto)
 target_compile_options(tracker_lb_integration_tests PRIVATE -UNDEBUG)
 torrent_warnings(tracker_lb_integration_tests)
 
 add_executable(client_integration_tests tests/client_integration_tests.cpp)
-target_link_libraries(client_integration_tests PRIVATE Threads::Threads)
+target_link_libraries(client_integration_tests PRIVATE Threads::Threads OpenSSL::Crypto)
 target_compile_options(client_integration_tests PRIVATE -UNDEBUG)
 torrent_warnings(client_integration_tests)
 

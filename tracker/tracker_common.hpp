@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../common/protocol.hpp"
-#include "../common/secure_crypto.hpp"
+#include "../common/secure_channel.hpp"
 
 #include <atomic>
 #include <algorithm>
@@ -597,6 +597,7 @@ public:
 // Write-server side: owns the sequence and keeps both read servers in sync.
 class WriteReplicator {
     TrackerState &state_;
+    std::string clusterKey_;
     std::vector<Endpoint> readers_;
     std::vector<bool> inSync_;
     std::atomic<u64> sequence_{0};
@@ -608,7 +609,7 @@ class WriteReplicator {
     // Caller holds mutationMutex.
     bool pushSnapshot(std::size_t reader) {
         std::string response;
-        bool ok = trackerCall(readers_[reader],
+        bool ok = clusterCall(readers_[reader], clusterKey_,
                               "P\t" + std::to_string(sequence_.load()) + "\n" +
                                   state_.serialize(),
                               response) &&
@@ -634,7 +635,7 @@ class WriteReplicator {
         std::vector<std::optional<u64>> readerSequence(readers_.size());
         for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
             std::string response;
-            if (!trackerCall(readers_[reader], "X\t0\tSNAPSHOT", response)) continue;
+            if (!clusterCall(readers_[reader], clusterKey_, "X\t0\tSNAPSHOT", response)) continue;
             std::size_t newline = response.find('\n');
             u64 sequence = 0;
             if (newline == std::string::npos ||
@@ -662,7 +663,7 @@ class WriteReplicator {
         for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
             std::string response;
             u64 applied = 0;
-            bool reachable = trackerCall(readers_[reader], "X\t0\tSTATUS", response) &&
+            bool reachable = clusterCall(readers_[reader], clusterKey_, "X\t0\tSTATUS", response) &&
                              readSequence(response.substr(response.find('\t') + 1),
                                           "replica", applied);
             std::lock_guard<std::mutex> lock(mutationMutex);
@@ -679,8 +680,9 @@ class WriteReplicator {
 public:
     std::mutex mutationMutex;
 
-    WriteReplicator(TrackerState &state, std::vector<Endpoint> readers)
-        : state_(state), readers_(std::move(readers)), inSync_(readers_.size(), false) {}
+    WriteReplicator(TrackerState &state, std::string clusterKey, std::vector<Endpoint> readers)
+        : state_(state), clusterKey_(std::move(clusterKey)), readers_(std::move(readers)),
+          inSync_(readers_.size(), false) {}
 
     bool recovered() const { return recovered_; }
     u64 sequence() const { return sequence_; }
@@ -693,7 +695,7 @@ public:
         for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
             if (!inSync_[reader]) continue;
             std::string response;
-            if (!trackerCall(readers_[reader], frame, response)) {
+            if (!clusterCall(readers_[reader], clusterKey_, frame, response)) {
                 inSync_[reader] = false;
                 std::cerr << "Read server " << endpointKey(readers_[reader])
                           << " unreachable; will resync\n";
@@ -730,6 +732,7 @@ public:
 struct TrackerNode {
     unsigned number = 0;
     TrackerState &state;
+    std::string clusterKey;
     WriteReplicator *writer = nullptr;   // set on the write server
     ReplicaLog *replica = nullptr;       // set on read servers
 
@@ -744,7 +747,11 @@ struct TrackerNode {
 inline void trackerConnection(int rawFd, TrackerNode &node) {
     UniqueFd fd(rawFd);
     std::string request;
-    if (!receiveFrame(fd.get(), request)) return;
+    if (!clusterReceive(fd.get(), node.clusterKey, request)) {
+        sendFrame(fd.get(), "ERR unauthenticated cluster frame");
+        return;
+    }
+    auto reply = [&](const std::string &text) { clusterSend(fd.get(), node.clusterKey, text); };
 
     // Snapshot push from the write server: "P\t<sequence>\n<state>".
     if (node.replica && request.rfind("P\t", 0) == 0) {
@@ -752,41 +759,41 @@ inline void trackerConnection(int rawFd, TrackerNode &node) {
         u64 sequence = 0;
         if (newline == std::string::npos ||
             !parseU64(request.substr(2, newline - 2), sequence)) {
-            sendFrame(fd.get(), "ERR malformed snapshot push");
+            reply("ERR malformed snapshot push");
             return;
         }
-        sendFrame(fd.get(), node.replica->install(sequence, request.substr(newline + 1)));
+        reply(node.replica->install(sequence, request.substr(newline + 1)));
         return;
     }
 
     std::vector<std::string> fields = split(request, '\t');
     if (fields.size() == 3 && fields[0] == "X" && fields[2] == "STATUS") {
-        sendFrame(fd.get(), node.status());
+        reply(node.status());
         return;
     }
     if (fields.size() == 3 && fields[0] == "X" && fields[2] == "SNAPSHOT") {
-        sendFrame(fd.get(), node.writer ? node.writer->snapshot() : node.replica->snapshot());
+        reply(node.writer ? node.writer->snapshot() : node.replica->snapshot());
         return;
     }
     if (fields.size() >= 4 && fields[0] == "S") {
         u64 sequence = 0, session = 0;
         if (!node.replica) {
-            sendFrame(fd.get(), "ERR not a read server");
+            reply("ERR not a read server");
         } else if (!parseU64(fields[1], sequence) || !parseU64(fields[2], session)) {
-            sendFrame(fd.get(), "ERR malformed replication frame");
+            reply("ERR malformed replication frame");
         } else {
-            sendFrame(fd.get(), node.replica->receive(sequence, session,
+            reply(node.replica->receive(sequence, session,
                                                       commandFromFields(fields, 3)));
         }
         return;
     }
     if (fields.size() < 3 || fields[0] != "C") {
-        sendFrame(fd.get(), "ERR malformed request");
+        reply("ERR malformed request");
         return;
     }
     u64 session = 0;
     if (!parseU64(fields[1], session)) {
-        sendFrame(fd.get(), "ERR malformed session");
+        reply("ERR malformed session");
         return;
     }
     std::string command = commandFromFields(fields, 2);
@@ -803,7 +810,7 @@ inline void trackerConnection(int rawFd, TrackerNode &node) {
         if (result.shouldSync)
             node.writer->replicate(command == "logout" ? session : result.session, command);
     }
-    sendFrame(fd.get(), result.response + "\t" + std::to_string(result.session));
+    reply(result.response + "\t" + std::to_string(result.session));
 }
 
 inline bool readTrackerInfo(const std::string &path, std::vector<Endpoint> &trackers) {
@@ -825,8 +832,8 @@ inline bool readTrackerInfo(const std::string &path, std::vector<Endpoint> &trac
 }
 
 inline int runTracker(int argc, char **argv) {
-    if (argc != 3) {
-        std::cerr << "usage: " << argv[0] << " trackers.conf <1|2|3>\n";
+    if (argc != 4) {
+        std::cerr << "usage: " << argv[0] << " trackers.conf cluster.key <1|2|3>\n";
         return 1;
     }
     std::vector<Endpoint> trackers;
@@ -836,7 +843,12 @@ inline int runTracker(int argc, char **argv) {
         return 1;
     }
     u64 parsedNumber = 0;
-    if (!parseUnsignedDecimal(argv[2], parsedNumber) || parsedNumber < 1 ||
+    std::string clusterKey;
+    if (!readKeyFile(argv[2], 32, clusterKey)) {
+        std::cerr << "cluster key file must hold one 32-byte hex key (run torrent_keygen)\n";
+        return 1;
+    }
+    if (!parseUnsignedDecimal(argv[3], parsedNumber) || parsedNumber < 1 ||
         parsedNumber > TRACKER_NODES) {
         std::cerr << "tracker number must be 1 (write) or 2-3 (read)\n";
         return 1;
@@ -849,10 +861,10 @@ inline int runTracker(int argc, char **argv) {
     std::unique_ptr<ReplicaLog> replica;
     if (number == WRITE_NODE)
         writer.reset(new WriteReplicator(
-            state, std::vector<Endpoint>(trackers.begin() + 1, trackers.end())));
+            state, clusterKey, std::vector<Endpoint>(trackers.begin() + 1, trackers.end())));
     else
         replica.reset(new ReplicaLog(state));
-    TrackerNode node{number, state, writer.get(), replica.get()};
+    TrackerNode node{number, state, clusterKey, writer.get(), replica.get()};
 
     int listener = createListener(local.ip, local.port);
     if (listener < 0) {

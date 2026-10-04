@@ -1,4 +1,4 @@
-#include "../common/protocol.hpp"
+#include "../common/secure_channel.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -183,6 +183,13 @@ int main(int argc, char **argv) {
     std::string trackerInfo = prefix + "-trackers.txt";
     std::string lbInfo = prefix + "-lb.txt";
     std::string clientInfo = prefix + "-client.txt";
+    std::string clusterKeyPath = prefix + "-cluster.key";
+    std::string identityPath = prefix + "-identity.key";
+    std::string clusterKey = randomBytes(32), lbPrivate, lbPublic;
+    require(ed25519KeyPair(lbPrivate, lbPublic) &&
+                writeKeyFile(clusterKeyPath, clusterKey, true) &&
+                writeKeyFile(identityPath, lbPrivate, true),
+            "could not create keys");
     std::string source = prefix + "-source.bin";
     std::string destination = prefix + "-copy.bin";
     std::string secondDestination = prefix + "-copy-2.bin";
@@ -201,7 +208,7 @@ int main(int argc, char **argv) {
     }
     {
         std::ofstream output(clientInfo);
-        output << "127.0.0.1:" << lbPort << '\n';
+        output << "127.0.0.1:" << lbPort << '\n' << hexEncode(lbPublic) << '\n';
     }
     {
         std::ofstream output(source, std::ios::binary);
@@ -212,21 +219,21 @@ int main(int argc, char **argv) {
     ChildProcess trackerOne, trackerTwo, trackerThree, lb, seeder, downloader,
                  secondDownloader;
     try {
-        trackerOne = startProcess({argv[1], trackerInfo, "1"}, false);
-        trackerTwo = startProcess({argv[1], trackerInfo, "2"}, false);
-        trackerThree = startProcess({argv[1], trackerInfo, "3"}, false);
+        trackerOne = startProcess({argv[1], trackerInfo, clusterKeyPath, "1"}, false);
+        trackerTwo = startProcess({argv[1], trackerInfo, clusterKeyPath, "2"}, false);
+        trackerThree = startProcess({argv[1], trackerInfo, clusterKeyPath, "3"}, false);
         require(waitForListener(trackerOnePort), "tracker one did not start");
         require(waitForListener(trackerTwoPort), "tracker two did not start");
         require(waitForListener(trackerThreePort), "tracker three did not start");
         bool writerReady = false;
         for (int attempt = 0; attempt < 200 && !writerReady; ++attempt) {
             std::string status;
-            writerReady = trackerCall({"127.0.0.1", trackerOnePort}, "X\t0\tSTATUS", status) &&
+            writerReady = clusterCall({"127.0.0.1", trackerOnePort}, clusterKey, "X\t0\tSTATUS", status) &&
                           status.find("READY") != std::string::npos;
             if (!writerReady) std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
         require(writerReady, "write server did not become ready");
-        lb = startProcess({argv[2], lbInfo}, false);
+        lb = startProcess({argv[2], lbInfo, clusterKeyPath, identityPath}, false);
         require(waitForListener(lbPort), "load balancer did not start");
 
         seeder = startProcess({
@@ -301,6 +308,8 @@ int main(int argc, char **argv) {
         stopProcess(trackerOne);
         unlink(trackerInfo.c_str());
         unlink(lbInfo.c_str());
+    unlink(clusterKeyPath.c_str());
+    unlink(identityPath.c_str());
         unlink(clientInfo.c_str());
         unlink(source.c_str());
         unlink(destination.c_str());
@@ -321,6 +330,8 @@ int main(int argc, char **argv) {
     stopProcess(trackerOne);
     unlink(trackerInfo.c_str());
     unlink(lbInfo.c_str());
+    unlink(clusterKeyPath.c_str());
+    unlink(identityPath.c_str());
     unlink(clientInfo.c_str());
     unlink(source.c_str());
     unlink(destination.c_str());

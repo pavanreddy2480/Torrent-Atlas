@@ -2,6 +2,7 @@
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #include <cstdint>
@@ -18,6 +19,44 @@ struct CipherContextDeleter {
 };
 
 using CipherContext = std::unique_ptr<EVP_CIPHER_CTX, CipherContextDeleter>;
+
+struct PkeyDeleter {
+    void operator()(EVP_PKEY *key) const { EVP_PKEY_free(key); }
+};
+struct PkeyContextDeleter {
+    void operator()(EVP_PKEY_CTX *context) const { EVP_PKEY_CTX_free(context); }
+};
+struct MdContextDeleter {
+    void operator()(EVP_MD_CTX *context) const { EVP_MD_CTX_free(context); }
+};
+using Pkey = std::unique_ptr<EVP_PKEY, PkeyDeleter>;
+using PkeyContext = std::unique_ptr<EVP_PKEY_CTX, PkeyContextDeleter>;
+using MdContext = std::unique_ptr<EVP_MD_CTX, MdContextDeleter>;
+
+inline const unsigned char *bytes(const std::string &value) {
+    return reinterpret_cast<const unsigned char *>(value.data());
+}
+
+// Generates a raw 32-byte private/public key pair for X25519 or Ed25519.
+inline bool generateRawKeyPair(int type, std::string &privateKey,
+                               std::string &publicKey) {
+    PkeyContext context(EVP_PKEY_CTX_new_id(type, nullptr));
+    EVP_PKEY *raw = nullptr;
+    if (!context || EVP_PKEY_keygen_init(context.get()) != 1 ||
+        EVP_PKEY_keygen(context.get(), &raw) != 1)
+        return false;
+    Pkey key(raw);
+    std::size_t privateLength = 32, publicLength = 32;
+    privateKey.assign(32, '\0');
+    publicKey.assign(32, '\0');
+    return EVP_PKEY_get_raw_private_key(
+               key.get(), reinterpret_cast<unsigned char *>(privateKey.data()),
+               &privateLength) == 1 &&
+           EVP_PKEY_get_raw_public_key(
+               key.get(), reinterpret_cast<unsigned char *>(publicKey.data()),
+               &publicLength) == 1 &&
+           privateLength == 32 && publicLength == 32;
+}
 
 inline bool validIntLength(std::size_t length) {
     return length <= static_cast<std::size_t>(std::numeric_limits<int>::max());
@@ -172,4 +211,87 @@ inline bool aes256GcmDecrypt(const std::string &key, const std::string &aad,
     output.resize(static_cast<std::size_t>(total + length));
     plain = std::move(output);
     return true;
+}
+
+inline std::string sha256(const std::string &data) {
+    std::string digest(32, '\0');
+    unsigned int length = 0;
+    if (EVP_Digest(data.data(), data.size(),
+                   reinterpret_cast<unsigned char *>(digest.data()), &length,
+                   EVP_sha256(), nullptr) != 1 || length != 32)
+        return {};
+    return digest;
+}
+
+inline std::string hmacSha256(const std::string &key, const std::string &data) {
+    std::string mac(32, '\0');
+    unsigned int length = 0;
+    if (!secure_crypto_detail::validIntLength(key.size()) ||
+        HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+             secure_crypto_detail::bytes(data), data.size(),
+             reinterpret_cast<unsigned char *>(mac.data()), &length) == nullptr ||
+        length != 32)
+        return {};
+    return mac;
+}
+
+// Ed25519 signatures: the load balancer's long-term identity.
+inline bool ed25519KeyPair(std::string &privateKey, std::string &publicKey) {
+    return secure_crypto_detail::generateRawKeyPair(EVP_PKEY_ED25519, privateKey, publicKey);
+}
+
+inline std::string ed25519Sign(const std::string &privateKey, const std::string &message) {
+    using namespace secure_crypto_detail;
+    if (privateKey.size() != 32) return {};
+    Pkey key(EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr,
+                                          bytes(privateKey), privateKey.size()));
+    MdContext context(EVP_MD_CTX_new());
+    std::string signature(64, '\0');
+    std::size_t length = signature.size();
+    if (!key || !context ||
+        EVP_DigestSignInit(context.get(), nullptr, nullptr, nullptr, key.get()) != 1 ||
+        EVP_DigestSign(context.get(), reinterpret_cast<unsigned char *>(signature.data()),
+                       &length, bytes(message), message.size()) != 1 ||
+        length != 64)
+        return {};
+    return signature;
+}
+
+inline bool ed25519Verify(const std::string &publicKey, const std::string &message,
+                          const std::string &signature) {
+    using namespace secure_crypto_detail;
+    if (publicKey.size() != 32 || signature.size() != 64) return false;
+    Pkey key(EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr,
+                                         bytes(publicKey), publicKey.size()));
+    MdContext context(EVP_MD_CTX_new());
+    return key && context &&
+           EVP_DigestVerifyInit(context.get(), nullptr, nullptr, nullptr, key.get()) == 1 &&
+           EVP_DigestVerify(context.get(), bytes(signature), signature.size(),
+                            bytes(message), message.size()) == 1;
+}
+
+// X25519 key agreement: fresh keys per connection.
+inline bool x25519KeyPair(std::string &privateKey, std::string &publicKey) {
+    return secure_crypto_detail::generateRawKeyPair(EVP_PKEY_X25519, privateKey, publicKey);
+}
+
+inline std::string x25519SharedSecret(const std::string &privateKey,
+                                      const std::string &peerPublicKey) {
+    using namespace secure_crypto_detail;
+    if (privateKey.size() != 32 || peerPublicKey.size() != 32) return {};
+    Pkey own(EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr,
+                                          bytes(privateKey), privateKey.size()));
+    Pkey peer(EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr,
+                                          bytes(peerPublicKey), peerPublicKey.size()));
+    if (!own || !peer) return {};
+    PkeyContext context(EVP_PKEY_CTX_new(own.get(), nullptr));
+    std::string secret(32, '\0');
+    std::size_t length = secret.size();
+    if (!context || EVP_PKEY_derive_init(context.get()) != 1 ||
+        EVP_PKEY_derive_set_peer(context.get(), peer.get()) != 1 ||
+        EVP_PKEY_derive(context.get(), reinterpret_cast<unsigned char *>(secret.data()),
+                        &length) != 1 ||
+        length != 32)
+        return {};
+    return secret;
 }

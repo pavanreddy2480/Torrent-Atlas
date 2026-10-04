@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
                          std::to_string(getpid()) + ".conf";
     {
         std::ofstream output(config);
-        output << "127.0.0.1:" << lbPort << '\n';
+        output << "127.0.0.1:" << lbPort << '\n' << std::string(64, '0') << '\n';
     }
     int inputPipe[2];
     assert(pipe(inputPipe) == 0);

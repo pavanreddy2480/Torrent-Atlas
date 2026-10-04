@@ -13,9 +13,10 @@ Pieces: client <-------------- encrypted --------------> client
 The supported process forms are:
 
 ```text
-tracker <three-endpoint-config> <1|2|3>      # 1 = write server, 2-3 = read servers
-tracker_lb <listen-write-read-read-config>
-client <peer-ip:port> <one-LB-endpoint-config>
+torrent_keygen <config-dir>                  # creates cluster.key, lb_identity.key, client.conf key
+tracker <three-endpoint-config> <cluster.key> <1|2|3>   # 1 = write server, 2-3 = read servers
+tracker_lb <listen-write-read-read-config> <cluster.key> <lb_identity.key>
+client <peer-ip:port> <client.conf>          # LB IP:PORT + LB public key
 ```
 
 ## Routing
@@ -36,6 +37,11 @@ The LB never logs request payloads, so passwords are not written to its logs.
 ## Tracker protocol
 
 Every application message uses a 4-byte big-endian payload length followed by that many bytes. Payloads above 16 MiB are rejected.
+
+The messages below are what travels inside two secure wrappers (details in [SECURITY.md](SECURITY.md)):
+
+- **Client to LB:** a signed X25519 handshake, then the `C` request and its reply sealed with AES-256-GCM under the session key.
+- **LB to tracker and tracker to tracker:** every frame is `<unix-seconds>\t<AES-256-GCM nonce, tag, ciphertext>` under the cluster key, with the timestamp as authenticated data. Frames older than 30 s or that fail to decrypt are refused. The LB only accepts `C` requests from clients, so clients can never send `S`, `P` or `X` frames into the cluster.
 
 Client request and response:
 
@@ -84,4 +90,4 @@ After a piece passes SHA-1 it is written, fsynced, recorded in the resume manife
 - **Write server restart.** It answers `ERR write server recovering` until a read server responds, then copies the most advanced read server's snapshot and sequence. Read servers at that sequence are marked in sync; others are caught up by snapshot.
 - **Data loss window.** If the write server restarts while the only reachable read server is behind, writes that only the other read server had are lost when that server is resynced.
 - **All trackers down.** State is in memory only, so metadata is lost.
-- The single LB is not replicated, and tracker traffic assumes a trusted network.
+- The single LB is not replicated.
