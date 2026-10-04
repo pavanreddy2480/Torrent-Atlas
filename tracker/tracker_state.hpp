@@ -1,12 +1,14 @@
 #pragma once
 
 #include "../common/protocol.hpp"
-#include "../common/secure_channel.hpp"
+#include "../common/secure_crypto.hpp"
 
 #include <atomic>
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
+#include <ctime>
 #include <condition_variable>
 #include <deque>
 #include <fstream>
@@ -41,6 +43,26 @@ struct GroupInfo {
     std::unordered_map<std::string, FileInfo> files;
 };
 
+// Everything random or time-dependent that a command needs. On a Raft
+// cluster the leader fills this in once and stores it in the log entry, so
+// every replica applies the command identically.
+struct ApplyContext {
+    std::string salt;       // 16 bytes, used by create_user
+    u64 newSession = 0;     // used by login
+    long long now = 0;      // unix seconds, used by the login lockout
+
+    static ApplyContext fresh() {
+        ApplyContext context;
+        context.salt = randomBytes(16);
+        std::string bytes = randomBytes(sizeof(u64));
+        if (bytes.size() == sizeof(u64))
+            std::memcpy(&context.newSession, bytes.data(), sizeof(u64));
+        context.newSession &= 0x7fffffffffffffffULL;
+        context.now = static_cast<long long>(std::time(nullptr));
+        return context;
+    }
+};
+
 struct HandleResult {
     std::string response;
     u64 session = 0;
@@ -50,7 +72,7 @@ struct HandleResult {
 class TrackerState {
     struct LoginThrottle {
         unsigned failures = 0;
-        std::chrono::steady_clock::time_point lockedUntil{};
+        long long lockedUntil = 0;
     };
 
     std::mutex mutex_;
@@ -58,11 +80,10 @@ class TrackerState {
     std::unordered_map<u64, std::string> sessions_;
     std::unordered_map<std::string, GroupInfo> groups_;
     std::unordered_map<std::string, LoginThrottle> loginThrottles_;
-    u64 trackerTag_;
     static constexpr std::uint32_t PASSWORD_ITERATIONS = 20000;
 
-    static std::string encodePassword(const std::string &password) {
-        std::string salt = randomBytes(16);
+    static std::string encodePassword(const std::string &password,
+                                      const std::string &salt) {
         if (salt.size() != 16) return {};
         std::string digest = pbkdf2HmacSha256(
             password, salt, PASSWORD_ITERATIONS, 32);
@@ -90,18 +111,6 @@ class TrackerState {
         return valid;
     }
 
-    u64 createSessionId() {
-        for (int attempt = 0; attempt < 16; ++attempt) {
-            std::string bytes = randomBytes(sizeof(u64));
-            if (bytes.size() != sizeof(u64)) return 0;
-            u64 random = 0;
-            std::memcpy(&random, bytes.data(), sizeof(random));
-            u64 session = trackerTag_ | (random & 0x00ffffffffffffffULL);
-            if (session != 0 && !sessions_.count(session)) return session;
-        }
-        return 0;
-    }
-
     static std::string joinHashes(const std::vector<std::string> &hashes) {
         std::string result;
         for (std::size_t i = 0; i < hashes.size(); ++i) {
@@ -122,8 +131,8 @@ class TrackerState {
     }
 
 public:
-    explicit TrackerState(unsigned trackerNumber)
-        : trackerTag_(static_cast<u64>(trackerNumber & 0xffU) << 56U) {}
+    TrackerState() = default;
+    explicit TrackerState(unsigned) {}
 
     bool empty() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -139,6 +148,11 @@ public:
         std::map<u64, std::string> sortedSessions(sessions_.begin(), sessions_.end());
         for (const auto &entry : sortedSessions)
             output << "S " << entry.first << ' ' << hexEncode(entry.second) << '\n';
+        std::map<std::string, LoginThrottle> sortedThrottles(loginThrottles_.begin(),
+                                                             loginThrottles_.end());
+        for (const auto &entry : sortedThrottles)
+            output << "T " << hexEncode(entry.first) << ' ' << entry.second.failures << ' '
+                   << entry.second.lockedUntil << '\n';
         std::map<std::string, GroupInfo> sortedGroups(groups_.begin(), groups_.end());
         for (const auto &groupEntry : sortedGroups) {
             const GroupInfo &group = groupEntry.second;
@@ -174,6 +188,7 @@ public:
         std::unordered_map<std::string, std::string> users;
         std::unordered_map<u64, std::string> sessions;
         std::unordered_map<std::string, GroupInfo> groups;
+        std::unordered_map<std::string, LoginThrottle> throttles;
         std::istringstream input(snapshot);
         std::string line;
         while (std::getline(input, line)) {
@@ -197,6 +212,13 @@ public:
                 if (!record.eof() || session == 0 || !hexDecode(a, user) ||
                     user.empty()) return false;
                 sessions[session] = user;
+            } else if (type == 'T') {
+                LoginThrottle throttle;
+                record >> a >> throttle.failures >> throttle.lockedUntil;
+                std::string user;
+                record >> std::ws;
+                if (!record.eof() || !hexDecode(a, user) || user.empty()) return false;
+                throttles[user] = throttle;
             } else if (type == 'G') {
                 record >> a >> b;
                 std::string group, owner;
@@ -255,11 +277,17 @@ public:
             users_ = std::move(users);
             sessions_ = std::move(sessions);
             groups_ = std::move(groups);
+            loginThrottles_ = std::move(throttles);
         }
         return true;
     }
 
     HandleResult handle(u64 session, const std::string &commandLine, bool replicated) {
+        return handle(session, commandLine, replicated, ApplyContext::fresh());
+    }
+
+    HandleResult handle(u64 session, const std::string &commandLine, bool replicated,
+                        const ApplyContext &context) {
         std::istringstream input(commandLine);
         std::string command;
         input >> command;
@@ -284,7 +312,7 @@ public:
                     return {"OK already replicated", session, false};
                 return {"ERR user already exists", session, false};
             }
-            std::string encoded = encodePassword(password);
+            std::string encoded = encodePassword(password, context.salt);
             secureErase(password);
             if (encoded.empty())
                 return {"ERR secure random generation failed", session, false};
@@ -304,7 +332,7 @@ public:
             }
             if (!users_.count(name)) return {"ERR no such user", session, false};
             LoginThrottle &throttle = loginThrottles_[name];
-            auto now = std::chrono::steady_clock::now();
+            const long long now = context.now;
             if (throttle.lockedUntil > now) {
                 secureErase(password);
                 return {"ERR too many login attempts; try again later", session, false};
@@ -314,15 +342,15 @@ public:
             if (!passwordValid) {
                 if (++throttle.failures >= 5) {
                     throttle.failures = 0;
-                    throttle.lockedUntil = now + std::chrono::seconds(30);
+                    throttle.lockedUntil = now + 30;
                     return {"ERR too many login attempts; try again later", session, false};
                 }
                 return {"ERR invalid password", session, false};
             }
             loginThrottles_.erase(name);
             if (session == 0) {
-                session = createSessionId();
-                if (session == 0)
+                session = context.newSession;
+                if (session == 0 || sessions_.count(session))
                     return {"ERR secure random generation failed", 0, false};
             }
             sessions_[session] = name;
@@ -529,411 +557,3 @@ public:
         return {"ERR unknown command", session, false};
     }
 };
-
-// Cluster layout: node 1 is the write server, nodes 2 and 3 are read servers.
-// Every mutation runs on the write server, gets the next sequence number, and
-// is pushed synchronously to each in-sync read server before the client gets
-// its answer. A read server that misses a sequence (it was down, restarted, or
-// rejected an entry) is brought back by a full snapshot push.
-static constexpr unsigned TRACKER_NODES = 3;
-static constexpr unsigned WRITE_NODE = 1;
-
-inline bool parseU64(const std::string &text, u64 &value) {
-    return parseUnsignedDecimal(text, value);
-}
-
-inline std::string commandFromFields(const std::vector<std::string> &fields,
-                                     std::size_t first) {
-    std::string command = fields[first];
-    for (std::size_t i = first + 1; i < fields.size(); ++i)
-        command += "\t" + fields[i];
-    return command;
-}
-
-// Read-server side: applies the write server's ordered stream.
-class ReplicaLog {
-    TrackerState &state_;
-    std::mutex mutex_;
-    u64 applied_ = 0;
-
-public:
-    explicit ReplicaLog(TrackerState &state) : state_(state) {}
-
-    // Returns APPLIED, DUPLICATE, or RESYNC (gap or conflict; the write
-    // server answers RESYNC with a snapshot push).
-    std::string receive(u64 sequence, u64 session, const std::string &command) {
-        if (sequence == 0) return "ERR malformed replication sequence";
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (sequence <= applied_) return "DUPLICATE";
-        if (sequence != applied_ + 1) return "RESYNC";
-        HandleResult result = state_.handle(session, command, true);
-        if (result.response.rfind("ERR", 0) == 0) {
-            std::cerr << "Read server rejected sequence " << sequence
-                      << "; requesting snapshot\n";
-            return "RESYNC";
-        }
-        applied_ = sequence;
-        return "APPLIED";
-    }
-
-    std::string install(u64 sequence, const std::string &snapshot) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!state_.replaceFromSnapshot(snapshot)) return "ERR invalid snapshot";
-        applied_ = sequence;
-        return "APPLIED";
-    }
-
-    u64 applied() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return applied_;
-    }
-
-    std::string snapshot() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return "SNAPSHOT\t" + std::to_string(applied_) + "\n" + state_.serialize();
-    }
-};
-
-// Write-server side: owns the sequence and keeps both read servers in sync.
-class WriteReplicator {
-    TrackerState &state_;
-    std::string clusterKey_;
-    std::vector<Endpoint> readers_;
-    std::vector<bool> inSync_;
-    std::atomic<u64> sequence_{0};
-    std::atomic<bool> recovered_{false};
-    std::mutex stopMutex_;
-    std::condition_variable stopCondition_;
-    bool stopping_ = false;
-
-    // Caller holds mutationMutex.
-    bool pushSnapshot(std::size_t reader) {
-        std::string response;
-        bool ok = clusterCall(readers_[reader], clusterKey_,
-                              "P\t" + std::to_string(sequence_.load()) + "\n" +
-                                  state_.serialize(),
-                              response) &&
-                  response == "APPLIED";
-        if (ok)
-            std::cerr << "Read server " << endpointKey(readers_[reader])
-                      << " synced to sequence " << sequence_.load() << '\n';
-        return ok;
-    }
-
-    static bool readSequence(const std::string &header, const char *kind, u64 &value) {
-        std::vector<std::string> fields = split(header, '\t');
-        return fields.size() >= 2 && fields[0] == kind && parseU64(fields[1], value);
-    }
-
-    // On start the write server has no state of its own. It takes the most
-    // advanced read server's snapshot, or starts empty if every reachable
-    // read server is empty. It needs at least one read server to answer.
-    bool tryRecover() {
-        bool anyAnswered = false;
-        u64 bestSequence = 0;
-        std::string bestState;
-        std::vector<std::optional<u64>> readerSequence(readers_.size());
-        for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
-            std::string response;
-            if (!clusterCall(readers_[reader], clusterKey_, "X\t0\tSNAPSHOT", response)) continue;
-            std::size_t newline = response.find('\n');
-            u64 sequence = 0;
-            if (newline == std::string::npos ||
-                !readSequence(response.substr(0, newline), "SNAPSHOT", sequence))
-                continue;
-            anyAnswered = true;
-            readerSequence[reader] = sequence;
-            if (sequence > bestSequence || bestState.empty()) {
-                bestSequence = sequence;
-                bestState = response.substr(newline + 1);
-            }
-        }
-        if (!anyAnswered) return false;
-        std::lock_guard<std::mutex> lock(mutationMutex);
-        if (bestSequence > 0 && !state_.replaceFromSnapshot(bestState)) return false;
-        sequence_ = bestSequence;
-        for (std::size_t reader = 0; reader < readers_.size(); ++reader)
-            inSync_[reader] = readerSequence[reader] == bestSequence;
-        recovered_ = true;
-        std::cerr << "Write server recovered at sequence " << bestSequence << '\n';
-        return true;
-    }
-
-    void syncReaders() {
-        for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
-            std::string response;
-            u64 applied = 0;
-            bool reachable = clusterCall(readers_[reader], clusterKey_, "X\t0\tSTATUS", response) &&
-                             readSequence(response.substr(response.find('\t') + 1),
-                                          "replica", applied);
-            std::lock_guard<std::mutex> lock(mutationMutex);
-            if (!reachable) {
-                inSync_[reader] = false;
-            } else if (applied != sequence_) {
-                inSync_[reader] = pushSnapshot(reader);
-            } else {
-                inSync_[reader] = true;
-            }
-        }
-    }
-
-public:
-    std::mutex mutationMutex;
-
-    WriteReplicator(TrackerState &state, std::string clusterKey, std::vector<Endpoint> readers)
-        : state_(state), clusterKey_(std::move(clusterKey)), readers_(std::move(readers)),
-          inSync_(readers_.size(), false) {}
-
-    bool recovered() const { return recovered_; }
-    u64 sequence() const { return sequence_; }
-
-    // Caller holds mutationMutex and has already applied the command locally.
-    void replicate(u64 session, const std::string &command) {
-        u64 sequence = ++sequence_;
-        std::string frame = "S\t" + std::to_string(sequence) + "\t" +
-                            std::to_string(session) + "\t" + command;
-        for (std::size_t reader = 0; reader < readers_.size(); ++reader) {
-            if (!inSync_[reader]) continue;
-            std::string response;
-            if (!clusterCall(readers_[reader], clusterKey_, frame, response)) {
-                inSync_[reader] = false;
-                std::cerr << "Read server " << endpointKey(readers_[reader])
-                          << " unreachable; will resync\n";
-            } else if (response != "APPLIED" && response != "DUPLICATE") {
-                inSync_[reader] = pushSnapshot(reader);
-            }
-        }
-    }
-
-    std::string snapshot() {
-        std::lock_guard<std::mutex> lock(mutationMutex);
-        return "SNAPSHOT\t" + std::to_string(sequence_.load()) + "\n" +
-               state_.serialize();
-    }
-
-    void stop() {
-        std::lock_guard<std::mutex> lock(stopMutex_);
-        stopping_ = true;
-        stopCondition_.notify_all();
-    }
-
-    void run() {
-        for (;;) {
-            if (!recovered_) tryRecover();
-            else syncReaders();
-            std::unique_lock<std::mutex> lock(stopMutex_);
-            if (stopCondition_.wait_for(lock, std::chrono::milliseconds(250),
-                                        [&] { return stopping_; }))
-                return;
-        }
-    }
-};
-
-struct TrackerNode {
-    unsigned number = 0;
-    TrackerState &state;
-    std::string clusterKey;
-    WriteReplicator *writer = nullptr;   // set on the write server
-    ReplicaLog *replica = nullptr;       // set on read servers
-
-    std::string status() const {
-        if (writer)
-            return std::string("STATUS\tprimary\t") + std::to_string(writer->sequence()) +
-                   "\t" + (writer->recovered() ? "READY" : "RECOVERING");
-        return "STATUS\treplica\t" + std::to_string(replica->applied()) + "\tREADY";
-    }
-};
-
-inline void trackerConnection(int rawFd, TrackerNode &node) {
-    UniqueFd fd(rawFd);
-    std::string request;
-    if (!clusterReceive(fd.get(), node.clusterKey, request)) {
-        sendFrame(fd.get(), "ERR unauthenticated cluster frame");
-        return;
-    }
-    auto reply = [&](const std::string &text) { clusterSend(fd.get(), node.clusterKey, text); };
-
-    // Snapshot push from the write server: "P\t<sequence>\n<state>".
-    if (node.replica && request.rfind("P\t", 0) == 0) {
-        std::size_t newline = request.find('\n');
-        u64 sequence = 0;
-        if (newline == std::string::npos ||
-            !parseU64(request.substr(2, newline - 2), sequence)) {
-            reply("ERR malformed snapshot push");
-            return;
-        }
-        reply(node.replica->install(sequence, request.substr(newline + 1)));
-        return;
-    }
-
-    std::vector<std::string> fields = split(request, '\t');
-    if (fields.size() == 3 && fields[0] == "X" && fields[2] == "STATUS") {
-        reply(node.status());
-        return;
-    }
-    if (fields.size() == 3 && fields[0] == "X" && fields[2] == "SNAPSHOT") {
-        reply(node.writer ? node.writer->snapshot() : node.replica->snapshot());
-        return;
-    }
-    if (fields.size() >= 4 && fields[0] == "S") {
-        u64 sequence = 0, session = 0;
-        if (!node.replica) {
-            reply("ERR not a read server");
-        } else if (!parseU64(fields[1], sequence) || !parseU64(fields[2], session)) {
-            reply("ERR malformed replication frame");
-        } else {
-            reply(node.replica->receive(sequence, session,
-                                                      commandFromFields(fields, 3)));
-        }
-        return;
-    }
-    if (fields.size() < 3 || fields[0] != "C") {
-        reply("ERR malformed request");
-        return;
-    }
-    u64 session = 0;
-    if (!parseU64(fields[1], session)) {
-        reply("ERR malformed session");
-        return;
-    }
-    std::string command = commandFromFields(fields, 2);
-    HandleResult result;
-    if (node.replica) {
-        result = isTrackerMutation(command)
-            ? HandleResult{"ERR read-only server; send writes to the write server", session, false}
-            : node.state.handle(session, command, false);
-    } else if (!node.writer->recovered()) {
-        result = {"ERR write server recovering", session, false};
-    } else {
-        std::lock_guard<std::mutex> mutationLock(node.writer->mutationMutex);
-        result = node.state.handle(session, command, false);
-        if (result.shouldSync)
-            node.writer->replicate(command == "logout" ? session : result.session, command);
-    }
-    reply(result.response + "\t" + std::to_string(result.session));
-}
-
-inline bool readTrackerInfo(const std::string &path, std::vector<Endpoint> &trackers) {
-    std::ifstream input(path);
-    if (!input) return false;
-    std::vector<Endpoint> loaded;
-    std::string token;
-    while (input >> token) {
-        Endpoint endpoint;
-        if (!parseEndpoint(token, endpoint)) return false;
-        loaded.push_back(endpoint);
-    }
-    if (loaded.size() != TRACKER_NODES) return false;
-    for (std::size_t i = 0; i < loaded.size(); ++i)
-        for (std::size_t j = i + 1; j < loaded.size(); ++j)
-            if (endpointKey(loaded[i]) == endpointKey(loaded[j])) return false;
-    trackers = std::move(loaded);
-    return true;
-}
-
-inline int runTracker(int argc, char **argv) {
-    if (argc != 4) {
-        std::cerr << "usage: " << argv[0] << " trackers.conf cluster.key <1|2|3>\n";
-        return 1;
-    }
-    std::vector<Endpoint> trackers;
-    if (!readTrackerInfo(argv[1], trackers)) {
-        std::cerr << "tracker config must list three distinct IP:PORT entries: "
-                     "the write server, then two read servers\n";
-        return 1;
-    }
-    u64 parsedNumber = 0;
-    std::string clusterKey;
-    if (!readKeyFile(argv[2], 32, clusterKey)) {
-        std::cerr << "cluster key file must hold one 32-byte hex key (run torrent_keygen)\n";
-        return 1;
-    }
-    if (!parseUnsignedDecimal(argv[3], parsedNumber) || parsedNumber < 1 ||
-        parsedNumber > TRACKER_NODES) {
-        std::cerr << "tracker number must be 1 (write) or 2-3 (read)\n";
-        return 1;
-    }
-    unsigned number = static_cast<unsigned>(parsedNumber);
-    Endpoint local = trackers[number - 1];
-
-    TrackerState state(number);
-    std::unique_ptr<WriteReplicator> writer;
-    std::unique_ptr<ReplicaLog> replica;
-    if (number == WRITE_NODE)
-        writer.reset(new WriteReplicator(
-            state, clusterKey, std::vector<Endpoint>(trackers.begin() + 1, trackers.end())));
-    else
-        replica.reset(new ReplicaLog(state));
-    TrackerNode node{number, state, clusterKey, writer.get(), replica.get()};
-
-    int listener = createListener(local.ip, local.port);
-    if (listener < 0) {
-        perror("tracker listen");
-        return 1;
-    }
-    std::thread syncThread;
-    if (writer) syncThread = std::thread(&WriteReplicator::run, writer.get());
-    std::cerr << "Tracker " << number << " ("
-              << (writer ? "write server" : "read server") << ") listening on "
-              << endpointKey(local) << '\n';
-
-    bool running = true;
-    bool monitorConsole = true;
-    std::mutex workersMutex;
-    std::condition_variable workersCondition;
-    std::size_t activeWorkers = 0;
-
-    while (running) {
-        pollfd descriptors[2]{};
-        descriptors[0].fd = listener;
-        descriptors[0].events = POLLIN;
-        descriptors[1].fd = monitorConsole ? STDIN_FILENO : -1;
-        descriptors[1].events = POLLIN;
-        int ready = poll(descriptors, 2, -1);
-        if (ready < 0) {
-            if (errno == EINTR) continue;
-            perror("poll");
-            break;
-        }
-        if (monitorConsole && (descriptors[1].revents & (POLLIN | POLLHUP))) {
-            std::string command;
-            if (!std::getline(std::cin, command)) monitorConsole = false;
-            else if (command == "quit") running = false;
-        }
-        if (!running) break;
-        if (descriptors[0].revents & POLLIN) {
-            int client = accept(listener, nullptr, nullptr);
-            if (client < 0) {
-                if (errno == EINTR) continue;
-                perror("accept");
-                break;
-            }
-            timeval timeout{};
-            timeout.tv_sec = 5;
-            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-            {
-                std::lock_guard<std::mutex> lock(workersMutex);
-                ++activeWorkers;
-            }
-            std::thread([&, client] {
-                trackerConnection(client, node);
-                {
-                    std::lock_guard<std::mutex> lock(workersMutex);
-                    --activeWorkers;
-                }
-                workersCondition.notify_all();
-            }).detach();
-        }
-    }
-    close(listener);
-    {
-        std::unique_lock<std::mutex> lock(workersMutex);
-        workersCondition.wait(lock, [&] { return activeWorkers == 0; });
-    }
-    if (writer) {
-        writer->stop();
-        syncThread.join();
-    }
-    return 0;
-}

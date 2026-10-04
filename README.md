@@ -1,32 +1,33 @@
 # Torrent Atlas
 
-Torrent Atlas is an interview-sized BitTorrent-style file sharing system written in C++17. It keeps the hard parts visible: replicated tracker metadata, deterministic load balancing, direct peer transfer, framed TCP, AES-256-GCM piece exchange, SHA-1 integrity checks, resumable parallel downloads, rarest-first scheduling, and a command-line client.
+Torrent Atlas is a BitTorrent-style file sharing system written in C++17: a Raft-replicated tracker cluster, direct encrypted peer transfer, SHA-1 integrity checks, resumable parallel downloads, rarest-first scheduling, and a command-line client.
 
 ## Architecture
 
 ```text
-clients ── framed TCP ──> load balancer :5000
-                              │
-              writes ─────────┼───────── reads
-                 v            │            v
-       write server :6000 ──sync──> read servers :6001, :6002
+            client (knows every tracker; follows REDIRECT to the leader)
+               │  signed X25519 handshake + AES-256-GCM
+     ┌─────────┼─────────┐
+     v         v         v
+ tracker 1  tracker 2  tracker 3     NuRaft cluster, one elected leader
+     └──── mutual TLS (Raft) ────┘   on-disk log, votes and snapshots
 
-peer :8001 <──── encrypted piece traffic ────> peer :8002
+peer :8101 <──── AES-256-GCM piece traffic ────> peer :8102
 ```
 
-The tracker tier has one write server and two read servers. Clients only talk to the load balancer.
+The trackers form a [NuRaft](https://github.com/eBay/NuRaft) cluster. One tracker is the elected leader:
 
-Every state-changing command (`create_user`, `login`, `upload_file`, ...) goes to the write server. It applies the command, gives it the next sequence number, and pushes it to both read servers before answering. So once a client sees `OK`, both in-sync read servers already have the change.
+- **Writes** (`create_user`, `login`, `upload_file`, ...) are appended to the Raft log. A write gets `OK` only after a majority (2 of 3) has it on disk, so a single crash never loses an acknowledged write.
+- **Reads** (`list_groups`, `list_files`, `download_file`, ...) are answered by the leader, so they always reflect every acknowledged write.
+- **Followers** answer `REDIRECT <leader>`. Clients remember the leader and retry elsewhere if a tracker is down.
+- **Failover:** if the leader dies, the other two elect a new one in about a second. If two of three are down, the last one refuses writes rather than risk losing them.
+- **Restarts:** each tracker keeps its log, term, vote and snapshots in its data directory, so a crashed or restarted tracker rejoins and catches up from the leader's log or snapshot.
 
-Reads (`list_groups`, `list_files`, `download_file`, ...) are spread round-robin over the read servers that are at the write server's sequence number. A read server that is behind is skipped until it catches up, so reads never return older data than a write the client already saw.
-
-A read server that was down, restarted, or missed an entry is caught up with a full snapshot push from the write server. A restarted write server copies its state from the most up-to-date read server before accepting writes. While the write server is down, reads keep working from the read servers and writes return `ERR write server unavailable`.
-
-For the wire formats and failure-state details, see [ARCHITECTURE.md](ARCHITECTURE.md).
+File bytes never pass through the trackers. For wire formats and failure handling, see [ARCHITECTURE.md](ARCHITECTURE.md); for keys and encryption, see [SECURITY.md](SECURITY.md).
 
 ## Build and test
 
-Requirements: CMake 3.16+, a C++17 compiler, and OpenSSL.
+Requirements: CMake 3.16+, a C++17 compiler, OpenSSL 3, and network access on the first configure (CMake fetches NuRaft and the header-only asio library).
 
 ```sh
 cmake -S . -B build
@@ -46,22 +47,25 @@ Build output goes in `build/` (or `build-sanitize/`), which git ignores. Delete 
 
 ## Local demo
 
-Committed example configs use LB `5000`, write server `6000`, and read servers `6001` and `6002`. Tracker number 1 is always the write server.
+`config/cluster.conf` lists the three trackers: client ports `6001`-`6003` and Raft ports `7001`-`7003`.
 
-Create keys once. This writes `config/cluster.key` and `config/lb_identity.key` (both secret, git-ignored) and adds the load balancer's public key to `config/client.conf`:
-
-```sh
-./build/torrent_keygen config
-```
+Create keys once. This writes the cluster CA, one TLS certificate per tracker and the trackers' signing key to `config/keys/` (git-ignored), and writes `config/client.conf` with every tracker address plus the public key clients trust:
 
 ```sh
-./build/tracker config/trackers.conf config/cluster.key 2
-./build/tracker config/trackers.conf config/cluster.key 3
-./build/tracker config/trackers.conf config/cluster.key 1
-./build/tracker_lb config/load_balancer.conf config/cluster.key config/lb_identity.key
-./build/client 127.0.0.1:8001 config/client.conf
-./build/client 127.0.0.1:8002 config/client.conf
+./build/torrent_keygen config/cluster.conf config/keys config/client.conf
 ```
+
+Start the trackers (each keeps its Raft log in its own data directory), then the clients:
+
+```sh
+./build/tracker config/cluster.conf 1 config/keys data/node1
+./build/tracker config/cluster.conf 2 config/keys data/node2
+./build/tracker config/cluster.conf 3 config/keys data/node3
+./build/client 127.0.0.1:8101 config/client.conf
+./build/client 127.0.0.1:8102 config/client.conf
+```
+
+Set `TORRENT_RAFT_LOG=3` on a tracker to see elections and replication on stderr.
 
 Common commands accept either spaced or underscore spelling:
 
@@ -85,13 +89,13 @@ quit
 
 ## Five-minute interview demo
 
-1. Start the three trackers and the LB; point out that clients know only `:5000`.
+1. Start the three trackers; point out that clients know all three and get redirected to the leader.
 2. Start two clients, create Alice and Bob, create a group, join it, and accept Bob.
 3. Upload a multi-piece file from Alice and download it from Bob. Use `show downloads` and `stats` to show rarest-first progress and throughput.
-4. Stop one read server. Reads and writes keep working; restart it and show it is caught up by a snapshot push.
-5. Stop the write server. Reads still work and writes are refused. Restart it and show it recovers its state from the read servers.
+4. Kill the leader. Within about a second another tracker is leader; reads and writes keep working and nothing acknowledged is lost.
+5. Kill a second tracker: writes are refused (no majority). Restart both and show they catch up from the log.
 
-The tradeoff is deliberately simple: one writer orders every change and replicates synchronously, so reads from in-sync read servers are consistent without a consensus protocol. The cost is that writes stop while the write server is down.
+The tradeoff: every write waits for a majority to store it, which costs one network round trip, and the cluster needs 2 of 3 trackers up to accept writes. In return, no acknowledged write is ever lost and failover is automatic.
 
 ## Transfer behavior
 
@@ -107,12 +111,11 @@ The tradeoff is deliberately simple: one writer orders every change and replicat
 
 ## Design limits
 
-- The LB is a single point of failure, and so is the write server for writes.
-- Tracker state and sequence numbers are in memory. Shutting down all three trackers loses metadata.
-- A restarted write server recovers from the most up-to-date read server it can reach. If the only read server reachable at that moment is behind, writes it missed are lost.
-- There is no forward secrecy for peer traffic: file capabilities are long-lived keys. See [SECURITY.md](SECURITY.md).
-- SHA-1 is retained because the assignment requires it; it is not recommended for new security designs.
-- Peer authorization uses tracker-issued file capabilities; it is not an internet-facing identity system.
+- Three fixed trackers tolerate one failure. Five would tolerate two; membership changes are not wired up.
+- Reads are served by the leader only. A leader that is cut off keeps answering reads until its lease expires (about two seconds), so a read in that window can be slightly stale.
+- A file capability is a long-lived per-file key: anyone who has it can download or seed that file. See [SECURITY.md](SECURITY.md).
+- SHA-1 is kept for piece and file integrity for compatibility; it is not recommended for new designs.
+- A seeder that crashes without `logout` stays listed until it reconnects; downloads still succeed by retrying other peers.
 
 ## Documentation
 

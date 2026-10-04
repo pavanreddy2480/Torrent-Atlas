@@ -9,6 +9,35 @@ option(TORRENT_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorS
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+# Raft consensus for the tracker cluster: eBay NuRaft, which needs the
+# header-only standalone asio for networking.
+include(FetchContent)
+FetchContent_Declare(
+  asio
+  GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+  GIT_TAG asio-1-30-2
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(asio)
+set(ASIO_INCLUDE_DIR ${asio_SOURCE_DIR}/asio/include CACHE PATH "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  nuraft
+  GIT_REPOSITORY https://github.com/eBay/NuRaft.git
+  GIT_TAG 0b01b18
+)
+FetchContent_MakeAvailable(nuraft)
+
+add_library(torrent_raft INTERFACE)
+target_include_directories(torrent_raft SYSTEM INTERFACE
+  ${nuraft_SOURCE_DIR}/include
+  ${nuraft_SOURCE_DIR}/include/libnuraft
+  ${ASIO_INCLUDE_DIR})
+target_compile_definitions(torrent_raft INTERFACE ASIO_STANDALONE)
+target_link_libraries(torrent_raft INTERFACE
+  NuRaft::static_lib OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+
 function(torrent_warnings target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   if(TORRENT_ENABLE_SANITIZERS)
@@ -34,12 +63,8 @@ target_link_libraries(client PRIVATE
 torrent_warnings(client)
 
 add_executable(tracker tracker/tracker.cpp)
-target_link_libraries(tracker PRIVATE Threads::Threads OpenSSL::Crypto)
+target_link_libraries(tracker PRIVATE torrent_raft)
 torrent_warnings(tracker)
-
-add_executable(tracker_lb tracker/tracker_lb.cpp)
-target_link_libraries(tracker_lb PRIVATE Threads::Threads OpenSSL::Crypto)
-torrent_warnings(tracker_lb)
 
 add_executable(torrent_keygen tools/keygen.cpp)
 target_link_libraries(torrent_keygen PRIVATE OpenSSL::Crypto)
@@ -59,7 +84,7 @@ target_compile_options(peer_rejection_test PRIVATE -UNDEBUG)
 torrent_warnings(peer_rejection_test)
 
 add_executable(tracker_state_tests tests/tracker_state_tests.cpp)
-target_link_libraries(tracker_state_tests PRIVATE Threads::Threads OpenSSL::Crypto)
+target_link_libraries(tracker_state_tests PRIVATE torrent_raft)
 target_compile_options(tracker_state_tests PRIVATE -UNDEBUG)
 torrent_warnings(tracker_state_tests)
 
@@ -83,11 +108,6 @@ target_link_libraries(tracker_integration_tests PRIVATE Threads::Threads OpenSSL
 target_compile_options(tracker_integration_tests PRIVATE -UNDEBUG)
 torrent_warnings(tracker_integration_tests)
 
-add_executable(tracker_lb_integration_tests tests/tracker_lb_integration_tests.cpp)
-target_link_libraries(tracker_lb_integration_tests PRIVATE Threads::Threads OpenSSL::Crypto)
-target_compile_options(tracker_lb_integration_tests PRIVATE -UNDEBUG)
-torrent_warnings(tracker_lb_integration_tests)
-
 add_executable(client_integration_tests tests/client_integration_tests.cpp)
 target_link_libraries(client_integration_tests PRIVATE Threads::Threads OpenSSL::Crypto)
 target_compile_options(client_integration_tests PRIVATE -UNDEBUG)
@@ -108,17 +128,8 @@ set_tests_properties(
   PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
 )
 add_test(
-  NAME tracker_lb_integration_tests
-  COMMAND tracker_lb_integration_tests $<TARGET_FILE:tracker> $<TARGET_FILE:tracker_lb>
-)
-set_tests_properties(
-  tracker_lb_integration_tests
-  PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
-)
-add_test(
   NAME client_integration_tests
-  COMMAND client_integration_tests $<TARGET_FILE:tracker>
-          $<TARGET_FILE:tracker_lb> $<TARGET_FILE:client>
+  COMMAND client_integration_tests $<TARGET_FILE:tracker> $<TARGET_FILE:client>
 )
 set_tests_properties(
   client_integration_tests

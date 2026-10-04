@@ -4,6 +4,9 @@
 
 #include <string>
 
-// client.conf: the load balancer's IP:PORT, then its hex Ed25519 public key.
-bool loadTrackerInfo(const std::string &path, Endpoint &tracker,
+#include <vector>
+
+// client.conf: one tracker IP:PORT per line, then the cluster's hex Ed25519
+// public key (written by torrent_keygen).
+bool loadTrackerInfo(const std::string &path, std::vector<Endpoint> &trackers,
                      std::string &serverPublicKey);

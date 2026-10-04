@@ -4,6 +4,8 @@
 
 #include <cassert>
 #include <iostream>
+#include <sys/socket.h>
+#include <thread>
 
 int main() {
     Sha1 emptySha1;
@@ -75,19 +77,28 @@ int main() {
     std::string shared = x25519SharedSecret(aPrivate, bPublic);
     assert(shared.size() == 32 && shared == x25519SharedSecret(bPrivate, aPublic));
 
-    // Cluster frames: tampering, a wrong key, or an old timestamp is rejected.
-    std::string clusterKey = randomBytes(32), body;
-    std::string sealed = clusterSeal(clusterKey, "S\t1\t0\tcreate_user a b");
-    assert(clusterOpen(clusterKey, sealed, body) && body == "S\t1\t0\tcreate_user a b");
-    std::string tamperedFrame = sealed;
-    tamperedFrame.back() ^= 1;
-    assert(!clusterOpen(clusterKey, tamperedFrame, body));
-    assert(!clusterOpen(randomBytes(32), sealed, body));
-    std::string stale = clusterSealAt(clusterKey, "X\t0\tSTATUS", unixSeconds() - 120);
-    assert(!stale.empty() && !clusterOpen(clusterKey, stale, body));
-    assert(sealed.find("create_user") == std::string::npos);  // body is encrypted
-    std::string restamped = std::to_string(unixSeconds() + 1) + sealed.substr(sealed.find('\t'));
-    assert(!clusterOpen(clusterKey, restamped, body));  // timestamp is authenticated
+    // Client handshake over a socket pair: the right pinned key yields the
+    // same session key on both sides; a wrong pinned key fails.
+    auto handshake = [&](const std::string &pinned, std::string &clientKey,
+                         std::string &serverKey) {
+        int fds[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        bool serverOk = false;
+        std::thread server([&] { serverOk = serverHandshake(fds[1], signPrivate, serverKey); });
+        bool clientOk = clientHandshake(fds[0], pinned, clientKey);
+        close(fds[0]);
+        server.join();
+        close(fds[1]);
+        return clientOk && serverOk;
+    };
+    std::string clientKey, serverKey;
+    assert(handshake(signPublic, clientKey, serverKey));
+    assert(clientKey.size() == 32 && clientKey == serverKey);
+    std::string secondClientKey, secondServerKey;
+    assert(handshake(signPublic, secondClientKey, secondServerKey));
+    assert(secondClientKey != clientKey);  // fresh keys every connection
+    std::string ignoredClient, ignoredServer;
+    assert(!handshake(otherPublic, ignoredClient, ignoredServer));
 
     std::cout << "security tests passed\n";
 }

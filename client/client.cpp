@@ -53,7 +53,8 @@ static std::mutex downloadsMutex;
 static std::vector<std::shared_ptr<DownloadStatus>> downloads;
 static std::mutex downloadThreadsMutex;
 static std::vector<std::thread> downloadThreads;
-static Endpoint trackerEndpoint;
+static std::vector<Endpoint> trackerEndpoints;
+static std::size_t leaderGuess = 0;
 static std::string trackerPublicKey;
 static std::mutex trackerMutex;
 static u64 sessionId = 0;
@@ -92,9 +93,34 @@ static std::string keyFor(const std::string &group, const std::string &name) {
 
 static bool trackerRequest(const std::string &command, std::string &response) {
     std::lock_guard<std::mutex> lock(trackerMutex);
+    // Try the last known leader first; follow REDIRECTs, skip dead trackers,
+    // and wait briefly while the cluster elects a leader.
     std::string request = "C\t" + std::to_string(sessionId) + "\t" + command;
-    if (!secureLbCall(trackerEndpoint, trackerPublicKey, request, response)) {
-        response = "ERR tracker service unavailable or failed authentication";
+    bool answered = false;
+    for (int attempt = 0; attempt < 12 && !answered; ++attempt) {
+        const Endpoint &target = trackerEndpoints[leaderGuess % trackerEndpoints.size()];
+        if (!secureTrackerCall(target, trackerPublicKey, request, response)) {
+            leaderGuess = (leaderGuess + 1) % trackerEndpoints.size();
+            continue;
+        }
+        if (response.rfind("REDIRECT ", 0) == 0) {
+            Endpoint leader;
+            std::string address = response.substr(9, response.find('\t') - 9);
+            for (std::size_t i = 0; i < trackerEndpoints.size(); ++i)
+                if (parseEndpoint(address, leader) &&
+                    endpointKey(trackerEndpoints[i]) == endpointKey(leader))
+                    leaderGuess = i;
+            continue;
+        }
+        if (response.rfind("ERR no leader elected yet", 0) == 0 ||
+            response.rfind("ERR write not committed", 0) == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            continue;
+        }
+        answered = true;
+    }
+    if (!answered) {
+        response = "ERR tracker cluster unavailable";
         return false;
     }
     std::size_t tab = response.rfind('\t');
@@ -919,11 +945,11 @@ static int runCli() {
 
 int main(int argc, char **argv) {
     if (argc != 3 || !parseEndpoint(argv[1], peerEndpoint) ||
-        !loadTrackerInfo(argv[2], trackerEndpoint, trackerPublicKey)) {
+        !loadTrackerInfo(argv[2], trackerEndpoints, trackerPublicKey)) {
         std::cerr << "usage: " << argv[0]
                   << " <peer-ip:port> client.conf\n"
-                  << "client.conf needs the load balancer's IP:PORT and public key; "
-                     "run torrent_keygen <config-dir> to create it\n";
+                  << "client.conf lists the trackers' IP:PORT and the cluster public key; "
+                     "torrent_keygen creates it\n";
         return 1;
     }
     std::thread peerThread(peerServer);

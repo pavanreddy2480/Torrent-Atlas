@@ -1,4 +1,4 @@
-#include "../tracker/tracker_common.hpp"
+#include "../tracker/raft_tracker.hpp"
 
 #include <cassert>
 #include <array>
@@ -22,7 +22,6 @@ int main() {
     HandleResult login = state.handle(0, "login alice secret", false);
     assert(login.response == "OK logged in");
     assert(login.session != 0);
-    assert((login.session >> 56U) == 1);
 
     HandleResult group = state.handle(login.session, "create_group demo", false);
     assert(group.response == "OK group created");
@@ -51,7 +50,6 @@ int main() {
     assert(replica.replaceFromSnapshot(state.serialize()));
     HandleResult replicaLogin = replica.handle(0, "login alice secret", false);
     assert(replicaLogin.response == "OK logged in");
-    assert((replicaLogin.session >> 56U) == 2);
 
     TrackerState cleanRestart(1);
     HandleResult missing = cleanRestart.handle(0, "login alice secret", false);
@@ -67,33 +65,38 @@ int main() {
     assert(cleanRestart.handle(0, "login eve secret", false).response ==
            "ERR too many login attempts; try again later");
 
-    TrackerState ordered(2);
-    ReplicaLog orderedReplica(ordered);
-    assert(orderedReplica.receive(2, 0, "create_user bob secret") == "RESYNC");
-    assert(orderedReplica.receive(1, 0, "create_user alice secret") == "APPLIED");
-    assert(orderedReplica.receive(1, 0, "create_user alice secret") == "DUPLICATE");
-    assert(orderedReplica.receive(2, 0, "create_user bob secret") == "APPLIED");
-    assert(ordered.handle(0, "login alice secret", false).response ==
-           "OK logged in");
-    assert(ordered.handle(0, "login bob secret", false).response ==
-           "OK logged in");
-    assert(orderedReplica.applied() == 2);
+    // Raft replicas must reach identical state from identical log entries:
+    // all randomness and time come from the entry, not the replica.
+    {
+        ApplyContext first = ApplyContext::fresh();
+        ApplyContext second = ApplyContext::fresh();
+        second.now = first.now + 1;
+        std::vector<std::pair<std::string, ApplyContext>> log = {
+            {"create_user carol secret", first},
+            {"login carol wrong", second},
+            {"login carol secret", second},
+        };
+        TrackerState replicaA, replicaB;
+        for (const auto &entry : log) {
+            u64 session = 0;
+            ApplyContext decoded;
+            std::string command;
+            assert(decodeCommandEntry(encodeCommandEntry(0, entry.second, entry.first),
+                                      session, decoded, command));
+            assert(command == entry.first && decoded.salt == entry.second.salt &&
+                   decoded.newSession == entry.second.newSession &&
+                   decoded.now == entry.second.now);
+            HandleResult a = replicaA.handle(session, command, false, decoded);
+            HandleResult b = replicaB.handle(session, command, false, decoded);
+            assert(a.response == b.response && a.session == b.session);
+        }
+        assert(replicaA.serialize() == replicaB.serialize());
 
-    TrackerState conflicting(2);
-    ReplicaLog conflictingReplica(conflicting);
-    assert(conflictingReplica.receive(1, 0, "create_group demo") == "RESYNC");
-    assert(conflictingReplica.applied() == 0);
-
-    TrackerState source(1);
-    assert(source.handle(0, "create_user carol secret", false).response ==
-           "OK user created");
-    assert(conflictingReplica.install(7, source.serialize()) == "APPLIED");
-    assert(conflictingReplica.applied() == 7);
-    assert(conflictingReplica.receive(8, 0, "create_user dave secret") == "APPLIED");
-    assert(conflicting.handle(0, "login carol secret", false).response ==
-           "OK logged in");
-    assert(conflictingReplica.install(9, "not a snapshot") == "ERR invalid snapshot");
-    assert(conflictingReplica.applied() == 8);
+        // Snapshots carry the login lockout too.
+        TrackerState restored;
+        assert(restored.replaceFromSnapshot(replicaA.serialize()));
+        assert(restored.serialize() == replicaA.serialize());
+    }
 
     assert(isTrackerMutation("login alice secret"));
     assert(isTrackerMutation("upload_file demo x"));

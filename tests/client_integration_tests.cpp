@@ -1,6 +1,7 @@
-#include "../common/secure_channel.hpp"
+#include "cluster_test_support.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <csignal>
 #include <fcntl.h>
@@ -164,84 +165,44 @@ static bool filesEqual(const std::string &left, const std::string &right) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) return 2;
-    int trackerOnePort = unusedPort();
-    int trackerTwoPort = unusedPort();
-    int trackerThreePort = unusedPort();
-    int lbPort = unusedPort();
+    if (argc != 3) return 2;
     int seederPort = unusedPort();
     int downloaderPort = unusedPort();
     int secondDownloaderPort = unusedPort();
-    if (trackerOnePort < 0 || trackerTwoPort < 0 || trackerThreePort < 0 || lbPort < 0 ||
-        seederPort < 0 || downloaderPort < 0 || secondDownloaderPort < 0) {
+    if (seederPort < 0 || downloaderPort < 0 || secondDownloaderPort < 0) {
         std::cout << "client integration tests skipped: local sockets unavailable\n";
         return 77;
     }
 
     std::string prefix = "/tmp/torrent-client-integration-" +
                          std::to_string(getpid());
-    std::string trackerInfo = prefix + "-trackers.txt";
-    std::string lbInfo = prefix + "-lb.txt";
-    std::string clientInfo = prefix + "-client.txt";
-    std::string clusterKeyPath = prefix + "-cluster.key";
-    std::string identityPath = prefix + "-identity.key";
-    std::string clusterKey = randomBytes(32), lbPrivate, lbPublic;
-    require(ed25519KeyPair(lbPrivate, lbPublic) &&
-                writeKeyFile(clusterKeyPath, clusterKey, true) &&
-                writeKeyFile(identityPath, lbPrivate, true),
-            "could not create keys");
     std::string source = prefix + "-source.bin";
     std::string destination = prefix + "-copy.bin";
     std::string secondDestination = prefix + "-copy-2.bin";
-    {
-        std::ofstream output(trackerInfo);
-        output << "127.0.0.1:" << trackerOnePort << '\n'
-               << "127.0.0.1:" << trackerTwoPort << '\n'
-               << "127.0.0.1:" << trackerThreePort << '\n';
-    }
-    {
-        std::ofstream output(lbInfo);
-        output << "127.0.0.1:" << lbPort << '\n'
-               << "127.0.0.1:" << trackerOnePort << '\n'
-               << "127.0.0.1:" << trackerTwoPort << '\n'
-               << "127.0.0.1:" << trackerThreePort << '\n';
-    }
-    {
-        std::ofstream output(clientInfo);
-        output << "127.0.0.1:" << lbPort << '\n' << hexEncode(lbPublic) << '\n';
-    }
     {
         std::ofstream output(source, std::ios::binary);
         for (std::size_t index = 0; index < PIECE_SIZE * 2 + 12345; ++index)
             output.put(static_cast<char>((index * 31U + 17U) & 0xffU));
     }
 
-    ChildProcess trackerOne, trackerTwo, trackerThree, lb, seeder, downloader,
-                 secondDownloader;
+    cluster_test::Cluster cluster;
+    ChildProcess seeder, downloader, secondDownloader;
     try {
-        trackerOne = startProcess({argv[1], trackerInfo, clusterKeyPath, "1"}, false);
-        trackerTwo = startProcess({argv[1], trackerInfo, clusterKeyPath, "2"}, false);
-        trackerThree = startProcess({argv[1], trackerInfo, clusterKeyPath, "3"}, false);
-        require(waitForListener(trackerOnePort), "tracker one did not start");
-        require(waitForListener(trackerTwoPort), "tracker two did not start");
-        require(waitForListener(trackerThreePort), "tracker three did not start");
-        bool writerReady = false;
-        for (int attempt = 0; attempt < 200 && !writerReady; ++attempt) {
-            std::string status;
-            writerReady = clusterCall({"127.0.0.1", trackerOnePort}, clusterKey, "X\t0\tSTATUS", status) &&
-                          status.find("READY") != std::string::npos;
-            if (!writerReady) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        if (!cluster.setup(argv[1], prefix + "-cluster")) {
+            std::cout << "client integration tests skipped: local sockets unavailable\n";
+            return 77;
         }
-        require(writerReady, "write server did not become ready");
-        lb = startProcess({argv[2], lbInfo, clusterKeyPath, identityPath}, false);
-        require(waitForListener(lbPort), "load balancer did not start");
+        cluster.startAll();
+        require(cluster.leader() >= 0, "tracker cluster did not elect a leader");
+        std::string clientInfo = cluster.clientConf;
+        const char *clientBinary = argv[2];
 
         seeder = startProcess({
-            argv[3], "127.0.0.1:" + std::to_string(seederPort), clientInfo}, true);
+            clientBinary, "127.0.0.1:" + std::to_string(seederPort), clientInfo}, true);
         downloader = startProcess({
-            argv[3], "127.0.0.1:" + std::to_string(downloaderPort), clientInfo}, true);
+            clientBinary, "127.0.0.1:" + std::to_string(downloaderPort), clientInfo}, true);
         secondDownloader = startProcess({
-            argv[3], "127.0.0.1:" + std::to_string(secondDownloaderPort),
+            clientBinary, "127.0.0.1:" + std::to_string(secondDownloaderPort),
             clientInfo}, true);
         require(waitForListener(seederPort), "seeder did not start");
         require(waitForListener(downloaderPort), "downloader did not start");
@@ -302,15 +263,8 @@ int main(int argc, char **argv) {
         stopProcess(downloader);
         stopProcess(secondDownloader);
         stopProcess(seeder);
-        stopProcess(lb);
-        stopProcess(trackerThree);
-        stopProcess(trackerTwo);
-        stopProcess(trackerOne);
-        unlink(trackerInfo.c_str());
-        unlink(lbInfo.c_str());
-    unlink(clusterKeyPath.c_str());
-    unlink(identityPath.c_str());
-        unlink(clientInfo.c_str());
+        cluster.stopAll();
+        std::system(("rm -rf " + prefix + "-cluster").c_str());
         unlink(source.c_str());
         unlink(destination.c_str());
         unlink(secondDestination.c_str());
@@ -324,15 +278,8 @@ int main(int argc, char **argv) {
     stopProcess(downloader);
     stopProcess(secondDownloader);
     stopProcess(seeder);
-    stopProcess(lb);
-    stopProcess(trackerThree);
-    stopProcess(trackerTwo);
-    stopProcess(trackerOne);
-    unlink(trackerInfo.c_str());
-    unlink(lbInfo.c_str());
-    unlink(clusterKeyPath.c_str());
-    unlink(identityPath.c_str());
-    unlink(clientInfo.c_str());
+    cluster.stopAll();
+    std::system(("rm -rf " + prefix + "-cluster").c_str());
     unlink(source.c_str());
     unlink(destination.c_str());
     unlink(secondDestination.c_str());

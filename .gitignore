@@ -3,5 +3,5 @@ test_piano.pdf
 build/
 build-*/
 .DS_Store
-config/cluster.key
-config/lb_identity.key
+config/keys/
+data/

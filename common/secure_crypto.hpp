@@ -235,7 +235,7 @@ inline std::string hmacSha256(const std::string &key, const std::string &data) {
     return mac;
 }
 
-// Ed25519 signatures: the load balancer's long-term identity.
+// Ed25519 signatures: the tracker cluster's long-term identity.
 inline bool ed25519KeyPair(std::string &privateKey, std::string &publicKey) {
     return secure_crypto_detail::generateRawKeyPair(EVP_PKEY_ED25519, privateKey, publicKey);
 }

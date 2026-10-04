@@ -1,195 +1,129 @@
-#include "../common/secure_channel.hpp"
+// Three NuRaft trackers: leader election, majority commit, failover,
+// catch-up, durability, and the security of both channels.
+#include "cluster_test_support.hpp"
 
-#include <cassert>
-#include <chrono>
-#include <csignal>
-#include <fcntl.h>
-#include <fstream>
+#include <cstdlib>
 #include <iostream>
-#include <string>
-#include <sys/wait.h>
-#include <thread>
 
-struct TrackerProcess {
-    pid_t pid = -1;
-};
+using namespace cluster_test;
 
-static int unusedPort() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    if (bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
-        close(fd);
-        return -1;
-    }
-    socklen_t length = sizeof(address);
-    assert(getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) == 0);
-    int port = ntohs(address.sin_port);
-    close(fd);
-    return port;
-}
-
-static std::string clusterKey;
-static std::string clusterKeyPath;
-
-static TrackerProcess startTracker(const std::string &binary,
-                                   const std::string &infoPath,
-                                   int number) {
-    pid_t pid = fork();
-    assert(pid >= 0);
-    if (pid == 0) {
-        int nullFd = open("/dev/null", O_RDONLY);
-        if (nullFd >= 0) {
-            dup2(nullFd, STDIN_FILENO);
-            close(nullFd);
-        }
-        std::string numberText = std::to_string(number);
-        execl(binary.c_str(), binary.c_str(), infoPath.c_str(), clusterKeyPath.c_str(),
-              numberText.c_str(), static_cast<char *>(nullptr));
-        _exit(127);
-    }
-    return {pid};
-}
-
-static void stopTracker(TrackerProcess &process) {
-    if (process.pid <= 0) return;
-    kill(process.pid, SIGTERM);
-    int status = 0;
-    waitpid(process.pid, &status, 0);
-    process.pid = -1;
-}
-
-static bool waitForTracker(int port) {
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        int fd = connectTcp("127.0.0.1", port, 1);
-        if (fd >= 0) {
-            close(fd);
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    return false;
-}
-
-static std::pair<std::string, u64> request(int port, u64 session,
-                                           const std::string &command) {
-    std::string response;
-    assert(clusterCall({"127.0.0.1", port}, clusterKey,
-                       "C\t" + std::to_string(session) + "\t" + command, response));
-    std::size_t tab = response.rfind('\t');
-    assert(tab != std::string::npos);
-    u64 returnedSession = static_cast<u64>(std::stoull(response.substr(tab + 1)));
-    response.resize(tab);
-    return {response, returnedSession};
-}
-
-static std::pair<std::string, u64> eventuallyRequest(
-    int port, u64 session, const std::string &command,
-    const std::string &expectedPrefix) {
-    std::pair<std::string, u64> result;
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        result = request(port, session, command);
-        if (result.first.rfind(expectedPrefix, 0) == 0) return result;
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    return result;
+static void require(bool condition, const std::string &message) {
+    if (!condition) throw std::runtime_error(message);
 }
 
 int main(int argc, char **argv) {
-    assert(argc == 2);
-    int ports[3];
-    for (int index = 0; index < 3; ++index) {
-        ports[index] = unusedPort();
-        if (ports[index] < 0) {
+    if (argc != 2) return 2;
+    std::string dir = "/tmp/torrent-raft-integration-" + std::to_string(getpid());
+    Cluster cluster;
+    try {
+        if (!cluster.setup(argv[1], dir)) {
             std::cout << "tracker integration tests skipped: local sockets unavailable\n";
             return 77;
         }
-        for (int earlier = 0; earlier < index; ++earlier)
-            while (ports[index] == ports[earlier]) ports[index] = unusedPort();
+        cluster.startAll();
+
+        // Writes go through the elected leader and commit on a majority.
+        require(cluster.request(0, "create_user alice secret").text == "OK user created",
+                "create_user failed");
+        Response login = cluster.request(0, "login alice secret");
+        require(login.text == "OK logged in" && login.session != 0, "login failed");
+        u64 session = login.session;
+        require(cluster.request(session, "create_group demo").text == "OK group created",
+                "create_group failed");
+        require(cluster.request(session, "list_groups").text == "OK demo",
+                "read after write failed");
+
+        // Followers point clients at the leader.
+        int leader = cluster.leader();
+        require(leader >= 0, "no leader elected");
+        std::size_t follower = (static_cast<std::size_t>(leader) + 1) % 3;
+        Response redirected;
+        require(cluster.requestTo(follower, session, "list_groups", redirected) &&
+                    redirected.text ==
+                        "REDIRECT " + endpointKey(cluster.members[leader].client),
+                "follower did not redirect to the leader: " + redirected.text);
+
+        // Leader crash: the other two elect a new leader and keep every write.
+        cluster.stop(static_cast<std::size_t>(leader));
+        require(cluster.request(session, "list_groups").text == "OK demo",
+                "acknowledged write lost after leader crash");
+        require(cluster.request(session, "create_group afterfail").text == "OK group created",
+                "new leader did not accept writes");
+        int newLeader = cluster.leader();
+        require(newLeader >= 0 && newLeader != leader, "no new leader after crash");
+
+        // Two of three down: no majority, so writes are refused, never half-applied.
+        cluster.stop(static_cast<std::size_t>(newLeader));
+        Response noQuorum = cluster.request(session, "create_group lonely", 6);
+        require(noQuorum.text.rfind("OK", 0) != 0, "write succeeded without a majority");
+
+        // Restart the crashed nodes: they rejoin, catch up from the log, and the
+        // cluster accepts writes again.
+        cluster.start(static_cast<std::size_t>(leader));
+        cluster.start(static_cast<std::size_t>(newLeader));
+        Response groups = cluster.request(session, "list_groups");
+        require(groups.text == "OK afterfail demo", "unexpected state after restart: " + groups.text);
+        require(cluster.request(session, "create_group rejoined").text == "OK group created",
+                "write failed after nodes rejoined");
+
+        // Durability: crash all three, restart, state and sessions are intact.
+        cluster.stopAll();
+        cluster.startAll();
+        require(cluster.request(session, "list_groups").text == "OK afterfail demo rejoined",
+                "state lost after full restart");
+        require(cluster.request(0, "login alice wrong").text == "ERR invalid password",
+                "password check failed after restart");
+
+        // Client channel: a wrong pinned key or a plain-text request gets nothing.
+        std::string wrongPrivate, wrongPublic;
+        require(ed25519KeyPair(wrongPrivate, wrongPublic), "keygen failed");
+        Response rejected;
+        require(!cluster.requestTo(0, 0, "list_groups", rejected, wrongPublic),
+                "client accepted a tracker it could not authenticate");
+        {
+            UniqueFd fd(connectTcp("127.0.0.1", cluster.clientPort(0), 2));
+            std::string response;
+            require(fd && sendFrame(fd.get(), "C\t0\tlogin alice secret") &&
+                        !receiveFrame(fd.get(), response),
+                    "tracker answered a plain-text request");
+        }
+        // A recorded request replayed on a new connection fails to decrypt.
+        {
+            int target = cluster.leader();
+            UniqueFd fd(connectTcp("127.0.0.1", cluster.clientPort(target), 2));
+            std::string sessionKey, response;
+            require(fd && clientHandshake(fd.get(), cluster.publicKey, sessionKey),
+                    "handshake failed");
+            AesGcmMessage message;
+            require(aes256GcmEncrypt(sessionKey, "client->tracker",
+                                     "C\t0\tcreate_user mallory secret", message),
+                    "encrypt failed");
+            std::string sealed = message.nonce + message.tag + message.ciphertext;
+            require(sendFrame(fd.get(), sealed) &&
+                        sealedReceive(fd.get(), sessionKey, "tracker->client", response),
+                    "sealed request failed");
+            UniqueFd replay(connectTcp("127.0.0.1", cluster.clientPort(target), 2));
+            std::string newKey;
+            require(replay && clientHandshake(replay.get(), cluster.publicKey, newKey) &&
+                        sendFrame(replay.get(), sealed) && !receiveFrame(replay.get(), response),
+                    "tracker accepted a replayed request");
+        }
+        // Raft port: a peer without a cluster certificate can't complete TLS.
+        {
+            UniqueFd fd(connectTcp("127.0.0.1", cluster.members[0].raft.port, 2));
+            std::string response;
+            require(fd && sendFrame(fd.get(), "not a tls handshake") &&
+                        !receiveFrame(fd.get(), response),
+                    "raft port answered a non-TLS peer");
+        }
+    } catch (const std::exception &error) {
+        std::cerr << error.what() << '\n';
+        cluster.stopAll();
+        std::system(("rm -rf " + dir).c_str());
+        return 1;
     }
-    const int writePort = ports[0], readPortA = ports[1], readPortB = ports[2];
-    std::string infoPath = "/tmp/torrent-tracker-integration-" +
-                           std::to_string(getpid()) + ".txt";
-    {
-        std::ofstream output(infoPath);
-        for (int port : ports) output << "127.0.0.1:" << port << '\n';
-    }
-    clusterKey = randomBytes(32);
-    clusterKeyPath = infoPath + ".key";
-    assert(writeKeyFile(clusterKeyPath, clusterKey, true));
-
-    TrackerProcess nodes[3];
-    for (int index = 0; index < 3; ++index)
-        nodes[index] = startTracker(argv[1], infoPath, index + 1);
-    for (int port : ports) assert(waitForTracker(port));
-
-    // Writes go to the write server once it has found a read server.
-    auto created = eventuallyRequest(writePort, 0, "create_user alice secret", "OK");
-    assert(created.first == "OK user created");
-    auto aliceLogin = request(writePort, 0, "login alice secret");
-    assert(aliceLogin.first == "OK logged in");
-    assert(request(writePort, aliceLogin.second, "create_group demo").first ==
-           "OK group created");
-
-    // Replication is synchronous once the read servers are in sync, so the
-    // next read on either read server sees the write.
-    auto groupsA = eventuallyRequest(readPortA, aliceLogin.second, "list_groups", "OK demo");
-    auto groupsB = eventuallyRequest(readPortB, aliceLogin.second, "list_groups", "OK demo");
-    assert(groupsA.first == "OK demo");
-    assert(groupsB.first == "OK demo");
-    assert(request(writePort, aliceLogin.second, "create_group second").first ==
-           "OK group created");
-    assert(request(readPortA, aliceLogin.second, "list_groups").first == "OK demo second");
-    assert(request(readPortB, aliceLogin.second, "list_groups").first == "OK demo second");
-
-    // Read servers refuse writes.
-    assert(request(readPortA, 0, "create_user bob secret").first.rfind(
-               "ERR read-only server", 0) == 0);
-
-    // Frames without the cluster key are refused, and data is untouched.
-    {
-        UniqueFd fd(connectTcp("127.0.0.1", readPortA, 2));
-        std::string response;
-        assert(fd && sendFrame(fd.get(), "P\t99\n") && receiveFrame(fd.get(), response));
-        assert(response == "ERR unauthenticated cluster frame");
-        std::string forged;
-        assert(!clusterCall({"127.0.0.1", readPortA}, randomBytes(32), "P\t99\n", forged));
-        assert(request(readPortA, aliceLogin.second, "list_groups").first == "OK demo second");
-    }
-
-    // A restarted read server is caught up by a snapshot push.
-    stopTracker(nodes[2]);
-    assert(request(writePort, aliceLogin.second, "create_group third").first ==
-           "OK group created");
-    nodes[2] = startTracker(argv[1], infoPath, 3);
-    assert(waitForTracker(readPortB));
-    assert(eventuallyRequest(readPortB, aliceLogin.second, "list_groups",
-                             "OK demo second third").first == "OK demo second third");
-
-    // A restarted write server recovers its state from the read servers.
-    stopTracker(nodes[0]);
-    nodes[0] = startTracker(argv[1], infoPath, 1);
-    assert(waitForTracker(writePort));
-    assert(eventuallyRequest(writePort, aliceLogin.second, "list_groups",
-                             "OK demo second third").first == "OK demo second third");
-    assert(request(writePort, aliceLogin.second, "create_group fourth").first ==
-           "OK group created");
-    assert(request(readPortA, aliceLogin.second, "list_groups").first ==
-           "OK demo fourth second third");
-
-    // State is in memory only: restarting every node starts empty.
-    for (auto &node : nodes) stopTracker(node);
-    for (int index = 0; index < 3; ++index)
-        nodes[index] = startTracker(argv[1], infoPath, index + 1);
-    for (int port : ports) assert(waitForTracker(port));
-    assert(eventuallyRequest(writePort, 0, "login alice secret", "ERR no such user").first ==
-           "ERR no such user");
-
-    for (auto &node : nodes) stopTracker(node);
-    unlink(infoPath.c_str());
-    unlink(clusterKeyPath.c_str());
+    cluster.stopAll();
+    std::system(("rm -rf " + dir).c_str());
     std::cout << "tracker integration tests passed\n";
+    return 0;
 }

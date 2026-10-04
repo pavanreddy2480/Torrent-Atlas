@@ -2,76 +2,67 @@
 
 ## Components
 
-The system has one load balancer, three trackers, and any number of clients. Tracker 1 is the write server; trackers 2 and 3 are read servers. The LB and trackers hold metadata only. File bytes move directly between clients.
+Three trackers form a NuRaft cluster; any number of clients connect to it. Trackers hold metadata only. File bytes move directly between clients.
 
 ```text
-Write:  client -> LB -> write server -> sync to both read servers -> response
-Read:   client -> LB -> an in-sync read server -> response
-Pieces: client <-------------- encrypted --------------> client
+Write:  client -> any tracker -> REDIRECT -> leader -> Raft log, majority stored -> response
+Read:   client -> leader -> response
+Pieces: client <------------- AES-256-GCM -------------> client
 ```
 
 The supported process forms are:
 
 ```text
-torrent_keygen <config-dir>                  # creates cluster.key, lb_identity.key, client.conf key
-tracker <three-endpoint-config> <cluster.key> <1|2|3>   # 1 = write server, 2-3 = read servers
-tracker_lb <listen-write-read-read-config> <cluster.key> <lb_identity.key>
-client <peer-ip:port> <client.conf>          # LB IP:PORT + LB public key
+torrent_keygen <cluster.conf> <keys-dir> <client.conf>
+tracker <cluster.conf> <node-id> <keys-dir> <data-dir>
+client <peer-ip:port> <client.conf>
 ```
 
-## Routing
+`cluster.conf` has one line per tracker, `<id> <client IP:PORT> <raft IP:PORT>`, and must list an odd number of trackers (3 or more). `client.conf` lists every tracker's client address and, on its last line, the cluster's Ed25519 public key.
 
-The LB classifies each request by its command. `create_user`, `login`, `logout`, `create_group`, `join_group`, `leave_group`, `accept_request`, `upload_file` and `stop_share` are writes and go only to the write server. Everything else is a read.
+## Raft replication
 
-For a read, the LB asks all three trackers for their status:
+The tracker state (users, password hashes, sessions, login lockouts, groups, membership requests, files, seeders) is a deterministic state machine driven by the Raft log (`tracker/raft_tracker.hpp`).
 
-```text
-X\t0\tSTATUS
-STATUS\t<primary|replica>\t<sequence>\t<READY|RECOVERING>
-```
+- **Commands that change state** (`create_user`, `login`, `logout`, `create_group`, `join_group`, `leave_group`, `accept_request`, `upload_file`, `stop_share`) become log entries:
 
-If the write server is ready, the read goes round-robin to a read server whose sequence equals the write server's, or to the write server if neither read server is in sync. If the write server is unreachable, the read goes to the read server with the highest sequence. With no tracker reachable the LB answers `ERR tracker service unavailable`; with the write server unreachable a write gets `ERR write server unavailable`.
+  ```text
+  <session>\t<salt hex>\t<new session id>\t<unix seconds>\t<command>
+  ```
 
-The LB never logs request payloads, so passwords are not written to its logs.
+  The leader picks the password salt, the new session ID and the current time once, so every replica applies the entry the same way. The leader answers the client with the result of applying the entry, after NuRaft reports it committed on a majority. Failed commands such as a wrong password are logged too, so the login lockout is the same on every node.
+- **Reads** run on the leader's state and are not logged.
+- **Followers** return `REDIRECT <leader client address>\t<session>`. With no leader yet, a tracker returns `ERR no leader elected yet; retry`. If a write cannot commit in 3 s (for example, no majority), the leader returns `ERR write not committed by a majority; retry`.
+- **Timing:** heartbeat 100 ms, election timeout 400 to 800 ms.
+- **Snapshots:** taken every 1000 entries; older entries are compacted. A lagging follower receives the snapshot in 1 MiB chunks, then the rest of the log.
 
-## Tracker protocol
+### Storage (`tracker/raft_storage.hpp`)
 
-Every application message uses a 4-byte big-endian payload length followed by that many bytes. Payloads above 16 MiB are rejected.
+Each tracker's data directory holds:
 
-The messages below are what travels inside two secure wrappers (details in [SECURITY.md](SECURITY.md)):
+| File | Contents |
+| --- | --- |
+| `raft.log` | Every log entry; appends are fsynced, and truncation or compaction rewrites the file atomically |
+| `state.bin` | Current term and vote |
+| `config.bin` | Cluster membership |
+| `snapshot.bin` | Latest snapshot metadata and serialized tracker state |
 
-- **Client to LB:** a signed X25519 handshake, then the `C` request and its reply sealed with AES-256-GCM under the session key.
-- **LB to tracker and tracker to tracker:** every frame is `<unix-seconds>\t<AES-256-GCM nonce, tag, ciphertext>` under the cluster key, with the timestamp as authenticated data. Frames older than 30 s or that fail to decrypt are refused. The LB only accepts `C` requests from clients, so clients can never send `S`, `P` or `X` frames into the cluster.
+On restart, a tracker loads its snapshot, then NuRaft replays newer committed entries.
 
-Client request and response:
+## Client protocol
+
+Every message uses a 4-byte big-endian payload length followed by that many bytes. Payloads above 16 MiB are rejected. Each client connection is one signed X25519 handshake followed by one request and one reply, both AES-256-GCM sealed (see [SECURITY.md](SECURITY.md)). Inside the seal:
 
 ```text
 C\t<session>\t<command>
 <response-text>\t<session>
 ```
 
-Read servers answer client writes with `ERR read-only server; send writes to the write server`.
+The client tries its last known leader first, follows `REDIRECT`, skips trackers that don't answer, and waits briefly while an election is in progress.
 
-Replication, from the write server to each read server, holding the write server's mutation lock so entries are strictly ordered:
+## Tracker-to-tracker protocol
 
-```text
-S\t<sequence>\t<session>\t<command>
-APPLIED | DUPLICATE | RESYNC
-```
-
-A read server applies only `applied + 1`. Older sequences are `DUPLICATE`. A gap, or an entry that fails against local state, is `RESYNC`, and the write server immediately pushes a full snapshot:
-
-```text
-P\t<sequence>\n<state>
-APPLIED
-```
-
-Snapshot read, used by a restarting write server:
-
-```text
-X\t0\tSNAPSHOT
-SNAPSHOT\t<sequence>\n<state>
-```
+This is NuRaft's own RPC protocol over TCP, wrapped in TLS 1.3 with mutual certificate authentication. Both sides must present a certificate signed by the cluster CA whose subject is `CN=torrent-node-<id>`.
 
 ## Peer protocol
 
@@ -85,9 +76,9 @@ After a piece passes SHA-1 it is written, fsynced, recorded in the resume manife
 
 ## Failure model
 
-- **Read server down.** The write server marks it out of sync and stops sending to it. Writes and reads continue on the other two nodes. A background loop checks both read servers every 250 ms and pushes a snapshot to any that is reachable but behind, so a restarted read server rejoins on its own.
-- **Write server down.** Reads continue from the most advanced read server. Writes fail with `ERR write server unavailable`. There is no election.
-- **Write server restart.** It answers `ERR write server recovering` until a read server responds, then copies the most advanced read server's snapshot and sequence. Read servers at that sequence are marked in sync; others are caught up by snapshot.
-- **Data loss window.** If the write server restarts while the only reachable read server is behind, writes that only the other read server had are lost when that server is resynced.
-- **All trackers down.** State is in memory only, so metadata is lost.
-- The single LB is not replicated.
+- **Leader crash:** a follower times out, wins a vote from the other survivor, and becomes leader. Only a node whose log has every committed entry can win, so no acknowledged write is lost.
+- **Follower crash:** writes continue with the leader plus the other follower, which is still a majority. On restart, the follower catches up from the leader's log, or from a snapshot if the log has been compacted.
+- **Two trackers down:** no majority, so no writes commit. The survivor does not become leader and does not serve reads.
+- **All trackers restarted:** state is rebuilt from each node's snapshot and log on disk.
+- **Network partition:** only the side with a majority can elect a leader and commit. An isolated old leader steps down when its lease expires (about 2 s). Until then it may still answer reads, but its writes cannot commit.
+- **Torn writes:** an incomplete final record in `raft.log` is ignored on load; Raft then re-sends that entry from the leader.

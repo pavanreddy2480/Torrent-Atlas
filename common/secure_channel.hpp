@@ -1,17 +1,15 @@
 #pragma once
 
-// Two secure links on top of the length-prefixed frames in protocol.hpp:
+// Client <-> tracker channel, on top of the length-prefixed frames in
+// protocol.hpp: a one-round-trip handshake per connection. Both sides send a
+// fresh X25519 public key, a random nonce and a timestamp. The tracker signs
+// the whole exchange with the cluster's Ed25519 identity key, which clients
+// know in advance from client.conf. The session key is
+// SHA-256(X25519 secret || transcript), and the request and reply are
+// AES-256-GCM under that key. Fresh keys from both sides make a recorded
+// connection useless to replay.
 //
-// 1. Client <-> load balancer: a one-round-trip handshake per connection.
-//    Both sides send a fresh X25519 public key, a random nonce and a
-//    timestamp. The load balancer signs the whole exchange with its
-//    long-term Ed25519 key, which clients know in advance from client.conf.
-//    The session key is SHA-256(X25519 secret || transcript), and the request
-//    and reply are AES-256-GCM under that key.
-//
-// 2. Load balancer <-> trackers and tracker <-> tracker: every frame is
-//    AES-256-GCM under a shared cluster key, with a timestamp that must be
-//    within 30 seconds.
+// Tracker <-> tracker Raft traffic uses mutual TLS instead (raft_tracker.hpp).
 
 #include "protocol.hpp"
 #include "secure_crypto.hpp"
@@ -20,7 +18,9 @@
 #include <fstream>
 #include <sys/stat.h>
 
-static constexpr long long FRESHNESS_WINDOW_SECONDS = 30;
+// Generous on purpose: replay safety comes from fresh keys and nonces; the
+// timestamp only bounds how long a captured peer request stays usable.
+static constexpr long long FRESHNESS_WINDOW_SECONDS = 300;
 
 inline long long unixSeconds() { return static_cast<long long>(std::time(nullptr)); }
 
@@ -50,52 +50,7 @@ inline bool writeKeyFile(const std::string &path, const std::string &key, bool s
     return !secret || chmod(path.c_str(), 0600) == 0;
 }
 
-// ---- Cluster frames: "<unix-seconds>\t<nonce|tag|ciphertext>" ----
-// AES-256-GCM under the cluster key, with the timestamp as authenticated data,
-// so tracker traffic (which carries passwords on create_user/login) is both
-// private and tamper-proof.
-
-inline std::string clusterSealAt(const std::string &key, const std::string &body,
-                                 long long timestamp) {
-    std::string stamp = std::to_string(timestamp);
-    AesGcmMessage message;
-    if (!aes256GcmEncrypt(key, "cluster|" + stamp, body, message)) return {};
-    return stamp + "\t" + message.nonce + message.tag + message.ciphertext;
-}
-
-inline std::string clusterSeal(const std::string &key, const std::string &body) {
-    return clusterSealAt(key, body, unixSeconds());
-}
-
-inline bool clusterOpen(const std::string &key, const std::string &frame, std::string &body) {
-    std::size_t tab = frame.find('\t');
-    long long timestamp = 0;
-    if (tab == std::string::npos || frame.size() < tab + 1 + 28 ||
-        !parseFreshTimestamp(frame.substr(0, tab), timestamp))
-        return false;
-    AesGcmMessage message{frame.substr(tab + 1, 12), frame.substr(tab + 29),
-                          frame.substr(tab + 13, 16)};
-    return aes256GcmDecrypt(key, "cluster|" + frame.substr(0, tab), message, body);
-}
-
-inline bool clusterSend(int fd, const std::string &key, const std::string &body) {
-    return sendFrame(fd, clusterSeal(key, body));
-}
-
-inline bool clusterReceive(int fd, const std::string &key, std::string &body) {
-    std::string frame;
-    return receiveFrame(fd, frame) && clusterOpen(key, frame, body);
-}
-
-inline bool clusterCall(const Endpoint &endpoint, const std::string &key,
-                        const std::string &request, std::string &response,
-                        int timeoutSeconds = 2) {
-    UniqueFd fd(connectTcp(endpoint.ip, endpoint.port, timeoutSeconds));
-    return fd && clusterSend(fd.get(), key, request) &&
-           clusterReceive(fd.get(), key, response);
-}
-
-// ---- Client <-> load balancer channel ----
+// ---- Client <-> tracker channel ----
 
 inline std::string handshakeTranscript(const std::string &clientHello,
                                        const std::string &serverFields) {
@@ -149,7 +104,7 @@ inline bool clientHandshake(int fd, const std::string &serverPublicKey,
     return sessionKey.size() == 32;
 }
 
-// Server side (load balancer).
+// Server side (tracker).
 inline bool serverHandshake(int fd, const std::string &identityPrivateKey,
                             std::string &sessionKey) {
     std::string hello;
@@ -181,15 +136,15 @@ inline bool serverHandshake(int fd, const std::string &identityPrivateKey,
     return sessionKey.size() == 32;
 }
 
-// One encrypted request/response with the load balancer.
-inline bool secureLbCall(const Endpoint &endpoint, const std::string &serverPublicKey,
+// One encrypted request/response with a tracker.
+inline bool secureTrackerCall(const Endpoint &endpoint, const std::string &serverPublicKey,
                          const std::string &request, std::string &response,
                          int timeoutSeconds = 5) {
     UniqueFd fd(connectTcp(endpoint.ip, endpoint.port, timeoutSeconds));
     std::string sessionKey;
     bool ok = fd && clientHandshake(fd.get(), serverPublicKey, sessionKey) &&
-              sealedSend(fd.get(), sessionKey, "client->lb", request) &&
-              sealedReceive(fd.get(), sessionKey, "lb->client", response);
+              sealedSend(fd.get(), sessionKey, "client->tracker", request) &&
+              sealedReceive(fd.get(), sessionKey, "tracker->client", response);
     secureErase(sessionKey);
     return ok;
 }
