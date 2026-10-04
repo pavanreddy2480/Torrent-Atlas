@@ -23,7 +23,7 @@ The trackers form a [NuRaft](https://github.com/eBay/NuRaft) cluster. One tracke
 - **Failover:** if the leader dies, the other two elect a new one in about a second. If two of three are down, the last one refuses writes rather than risk losing them.
 - **Restarts:** each tracker keeps its log, term, vote and snapshots in its data directory, so a crashed or restarted tracker rejoins and catches up from the leader's log or snapshot.
 
-File bytes never pass through the trackers. For wire formats and failure handling, see [ARCHITECTURE.md](ARCHITECTURE.md); for keys and encryption, see [SECURITY.md](SECURITY.md).
+File bytes never pass through the trackers. Full overview: [PROJECT.md](PROJECT.md). How the distributed parts work: [DESIGN.md](DESIGN.md). Keys and encryption: [SECURITY.md](SECURITY.md).
 
 ## Build and test
 
@@ -115,11 +115,12 @@ The tradeoff: every write waits for a majority to store it, which costs one netw
 - Reads are served by the leader only. A leader that is cut off keeps answering reads until its lease expires (about two seconds), so a read in that window can be slightly stale.
 - A file capability is a long-lived per-file key: anyone who has it can download or seed that file. See [SECURITY.md](SECURITY.md).
 - SHA-1 is kept for piece and file integrity for compatibility; it is not recommended for new designs.
-- A seeder that crashes without `logout` stays listed until it reconnects; downloads still succeed by retrying other peers.
+- A seeder that crashes without `logout` stays listed until that user logs out or stops sharing; downloads still succeed by retrying other peers.
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): architecture, routing, protocol, and recovery.
+- [PROJECT.md](PROJECT.md): complete project overview.
+- [DESIGN.md](DESIGN.md): distributed design, with diagrams.
+- [SECURITY.md](SECURITY.md): security design, with diagrams.
 - [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md): implementation choices and tradeoffs.
-- [SECURITY.md](SECURITY.md): threat model and cryptographic notes.
-- `design.pdf`: original assignment specification.
+- `docs/design.pdf`: original assignment specification.

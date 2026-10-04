@@ -65,6 +65,33 @@ int main() {
     assert(cleanRestart.handle(0, "login eve secret", false).response ==
            "ERR too many login attempts; try again later");
 
+    // Access control: login required, members-only files, owner-only admin.
+    {
+        TrackerState acl;
+        acl.handle(0, "create_user owner pw", false);
+        acl.handle(0, "create_user outsider pw", false);
+        u64 owner = acl.handle(0, "login owner pw", false).session;
+        u64 outsider = acl.handle(0, "login outsider pw", false).session;
+        assert(acl.handle(0, "create_group secret", false).response == "ERR login required");
+        assert(acl.handle(owner, "create_group secret", false).response == "OK group created");
+        std::string upload = "upload_file secret " + hexEncode("a.txt") + " 0 "
+            "0123456789abcdef0123456789abcdef01234567 " + std::string(64, 'a') +
+            " - 127.0.0.1 9000";
+        assert(acl.handle(owner, upload, false).response.rfind("OK file shared", 0) == 0);
+        assert(acl.handle(outsider, "list_files secret", false).response ==
+               "ERR not a group member");
+        assert(acl.handle(outsider, "download_file secret " + hexEncode("a.txt"), false)
+                   .response == "ERR not a group member");
+        assert(acl.handle(outsider, upload, false).response == "ERR not a group member");
+        assert(acl.handle(outsider, "join_group secret", false).response == "OK join requested");
+        assert(acl.handle(outsider, "accept_request secret outsider", false).response ==
+               "ERR only owner may accept requests");
+        assert(acl.handle(outsider, "list_requests secret", false).response ==
+               "ERR only owner may list requests");
+        assert(acl.handle(owner, "leave_group secret", false).response ==
+               "ERR owner cannot leave group");
+    }
+
     // Raft replicas must reach identical state from identical log entries:
     // all randomness and time come from the entry, not the replica.
     {
