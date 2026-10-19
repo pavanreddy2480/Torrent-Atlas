@@ -1,6 +1,6 @@
 // client <peer IP:PORT> <client.conf>
 
-#include "client.hpp"
+#include "client/client.hpp"
 
 #include <iostream>
 

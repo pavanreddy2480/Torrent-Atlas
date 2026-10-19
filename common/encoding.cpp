@@ -1,4 +1,4 @@
-#include "encoding.hpp"
+#include "common/encoding.hpp"
 
 #include <algorithm>
 #include <cctype>

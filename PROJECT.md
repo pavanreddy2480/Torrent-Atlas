@@ -43,23 +43,27 @@ Related documents:
 
 ## 2. Components
 
-Each program is split into small classes, one per job, with a header (`.hpp`) for the interface and a source file (`.cpp`) for the code. The build compiles them into three libraries (`torrent_common`, `tracker_core`, `client_core`) that the programs and the tests link against.
+Each program is split into small classes, grouped into subfolders by area,, one per job, with a header (`.hpp`) for the interface and a source file (`.cpp`) for the code. The build compiles them into three libraries (`torrent_common`, `tracker_core`, `client_core`) that the programs and the tests link against.
 
 ### 2.1 Tracker (`tracker/`)
+
+`state/` holds the tracker's data and commands; `raft/` holds everything that replicates it.
 
 | File | Role |
 | --- | --- |
 | `main.cpp` | Entry point: `tracker <cluster.conf> <node-id> <keys-dir> <data-dir>`. Loads config and keys, starts a `RaftNode`, and serves clients with a `TcpServer` over `SecureChannel`. |
-| `tracker_state` | `TrackerState`: users, password hashes, sessions, login lockouts, groups, membership, files and seeders. Every command is one method, picked from a table that also says whether it needs a login and whether it changes state. Deterministic, so every replica computes the same result. |
-| `state_snapshot.cpp` | `TrackerState::serialize` and `restore`: the snapshot text format. |
-| `password` | PBKDF2 password hashing and checking. |
-| `log_command` | `LogCommand`: a client command plus its salt, session ID and time, as stored in the Raft log. |
-| `raft_node` | `RaftNode`: runs the tracker as a NuRaft node. Turns writes into log entries, answers reads, redirects clients to the leader, configures mutual TLS. |
-| `state_machine` | `TrackerStateMachine`: NuRaft's view of `TrackerState`. Applies committed entries and saves, sends and installs snapshots. |
-| `raft_storage` | `FileLogStore` and `FileStateManager`: the durable Raft log, term/vote and membership. |
-| `storage_io` | fsynced and atomic file writes, and NuRaft buffer conversions. |
+| `state/tracker_state` | `TrackerState`: users, password hashes, sessions, login lockouts, groups, membership, files and seeders. Every command is one method, picked from a table that also says whether it needs a login and whether it changes state. Deterministic, so every replica computes the same result. |
+| `state/state_snapshot.cpp` | `TrackerState::serialize` and `restore`: the snapshot text format. |
+| `state/password` | PBKDF2 password hashing and checking. |
+| `raft/log_command` | `LogCommand`: a client command plus its salt, session ID and time, as stored in the Raft log. |
+| `raft/raft_node` | `RaftNode`: runs the tracker as a NuRaft node. Turns writes into log entries, answers reads, redirects clients to the leader, configures mutual TLS. |
+| `raft/state_machine` | `TrackerStateMachine`: NuRaft's view of `TrackerState`. Applies committed entries and saves, sends and installs snapshots. |
+| `raft/raft_storage` | `FileLogStore` and `FileStateManager`: the durable Raft log, term/vote and membership. |
+| `raft/storage_io` | fsynced and atomic file writes, and NuRaft buffer conversions. |
 
 ### 2.2 Client (`client/`)
+
+The prompt and tracker connection sit at the top; `peer/` talks to other peers, `download/` runs downloads, `storage/` handles files on disk.
 
 | File | Role |
 | --- | --- |
@@ -67,32 +71,34 @@ Each program is split into small classes, one per job, with a header (`.hpp`) fo
 | `client` | `Client`: the command prompt. Owns every other part and sends each command to the right one. |
 | `command_line` | `CommandLine`: splits typed input (quotes, escapes) and accepts both `create user` and `create_user`. |
 | `tracker_client` | `TrackerClient`: requests to the tracker cluster, following leader redirects and keeping the session ID. |
-| `shared_files` | `SharedFiles`: the files this client seeds, complete or partly downloaded. |
-| `peer_server` | `PeerServer`: answers other peers' bitmap and piece requests. |
-| `peer_client` | `PeerClient`: asks a seeder for its bitmap or a piece and checks the piece hash. |
-| `peer_protocol` | The encrypted peer-to-peer message format, shared by both sides. |
-| `peer_stats` | `PeerStats`: per-peer successes, failures and speed for `show peers`. |
-| `download` | `Download`: one download, from resume check to rarest-first parallel fetch to the final hash check. |
-| `download_manager` | `DownloadManager`: starts, lists, measures and cancels downloads. |
-| `piece_file` | `PieceFile`: reads, writes and hashes a file one 512 KiB piece at a time. |
-| `resume_manifest` | `ResumeManifest`: the `<dest>.resume` file that lets a download continue. |
-| `local_file.hpp` | `LocalFile`: a seeded file's path, metadata and available pieces. |
+| `storage/shared_files` | `SharedFiles`: the files this client seeds, complete or partly downloaded. |
+| `peer/peer_server` | `PeerServer`: answers other peers' bitmap and piece requests. |
+| `peer/peer_client` | `PeerClient`: asks a seeder for its bitmap or a piece and checks the piece hash. |
+| `peer/peer_protocol` | The encrypted peer-to-peer message format, shared by both sides. |
+| `peer/peer_stats` | `PeerStats`: per-peer successes, failures and speed for `show peers`. |
+| `download/download` | `Download`: one download, from resume check to rarest-first parallel fetch to the final hash check. |
+| `download/download_manager` | `DownloadManager`: starts, lists, measures and cancels downloads. |
+| `storage/piece_file` | `PieceFile`: reads, writes and hashes a file one 512 KiB piece at a time. |
+| `download/resume_manifest` | `ResumeManifest`: the `<dest>.resume` file that lets a download continue. |
+| `storage/local_file.hpp` | `LocalFile`: a seeded file's path, metadata and available pieces. |
 
 ### 2.3 Shared code (`common/`)
 
+`net/` is sockets and the secure tracker channel, `crypto/` wraps OpenSSL, `config/` reads config files and creates keys.
+
 | File | Role |
 | --- | --- |
-| `net` | `Endpoint` (IPv4 address and port) and `Socket` (RAII socket with length-prefixed frames). |
-| `tcp_server` | `TcpServer`: accepts connections and handles each one on its own thread. Used by the tracker and the peer server. |
-| `crypto` | OpenSSL wrappers: random bytes, SHA-1, SHA-256, PBKDF2, AES-256-GCM, Ed25519, X25519. |
-| `secure_channel` | `SecureChannel`: the client-to-tracker handshake and the sealed request and reply. |
+| `net/net` | `Endpoint` (IPv4 address and port) and `Socket` (RAII socket with length-prefixed frames). |
+| `net/tcp_server` | `TcpServer`: accepts connections and handles each one on its own thread. Used by the tracker and the peer server. |
+| `crypto/crypto` | OpenSSL wrappers: random bytes, SHA-1, SHA-256, PBKDF2, AES-256-GCM, Ed25519, X25519. |
+| `net/secure_channel` | `SecureChannel`: the client-to-tracker handshake and the sealed request and reply. |
 | `file_metadata` | `FileMetadata`: a file's size, hashes and capability, with validation. |
-| `cluster_config` | `ClusterConfig`: parses `cluster.conf`. |
-| `client_config` | `ClientConfig`: reads and writes `client.conf`. |
-| `cluster_keys` | Creates the CA, node certificates, signing key and `client.conf`; `NodeKeys` loads one node's keys. |
+| `config/cluster_config` | `ClusterConfig`: parses `cluster.conf`. |
+| `config/client_config` | `ClientConfig`: reads and writes `client.conf`. |
+| `config/cluster_keys` | Creates the CA, node certificates, signing key and `client.conf`; `NodeKeys` loads one node's keys. |
 | `encoding` | Hex, decimal parsing, split and join. |
-| `freshness.hpp` | The five-minute timestamp window for handshakes and peer requests. |
-| `openssl_ptr.hpp` | `std::unique_ptr` for OpenSSL objects. |
+| `net/freshness.hpp` | The five-minute timestamp window for handshakes and peer requests. |
+| `crypto/openssl_ptr.hpp` | `std::unique_ptr` for OpenSSL objects. |
 
 ### 2.4 Tools (`tools/`)
 
@@ -193,8 +199,16 @@ If the same file (same size and hashes) is already shared in the group, the trac
 │   ├── cluster.conf        the three trackers: id, client address, Raft address
 │   └── client.conf         tracker addresses (+ public key after keygen)
 ├── client/                 client program
+│   ├── peer/               peer server, peer requests, peer stats
+│   ├── download/           downloads and resume manifests
+│   └── storage/            piece files and the list of seeded files
 ├── tracker/                tracker program (Raft node)
-├── common/                 shared networking, crypto and config code
+│   ├── state/              users, groups, files, passwords, snapshots
+│   └── raft/               NuRaft node, log, storage, state machine
+├── common/                 shared code
+│   ├── net/                sockets, TCP server, secure tracker channel
+│   ├── crypto/             OpenSSL wrappers
+│   └── config/             cluster.conf, client.conf, key generation
 ├── tools/keygen.cpp        key and certificate generator
 ├── tests/                  unit and integration tests (CTest)
 ├── PROJECT.md              this file

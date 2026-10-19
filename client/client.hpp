@@ -3,12 +3,12 @@
 // The peer program: a command prompt, a peer server that seeds files, and the
 // downloads in progress.
 
-#include "command_line.hpp"
-#include "download_manager.hpp"
-#include "peer_server.hpp"
-#include "peer_stats.hpp"
-#include "shared_files.hpp"
-#include "tracker_client.hpp"
+#include "client/command_line.hpp"
+#include "client/download/download_manager.hpp"
+#include "client/peer/peer_server.hpp"
+#include "client/peer/peer_stats.hpp"
+#include "client/storage/shared_files.hpp"
+#include "client/tracker_client.hpp"
 
 #include <istream>
 #include <ostream>

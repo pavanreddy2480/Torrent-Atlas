@@ -4,7 +4,7 @@
 // its size, SHA-1 of the whole file and of every 512 KiB piece, and the
 // capability, a random 256-bit key that peers use to encrypt piece traffic.
 
-#include "encoding.hpp"
+#include "common/encoding.hpp"
 
 #include <string>
 #include <vector>

@@ -1,6 +1,6 @@
-#include "../common/crypto.hpp"
-#include "../common/encoding.hpp"
-#include "../common/secure_channel.hpp"
+#include "common/crypto/crypto.hpp"
+#include "common/encoding.hpp"
+#include "common/net/secure_channel.hpp"
 
 #include <cassert>
 #include <iostream>

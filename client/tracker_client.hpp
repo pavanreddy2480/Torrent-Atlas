@@ -4,8 +4,8 @@
 // REDIRECTs, skips trackers that are down, waits briefly while the cluster
 // elects a leader, and remembers the session ID the tracker hands out.
 
-#include "../common/client_config.hpp"
-#include "../common/file_metadata.hpp"
+#include "common/config/client_config.hpp"
+#include "common/file_metadata.hpp"
 
 #include <mutex>
 #include <string>

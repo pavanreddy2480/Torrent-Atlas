@@ -2,7 +2,7 @@
 // Creates the cluster CA, one TLS certificate per tracker, the trackers'
 // client-handshake identity key, and the client config. See cluster_keys.hpp.
 
-#include "../common/cluster_keys.hpp"
+#include "common/config/cluster_keys.hpp"
 
 #include <iostream>
 

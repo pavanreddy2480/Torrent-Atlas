@@ -2,10 +2,10 @@
 
 // Starts and talks to a local 3-node tracker cluster for integration tests.
 
-#include "../common/client_config.hpp"
-#include "../common/encoding.hpp"
-#include "../common/cluster_keys.hpp"
-#include "../common/secure_channel.hpp"
+#include "common/config/client_config.hpp"
+#include "common/encoding.hpp"
+#include "common/config/cluster_keys.hpp"
+#include "common/net/secure_channel.hpp"
 
 #include <arpa/inet.h>
 #include <fstream>

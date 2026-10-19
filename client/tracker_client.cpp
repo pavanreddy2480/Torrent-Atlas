@@ -1,6 +1,6 @@
-#include "tracker_client.hpp"
+#include "client/tracker_client.hpp"
 
-#include "../common/secure_channel.hpp"
+#include "common/net/secure_channel.hpp"
 
 #include <chrono>
 #include <sstream>

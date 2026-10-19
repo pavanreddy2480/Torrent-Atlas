@@ -1,5 +1,5 @@
-#include "../client/piece_file.hpp"
-#include "../client/resume_manifest.hpp"
+#include "client/storage/piece_file.hpp"
+#include "client/download/resume_manifest.hpp"
 
 #include <cassert>
 #include <fstream>

@@ -2,7 +2,7 @@
 // catch-up, durability, and the security of both channels.
 #include "cluster_test_support.hpp"
 
-#include "../common/crypto.hpp"
+#include "common/crypto/crypto.hpp"
 
 #include <cstdlib>
 #include <iostream>

@@ -1,6 +1,6 @@
 #include "cluster_test_support.hpp"
 
-#include "../common/file_metadata.hpp"
+#include "common/file_metadata.hpp"
 
 #include <algorithm>
 #include <cstdlib>

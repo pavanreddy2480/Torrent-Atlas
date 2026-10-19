@@ -1,10 +1,10 @@
 // tracker <cluster.conf> <node-id> <keys-dir> <data-dir>
 // Runs one tracker node. Type "quit" on stdin to stop it.
 
-#include "raft_node.hpp"
+#include "tracker/raft/raft_node.hpp"
 
-#include "../common/secure_channel.hpp"
-#include "../common/tcp_server.hpp"
+#include "common/net/secure_channel.hpp"
+#include "common/net/tcp_server.hpp"
 
 #include <filesystem>
 #include <iostream>

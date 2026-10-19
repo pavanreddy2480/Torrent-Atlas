@@ -1,8 +1,8 @@
-#include "client.hpp"
+#include "client/client.hpp"
 
-#include "piece_file.hpp"
+#include "client/storage/piece_file.hpp"
 
-#include "../common/crypto.hpp"
+#include "common/crypto/crypto.hpp"
 
 #include <filesystem>
 

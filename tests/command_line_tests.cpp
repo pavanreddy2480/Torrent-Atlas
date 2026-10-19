@@ -1,4 +1,4 @@
-#include "../client/command_line.hpp"
+#include "client/command_line.hpp"
 
 #include <cassert>
 #include <iostream>

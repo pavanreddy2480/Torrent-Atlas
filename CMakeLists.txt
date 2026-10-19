@@ -51,29 +51,31 @@ endfunction()
 
 # Code shared by every program: networking, crypto, configuration and keys.
 add_library(torrent_common STATIC
-  common/client_config.cpp
-  common/cluster_config.cpp
-  common/cluster_keys.cpp
-  common/crypto.cpp
+  common/config/client_config.cpp
+  common/config/cluster_config.cpp
+  common/config/cluster_keys.cpp
+  common/crypto/crypto.cpp
   common/encoding.cpp
   common/file_metadata.cpp
-  common/net.cpp
-  common/secure_channel.cpp
-  common/tcp_server.cpp
+  common/net/net.cpp
+  common/net/secure_channel.cpp
+  common/net/tcp_server.cpp
 )
+# Includes are written from the repository root, e.g. "common/net/net.hpp".
+target_include_directories(torrent_common PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(torrent_common PUBLIC OpenSSL::Crypto Threads::Threads)
 torrent_warnings(torrent_common)
 
 # Everything in the tracker except main(), so tests can use it.
 add_library(tracker_core STATIC
-  tracker/log_command.cpp
-  tracker/password.cpp
-  tracker/raft_node.cpp
-  tracker/raft_storage.cpp
-  tracker/state_machine.cpp
-  tracker/state_snapshot.cpp
-  tracker/storage_io.cpp
-  tracker/tracker_state.cpp
+  tracker/raft/log_command.cpp
+  tracker/raft/raft_node.cpp
+  tracker/raft/raft_storage.cpp
+  tracker/raft/state_machine.cpp
+  tracker/raft/storage_io.cpp
+  tracker/state/password.cpp
+  tracker/state/state_snapshot.cpp
+  tracker/state/tracker_state.cpp
 )
 target_link_libraries(tracker_core PUBLIC torrent_common torrent_raft)
 torrent_warnings(tracker_core)
@@ -82,15 +84,15 @@ torrent_warnings(tracker_core)
 add_library(client_core STATIC
   client/client.cpp
   client/command_line.cpp
-  client/download.cpp
-  client/download_manager.cpp
-  client/peer_client.cpp
-  client/peer_protocol.cpp
-  client/peer_server.cpp
-  client/peer_stats.cpp
-  client/piece_file.cpp
-  client/resume_manifest.cpp
-  client/shared_files.cpp
+  client/download/download.cpp
+  client/download/download_manager.cpp
+  client/download/resume_manifest.cpp
+  client/peer/peer_client.cpp
+  client/peer/peer_protocol.cpp
+  client/peer/peer_server.cpp
+  client/peer/peer_stats.cpp
+  client/storage/piece_file.cpp
+  client/storage/shared_files.cpp
   client/tracker_client.cpp
 )
 target_link_libraries(client_core PUBLIC torrent_common)

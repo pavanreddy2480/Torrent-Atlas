@@ -1,5 +1,5 @@
-#include "../tracker/log_command.hpp"
-#include "../tracker/tracker_state.hpp"
+#include "tracker/raft/log_command.hpp"
+#include "tracker/state/tracker_state.hpp"
 
 #include <cassert>
 #include <iostream>

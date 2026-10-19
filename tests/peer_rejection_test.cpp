@@ -1,4 +1,4 @@
-#include "../common/net.hpp"
+#include "common/net/net.hpp"
 
 #include <arpa/inet.h>
 #include <sys/socket.h>

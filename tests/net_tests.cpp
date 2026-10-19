@@ -1,6 +1,6 @@
-#include "../common/encoding.hpp"
-#include "../common/file_metadata.hpp"
-#include "../common/net.hpp"
+#include "common/encoding.hpp"
+#include "common/file_metadata.hpp"
+#include "common/net/net.hpp"
 
 #include <arpa/inet.h>
 #include <cassert>
