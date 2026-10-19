@@ -4,6 +4,8 @@ project(Torrent LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# build/compile_commands.json tells clangd (VS Code) the include paths and flags.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(TORRENT_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
 find_package(Threads REQUIRED)
