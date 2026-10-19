@@ -1,4 +1,7 @@
-#include "../common/protocol.hpp"
+#include "../common/net.hpp"
+
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
 #include <cassert>
 #include <chrono>
@@ -11,28 +14,24 @@
 #include <unistd.h>
 
 static int unusedPort() {
-    UniqueFd fd(socket(AF_INET, SOCK_STREAM, 0));
-    if (!fd) return -1;
+    Socket socket(::socket(AF_INET, SOCK_STREAM, 0));
+    if (!socket) return -1;
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    if (bind(fd.get(), reinterpret_cast<sockaddr *>(&address),
-             sizeof(address)) != 0)
-        return -1;
     socklen_t length = sizeof(address);
-    if (getsockname(fd.get(), reinterpret_cast<sockaddr *>(&address),
-                    &length) != 0)
+    if (bind(socket.fd(), reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+        getsockname(socket.fd(), reinterpret_cast<sockaddr *>(&address), &length) != 0)
         return -1;
     return ntohs(address.sin_port);
 }
 
 static std::string request(const std::string &payload, int port) {
-    UniqueFd fd(connectTcp("127.0.0.1", port));
-    assert(fd);
+    Socket socket = Socket::connect({"127.0.0.1", port});
+    assert(socket);
     std::string response;
-    assert(sendFrame(fd.get(), payload));
-    assert(receiveFrame(fd.get(), response));
+    assert(socket.sendFrame(payload));
+    assert(socket.receiveFrame(response));
     return response;
 }
 
@@ -69,8 +68,7 @@ int main(int argc, char **argv) {
     close(inputPipe[0]);
     bool listening = false;
     for (int attempt = 0; attempt < 100; ++attempt) {
-        UniqueFd fd(connectTcp("127.0.0.1", peerPort, 1));
-        if (fd) {
+        if (Socket::connect({"127.0.0.1", peerPort}, 1)) {
             listening = true;
             break;
         }

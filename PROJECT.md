@@ -43,36 +43,56 @@ Related documents:
 
 ## 2. Components
 
+Each program is split into small classes, one per job, with a header (`.hpp`) for the interface and a source file (`.cpp`) for the code. The build compiles them into three libraries (`torrent_common`, `tracker_core`, `client_core`) that the programs and the tests link against.
+
 ### 2.1 Tracker (`tracker/`)
 
 | File | Role |
 | --- | --- |
-| `tracker.cpp` | Entry point: `tracker <cluster.conf> <node-id> <keys-dir> <data-dir>` |
-| `tracker_state.hpp` | The metadata itself: users, password hashes, sessions, login lockouts, groups, membership, files and seeders. Deterministic, so every replica computes the same result. |
-| `raft_tracker.hpp` | Runs the tracker as a NuRaft node. Turns writes into log entries, answers reads, redirects clients to the leader, configures mutual TLS. |
-| `raft_storage.hpp` | Durable Raft storage: log file, term/vote, membership, snapshots. |
+| `main.cpp` | Entry point: `tracker <cluster.conf> <node-id> <keys-dir> <data-dir>`. Loads config and keys, starts a `RaftNode`, and serves clients with a `TcpServer` over `SecureChannel`. |
+| `tracker_state` | `TrackerState`: users, password hashes, sessions, login lockouts, groups, membership, files and seeders. Every command is one method, picked from a table that also says whether it needs a login and whether it changes state. Deterministic, so every replica computes the same result. |
+| `state_snapshot.cpp` | `TrackerState::serialize` and `restore`: the snapshot text format. |
+| `password` | PBKDF2 password hashing and checking. |
+| `log_command` | `LogCommand`: a client command plus its salt, session ID and time, as stored in the Raft log. |
+| `raft_node` | `RaftNode`: runs the tracker as a NuRaft node. Turns writes into log entries, answers reads, redirects clients to the leader, configures mutual TLS. |
+| `state_machine` | `TrackerStateMachine`: NuRaft's view of `TrackerState`. Applies committed entries and saves, sends and installs snapshots. |
+| `raft_storage` | `FileLogStore` and `FileStateManager`: the durable Raft log, term/vote and membership. |
+| `storage_io` | fsynced and atomic file writes, and NuRaft buffer conversions. |
 
 ### 2.2 Client (`client/`)
 
 | File | Role |
 | --- | --- |
-| `client.cpp` | Command shell, tracker requests (with leader redirect), the peer server that seeds files, and the parallel downloader. |
-| `download_storage.cpp` | Hashing files, writing pieces, and resume manifests. |
-| `network_utils.cpp` | Reads `client.conf` (tracker list plus the cluster's public key). |
-| `command_utils.cpp` | Accepts both `create user` and `create_user` spellings, and hides passwords when logging commands. |
-| `telemetry.cpp` | Timing, retry back-off and failure counters for `stats`. |
+| `main.cpp` | Entry point: `client <peer IP:PORT> <client.conf>`. |
+| `client` | `Client`: the command prompt. Owns every other part and sends each command to the right one. |
+| `command_line` | `CommandLine`: splits typed input (quotes, escapes) and accepts both `create user` and `create_user`. |
+| `tracker_client` | `TrackerClient`: requests to the tracker cluster, following leader redirects and keeping the session ID. |
+| `shared_files` | `SharedFiles`: the files this client seeds, complete or partly downloaded. |
+| `peer_server` | `PeerServer`: answers other peers' bitmap and piece requests. |
+| `peer_client` | `PeerClient`: asks a seeder for its bitmap or a piece and checks the piece hash. |
+| `peer_protocol` | The encrypted peer-to-peer message format, shared by both sides. |
+| `peer_stats` | `PeerStats`: per-peer successes, failures and speed for `show peers`. |
+| `download` | `Download`: one download, from resume check to rarest-first parallel fetch to the final hash check. |
+| `download_manager` | `DownloadManager`: starts, lists, measures and cancels downloads. |
+| `piece_file` | `PieceFile`: reads, writes and hashes a file one 512 KiB piece at a time. |
+| `resume_manifest` | `ResumeManifest`: the `<dest>.resume` file that lets a download continue. |
+| `local_file.hpp` | `LocalFile`: a seeded file's path, metadata and available pieces. |
 
 ### 2.3 Shared code (`common/`)
 
 | File | Role |
 | --- | --- |
-| `protocol.hpp` | Length-prefixed TCP framing, endpoint parsing, hex helpers, and the list of commands that change state. |
-| `secure_crypto.hpp` | OpenSSL wrappers: random bytes, PBKDF2, AES-256-GCM, SHA-256, HMAC, Ed25519, X25519. |
-| `secure_channel.hpp` | The client-to-tracker handshake and the sealed request and reply. |
-| `cluster_config.hpp` | Parses `cluster.conf`. |
-| `cluster_keys.hpp` | Creates the CA, node certificates, signing key and `client.conf`. |
-| `sha1.hpp` | SHA-1 for piece and file integrity. |
-| `command_parser.hpp` | Splits shell input, handling quotes and escapes. |
+| `net` | `Endpoint` (IPv4 address and port) and `Socket` (RAII socket with length-prefixed frames). |
+| `tcp_server` | `TcpServer`: accepts connections and handles each one on its own thread. Used by the tracker and the peer server. |
+| `crypto` | OpenSSL wrappers: random bytes, SHA-1, SHA-256, PBKDF2, AES-256-GCM, Ed25519, X25519. |
+| `secure_channel` | `SecureChannel`: the client-to-tracker handshake and the sealed request and reply. |
+| `file_metadata` | `FileMetadata`: a file's size, hashes and capability, with validation. |
+| `cluster_config` | `ClusterConfig`: parses `cluster.conf`. |
+| `client_config` | `ClientConfig`: reads and writes `client.conf`. |
+| `cluster_keys` | Creates the CA, node certificates, signing key and `client.conf`; `NodeKeys` loads one node's keys. |
+| `encoding` | Hex, decimal parsing, split and join. |
+| `freshness.hpp` | The five-minute timestamp window for handshakes and peer requests. |
+| `openssl_ptr.hpp` | `std::unique_ptr` for OpenSSL objects. |
 
 ### 2.4 Tools (`tools/`)
 
@@ -108,7 +128,7 @@ The client prints a `>` prompt. Every command accepts both `create user` and `cr
 | `download file <group> <name> <dest>` | Download from the group's peers | Members |
 | `resume download <group> <name> <dest>` | Continue an interrupted download | Members |
 | `show downloads` | `[D]` downloading, `[C]` complete, `[F]` failed, with progress | Local |
-| `stats` | Speed, ETA, peers, retries, time spent in crypto, network and disk | Local |
+| `stats` | Progress, speed, ETA, responsive peers and retries for each download | Local |
 | `show peers` | Per-peer successes, failures and throughput | Local |
 | `cancel download <name>` | Stop a download; resume data is kept | Local |
 | `stop share <group> <name>` | Stop seeding a file | Seeder |
@@ -174,7 +194,7 @@ If the same file (same size and hashes) is already shared in the group, the trac
 │   └── client.conf         tracker addresses (+ public key after keygen)
 ├── client/                 client program
 ├── tracker/                tracker program (Raft node)
-├── common/                 shared protocol, crypto and config code
+├── common/                 shared networking, crypto and config code
 ├── tools/keygen.cpp        key and certificate generator
 ├── tests/                  unit and integration tests (CTest)
 ├── PROJECT.md              this file
@@ -225,11 +245,11 @@ ctest --test-dir build --output-on-failure
 
 | Test | Covers |
 | --- | --- |
-| `security_tests` | SHA-1, SHA-256, HMAC and PBKDF2 known answers; AES-GCM tampering; Ed25519; X25519; handshake success and wrong-key failure |
+| `net_tests` | Endpoint, number and hex parsing; frame limits |
+| `security_tests` | SHA-1, SHA-256 and PBKDF2 known answers; AES-GCM tampering; Ed25519; X25519; handshake success and wrong-key failure |
+| `command_line_tests` | Quoting, escaping and two-word command names |
+| `resume_tests` | Resume manifests, file hashing, piece reads and writes |
 | `tracker_state_tests` | Tracker commands; access control (login, member-only, owner-only); lockout; snapshots; replicas agree when applying the same log |
-| `command_parser_tests` | Quoting and escaping |
-| `protocol_tests` | Frame and endpoint parsing |
-| `download_storage_tests` | Hashing, piece writes, resume manifests |
 | `tracker_integration_tests` | 3-node cluster: redirects, leader crash, no-majority refusal, rejoin, full restart, plain-text, wrong-key and replay attacks, non-TLS Raft peer |
 | `client_integration_tests` | Full upload and encrypted multi-peer download through the cluster, `show downloads`, retry after a seeder leaves |
 | `peer_rejection_test` | Malformed and unauthorized peer requests |

@@ -2,7 +2,16 @@
 
 // Starts and talks to a local 3-node tracker cluster for integration tests.
 
+#include "../common/client_config.hpp"
+#include "../common/encoding.hpp"
 #include "../common/cluster_keys.hpp"
+#include "../common/secure_channel.hpp"
+
+#include <arpa/inet.h>
+#include <fstream>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -32,8 +41,7 @@ inline int unusedPort() {
 
 inline bool waitForListener(int port) {
     for (int attempt = 0; attempt < 200; ++attempt) {
-        UniqueFd fd(connectTcp("127.0.0.1", port, 1));
-        if (fd) return true;
+        if (Socket::connect({"127.0.0.1", port}, 1)) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
     return false;
@@ -74,13 +82,11 @@ public:
                        << ports[id + 2] << '\n';
         }
         std::string error;
-        if (!readClusterConfig(conf, members) ||
-            !generateClusterKeys(members, keys, clientConf, error))
+        std::optional<ClusterConfig> cluster = ClusterConfig::load(conf);
+        if (!cluster || !generateClusterKeys(*cluster, keys, clientConf, error))
             throw std::runtime_error("cluster setup failed: " + error);
-        std::ifstream input(clientConf);
-        std::string token, last;
-        while (input >> token) last = token;
-        hexDecode(last, publicKey);
+        members = cluster->members();
+        publicKey = ClientConfig::load(clientConf)->trackerPublicKey;
         pids_.assign(members.size(), -1);
         return true;
     }
@@ -123,8 +129,8 @@ public:
     bool requestTo(std::size_t node, u64 session, const std::string &command, Response &out,
                    const std::string &pinnedKey = "") {
         std::string response;
-        if (!secureTrackerCall(members[node].client, pinnedKey.empty() ? publicKey : pinnedKey,
-                               "C\t" + std::to_string(session) + "\t" + command, response))
+        if (!callTracker(members[node].client, pinnedKey.empty() ? publicKey : pinnedKey,
+                         "C\t" + std::to_string(session) + "\t" + command, response))
             return false;
         std::size_t tab = response.rfind('\t');
         out.text = response.substr(0, tab);
@@ -141,6 +147,7 @@ public:
                 if (!requestTo(node, session, command, out)) continue;
                 if (out.text.rfind("REDIRECT", 0) == 0) continue;
                 if (out.text.rfind("ERR no leader", 0) == 0 ||
+                    out.text.rfind("ERR leader catching up", 0) == 0 ||
                     out.text.rfind("ERR write not committed", 0) == 0)
                     break;
                 return out;
@@ -156,7 +163,8 @@ public:
             for (std::size_t node = 0; node < members.size(); ++node) {
                 Response out;
                 if (pids_[node] > 0 && requestTo(node, 0, "list_groups", out) &&
-                    out.text.rfind("REDIRECT", 0) != 0 && out.text.rfind("ERR no leader", 0) != 0)
+                    out.text.rfind("REDIRECT", 0) != 0 && out.text.rfind("ERR no leader", 0) != 0 &&
+                    out.text.rfind("ERR leader catching up", 0) != 0)
                     return static_cast<int>(node);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

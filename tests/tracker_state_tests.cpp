@@ -1,95 +1,90 @@
-#include "../tracker/raft_tracker.hpp"
+#include "../tracker/log_command.hpp"
+#include "../tracker/tracker_state.hpp"
 
 #include <cassert>
-#include <array>
 #include <iostream>
 
 int main() {
-    TrackerState state(1);
-
-    HandleResult created = state.handle(0, "create_user alice secret", false);
-    assert(created.response == "OK user created");
+    TrackerState state;
+    assert(state.apply(0, "create_user alice secret").response == "OK user created");
 
     std::string snapshot = state.serialize();
     assert(snapshot.find("secret") == std::string::npos);
-    assert(snapshot.find(hexEncode("secret")) == std::string::npos);
-    assert(snapshot.find("pbkdf2-sha256") == std::string::npos);
+    assert(snapshot.find(toHex("secret")) == std::string::npos);
+    assert(snapshot.find("pbkdf2-sha256") == std::string::npos);   // hex-encoded
 
-    HandleResult wrong = state.handle(0, "login alice incorrect", false);
-    assert(wrong.response == "ERR invalid password");
-    assert(wrong.session == 0);
+    CommandResult wrong = state.apply(0, "login alice incorrect");
+    assert(wrong.response == "ERR invalid password" && wrong.session == 0);
+    CommandResult login = state.apply(0, "login alice secret");
+    assert(login.response == "OK logged in" && login.session != 0);
+    u64 session = login.session;
 
-    HandleResult login = state.handle(0, "login alice secret", false);
-    assert(login.response == "OK logged in");
-    assert(login.session != 0);
+    assert(state.apply(session, "create_group demo").response == "OK group created");
+    assert(state.apply(session, "create_group alpha").response == "OK group created");
+    assert(state.apply(session, "list_groups").response == "OK alpha demo");
+    assert(state.apply(session, "list_groups trailing").response == "ERR usage: list_groups");
+    assert(state.apply(session, "bogus").response == "ERR unknown command");
+    assert(state.apply(session, "").response == "ERR empty command");
+    std::string capability(64, 'a');
+    assert(state.apply(session, "upload_file demo 66696c65 1 "
+                                "0123456789abcdef0123456789abcdef0123456z " + capability +
+                                " 0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000")
+               .response == "ERR invalid upload metadata");
+    assert(state.apply(session, "upload_file demo 66696c65 1 "
+                                "0123456789abcdef0123456789abcdef01234567 " + capability +
+                                " 0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000 extra")
+               .response == "ERR invalid upload metadata");
 
-    HandleResult group = state.handle(login.session, "create_group demo", false);
-    assert(group.response == "OK group created");
-    assert(state.handle(login.session, "create_group alpha", false).response ==
-           "OK group created");
-    assert(state.handle(login.session, "list_groups", false).response ==
-           "OK alpha demo");
-    assert(state.handle(login.session, "list_groups trailing", false).response ==
-           "ERR usage: list_groups");
-    std::string capability =
-        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-    assert(state.handle(
-        login.session,
-        "upload_file demo 66696c65 1 "
-        "0123456789abcdef0123456789abcdef0123456z " + capability +
-        " 0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000",
-        false).response == "ERR invalid upload metadata");
-    assert(state.handle(
-        login.session,
-        "upload_file demo 66696c65 1 "
-        "0123456789abcdef0123456789abcdef01234567 " + capability +
-        " 0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000 extra",
-        false).response == "ERR invalid upload metadata");
+    TrackerState replica;
+    assert(replica.restore(state.serialize()));
+    assert(replica.apply(0, "login alice secret").response == "OK logged in");
 
-    TrackerState replica(2);
-    assert(replica.replaceFromSnapshot(state.serialize()));
-    HandleResult replicaLogin = replica.handle(0, "login alice secret", false);
-    assert(replicaLogin.response == "OK logged in");
+    TrackerState cleanRestart;
+    assert(cleanRestart.apply(0, "login alice secret").response == "ERR no such user");
 
-    TrackerState cleanRestart(1);
-    HandleResult missing = cleanRestart.handle(0, "login alice secret", false);
-    assert(missing.response == "ERR no such user");
-
-    assert(cleanRestart.handle(0, "create_user eve secret", false).response ==
-           "OK user created");
+    // Five wrong passwords lock the account, even for the right password.
+    assert(cleanRestart.apply(0, "create_user eve secret").response == "OK user created");
     for (int attempt = 0; attempt < 4; ++attempt)
-        assert(cleanRestart.handle(0, "login eve wrong", false).response ==
-               "ERR invalid password");
-    assert(cleanRestart.handle(0, "login eve wrong", false).response ==
+        assert(cleanRestart.apply(0, "login eve wrong").response == "ERR invalid password");
+    assert(cleanRestart.apply(0, "login eve wrong").response ==
            "ERR too many login attempts; try again later");
-    assert(cleanRestart.handle(0, "login eve secret", false).response ==
+    assert(cleanRestart.apply(0, "login eve secret").response ==
            "ERR too many login attempts; try again later");
 
     // Access control: login required, members-only files, owner-only admin.
     {
         TrackerState acl;
-        acl.handle(0, "create_user owner pw", false);
-        acl.handle(0, "create_user outsider pw", false);
-        u64 owner = acl.handle(0, "login owner pw", false).session;
-        u64 outsider = acl.handle(0, "login outsider pw", false).session;
-        assert(acl.handle(0, "create_group secret", false).response == "ERR login required");
-        assert(acl.handle(owner, "create_group secret", false).response == "OK group created");
-        std::string upload = "upload_file secret " + hexEncode("a.txt") + " 0 "
-            "0123456789abcdef0123456789abcdef01234567 " + std::string(64, 'a') +
-            " - 127.0.0.1 9000";
-        assert(acl.handle(owner, upload, false).response.rfind("OK file shared", 0) == 0);
-        assert(acl.handle(outsider, "list_files secret", false).response ==
+        acl.apply(0, "create_user owner pw");
+        acl.apply(0, "create_user outsider pw");
+        u64 owner = acl.apply(0, "login owner pw").session;
+        u64 outsider = acl.apply(0, "login outsider pw").session;
+        assert(acl.apply(0, "create_group secret").response == "ERR login required");
+        assert(acl.apply(owner, "create_group secret").response == "OK group created");
+        std::string upload = "upload_file secret " + toHex("a.txt") +
+                             " 0 0123456789abcdef0123456789abcdef01234567 " + capability +
+                             " - 127.0.0.1 9000";
+        assert(acl.apply(owner, upload).response == "OK file shared " + capability);
+        assert(acl.apply(owner, "download_file secret " + toHex("a.txt")).response ==
+               "META 0 0123456789abcdef0123456789abcdef01234567 " + capability +
+                   " - 127.0.0.1:9000");
+        assert(acl.apply(outsider, "list_files secret").response == "ERR not a group member");
+        assert(acl.apply(outsider, "download_file secret " + toHex("a.txt")).response ==
                "ERR not a group member");
-        assert(acl.handle(outsider, "download_file secret " + hexEncode("a.txt"), false)
-                   .response == "ERR not a group member");
-        assert(acl.handle(outsider, upload, false).response == "ERR not a group member");
-        assert(acl.handle(outsider, "join_group secret", false).response == "OK join requested");
-        assert(acl.handle(outsider, "accept_request secret outsider", false).response ==
+        assert(acl.apply(outsider, upload).response == "ERR not a group member");
+        assert(acl.apply(outsider, "join_group secret").response == "OK join requested");
+        assert(acl.apply(outsider, "join_group secret").response == "ERR request already pending");
+        assert(acl.apply(outsider, "accept_request secret outsider").response ==
                "ERR only owner may accept requests");
-        assert(acl.handle(outsider, "list_requests secret", false).response ==
+        assert(acl.apply(outsider, "list_requests secret").response ==
                "ERR only owner may list requests");
-        assert(acl.handle(owner, "leave_group secret", false).response ==
-               "ERR owner cannot leave group");
+        assert(acl.apply(owner, "list_requests secret").response == "OK outsider");
+        assert(acl.apply(owner, "leave_group secret").response == "ERR owner cannot leave group");
+
+        // Logging out stops sharing; the file disappears with its last seeder.
+        assert(acl.apply(owner, "logout").session == 0);
+        assert(acl.apply(owner, "logout").response == "ERR not logged in");
+        u64 again = acl.apply(0, "login owner pw").session;
+        assert(acl.apply(again, "list_files secret").response == "OK");
     }
 
     // Raft replicas must reach identical state from identical log entries:
@@ -98,37 +93,33 @@ int main() {
         ApplyContext first = ApplyContext::fresh();
         ApplyContext second = ApplyContext::fresh();
         second.now = first.now + 1;
-        std::vector<std::pair<std::string, ApplyContext>> log = {
-            {"create_user carol secret", first},
-            {"login carol wrong", second},
-            {"login carol secret", second},
-        };
+        std::vector<LogCommand> log = {{0, first, "create_user carol secret"},
+                                       {0, second, "login carol wrong"},
+                                       {0, second, "login carol secret"}};
         TrackerState replicaA, replicaB;
-        for (const auto &entry : log) {
-            u64 session = 0;
-            ApplyContext decoded;
-            std::string command;
-            assert(decodeCommandEntry(encodeCommandEntry(0, entry.second, entry.first),
-                                      session, decoded, command));
-            assert(command == entry.first && decoded.salt == entry.second.salt &&
-                   decoded.newSession == entry.second.newSession &&
-                   decoded.now == entry.second.now);
-            HandleResult a = replicaA.handle(session, command, false, decoded);
-            HandleResult b = replicaB.handle(session, command, false, decoded);
+        for (const LogCommand &entry : log) {
+            std::optional<LogCommand> decoded = LogCommand::decode(entry.encode());
+            assert(decoded && decoded->command == entry.command &&
+                   decoded->context.salt == entry.context.salt &&
+                   decoded->context.newSession == entry.context.newSession &&
+                   decoded->context.now == entry.context.now);
+            CommandResult a = replicaA.apply(decoded->session, decoded->command, decoded->context);
+            CommandResult b = replicaB.apply(decoded->session, decoded->command, decoded->context);
             assert(a.response == b.response && a.session == b.session);
         }
         assert(replicaA.serialize() == replicaB.serialize());
 
         // Snapshots carry the login lockout too.
         TrackerState restored;
-        assert(restored.replaceFromSnapshot(replicaA.serialize()));
+        assert(restored.restore(replicaA.serialize()));
         assert(restored.serialize() == replicaA.serialize());
+        assert(!restored.restore("X junk\n"));
     }
 
-    assert(isTrackerMutation("login alice secret"));
-    assert(isTrackerMutation("upload_file demo x"));
-    assert(!isTrackerMutation("list_files demo"));
-    assert(!isTrackerMutation("download_file demo x"));
+    assert(TrackerState::isMutation("login alice secret"));
+    assert(TrackerState::isMutation("upload_file demo x"));
+    assert(!TrackerState::isMutation("list_files demo"));
+    assert(!TrackerState::isMutation("download_file demo x"));
 
     std::cout << "tracker state tests passed\n";
 }

@@ -2,6 +2,8 @@
 // catch-up, durability, and the security of both channels.
 #include "cluster_test_support.hpp"
 
+#include "../common/crypto.hpp"
+
 #include <cstdlib>
 #include <iostream>
 
@@ -40,7 +42,7 @@ int main(int argc, char **argv) {
         Response redirected;
         require(cluster.requestTo(follower, session, "list_groups", redirected) &&
                     redirected.text ==
-                        "REDIRECT " + endpointKey(cluster.members[leader].client),
+                        "REDIRECT " + cluster.members[leader].client.toString(),
                 "follower did not redirect to the leader: " + redirected.text);
 
         // Leader crash: the other two elect a new leader and keep every write.
@@ -69,51 +71,45 @@ int main(int argc, char **argv) {
         // Durability: crash all three, restart, state and sessions are intact.
         cluster.stopAll();
         cluster.startAll();
-        require(cluster.request(session, "list_groups").text == "OK afterfail demo rejoined",
-                "state lost after full restart");
+        Response restarted = cluster.request(session, "list_groups");
+        require(restarted.text == "OK afterfail demo rejoined",
+                "state lost after full restart: " + restarted.text);
         require(cluster.request(0, "login alice wrong").text == "ERR invalid password",
                 "password check failed after restart");
 
         // Client channel: a wrong pinned key or a plain-text request gets nothing.
-        std::string wrongPrivate, wrongPublic;
-        require(ed25519KeyPair(wrongPrivate, wrongPublic), "keygen failed");
+        std::optional<crypto::KeyPair> wrongKey = crypto::ed25519KeyPair();
+        require(wrongKey.has_value(), "keygen failed");
         Response rejected;
-        require(!cluster.requestTo(0, 0, "list_groups", rejected, wrongPublic),
+        require(!cluster.requestTo(0, 0, "list_groups", rejected, wrongKey->publicKey),
                 "client accepted a tracker it could not authenticate");
         {
-            UniqueFd fd(connectTcp("127.0.0.1", cluster.clientPort(0), 2));
+            Socket socket = Socket::connect(cluster.members[0].client, 2);
             std::string response;
-            require(fd && sendFrame(fd.get(), "C\t0\tlogin alice secret") &&
-                        !receiveFrame(fd.get(), response),
+            require(socket && socket.sendFrame("C\t0\tlogin alice secret") &&
+                        !socket.receiveFrame(response),
                     "tracker answered a plain-text request");
         }
         // A recorded request replayed on a new connection fails to decrypt.
         {
-            int target = cluster.leader();
-            UniqueFd fd(connectTcp("127.0.0.1", cluster.clientPort(target), 2));
-            std::string sessionKey, response;
-            require(fd && clientHandshake(fd.get(), cluster.publicKey, sessionKey),
-                    "handshake failed");
-            AesGcmMessage message;
-            require(aes256GcmEncrypt(sessionKey, "client->tracker",
-                                     "C\t0\tcreate_user mallory secret", message),
-                    "encrypt failed");
-            std::string sealed = message.nonce + message.tag + message.ciphertext;
-            require(sendFrame(fd.get(), sealed) &&
-                        sealedReceive(fd.get(), sessionKey, "tracker->client", response),
+            const Endpoint &target = cluster.members[cluster.leader()].client;
+            auto channel = SecureChannel::connect(Socket::connect(target, 2), cluster.publicKey);
+            require(channel.has_value(), "handshake failed");
+            std::string sealed = channel->seal("C\t0\tcreate_user mallory secret");
+            std::string response;
+            require(channel->socket().sendFrame(sealed) && channel->receive(response),
                     "sealed request failed");
-            UniqueFd replay(connectTcp("127.0.0.1", cluster.clientPort(target), 2));
-            std::string newKey;
-            require(replay && clientHandshake(replay.get(), cluster.publicKey, newKey) &&
-                        sendFrame(replay.get(), sealed) && !receiveFrame(replay.get(), response),
+            auto replay = SecureChannel::connect(Socket::connect(target, 2), cluster.publicKey);
+            require(replay && replay->socket().sendFrame(sealed) &&
+                        !replay->socket().receiveFrame(response),
                     "tracker accepted a replayed request");
         }
         // Raft port: a peer without a cluster certificate can't complete TLS.
         {
-            UniqueFd fd(connectTcp("127.0.0.1", cluster.members[0].raft.port, 2));
+            Socket socket = Socket::connect(cluster.members[0].raft, 2);
             std::string response;
-            require(fd && sendFrame(fd.get(), "not a tls handshake") &&
-                        !receiveFrame(fd.get(), response),
+            require(socket && socket.sendFrame("not a tls handshake") &&
+                        !socket.receiveFrame(response),
                     "raft port answered a non-TLS peer");
         }
     } catch (const std::exception &error) {

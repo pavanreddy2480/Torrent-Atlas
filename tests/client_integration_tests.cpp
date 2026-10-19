@@ -1,5 +1,7 @@
 #include "cluster_test_support.hpp"
 
+#include "../common/file_metadata.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <chrono>
@@ -102,11 +104,7 @@ static void stopProcess(ChildProcess &process) {
 static bool waitForListener(int port, int seconds = 20) {
     int attempts = seconds * 20;
     for (int attempt = 0; attempt < attempts; ++attempt) {
-        int fd = connectTcp("127.0.0.1", port, 1);
-        if (fd >= 0) {
-            close(fd);
-            return true;
-        }
+        if (Socket::connect({"127.0.0.1", port}, 1)) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return false;

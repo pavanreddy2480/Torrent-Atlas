@@ -49,97 +49,82 @@ function(torrent_warnings target)
   endif()
 endfunction()
 
-add_executable(client
-  client/client.cpp
-  client/command_utils.cpp
-  client/download_storage.cpp
-  client/network_utils.cpp
-  client/telemetry.cpp
+# Code shared by every program: networking, crypto, configuration and keys.
+add_library(torrent_common STATIC
+  common/client_config.cpp
+  common/cluster_config.cpp
+  common/cluster_keys.cpp
+  common/crypto.cpp
+  common/encoding.cpp
+  common/file_metadata.cpp
+  common/net.cpp
+  common/secure_channel.cpp
+  common/tcp_server.cpp
 )
-target_link_libraries(client PRIVATE
-  Threads::Threads
-  OpenSSL::Crypto
-)
-torrent_warnings(client)
+target_link_libraries(torrent_common PUBLIC OpenSSL::Crypto Threads::Threads)
+torrent_warnings(torrent_common)
 
-add_executable(tracker tracker/tracker.cpp)
-target_link_libraries(tracker PRIVATE torrent_raft)
+# Everything in the tracker except main(), so tests can use it.
+add_library(tracker_core STATIC
+  tracker/log_command.cpp
+  tracker/password.cpp
+  tracker/raft_node.cpp
+  tracker/raft_storage.cpp
+  tracker/state_machine.cpp
+  tracker/state_snapshot.cpp
+  tracker/storage_io.cpp
+  tracker/tracker_state.cpp
+)
+target_link_libraries(tracker_core PUBLIC torrent_common torrent_raft)
+torrent_warnings(tracker_core)
+
+# Everything in the client except main().
+add_library(client_core STATIC
+  client/client.cpp
+  client/command_line.cpp
+  client/download.cpp
+  client/download_manager.cpp
+  client/peer_client.cpp
+  client/peer_protocol.cpp
+  client/peer_server.cpp
+  client/peer_stats.cpp
+  client/piece_file.cpp
+  client/resume_manifest.cpp
+  client/shared_files.cpp
+  client/tracker_client.cpp
+)
+target_link_libraries(client_core PUBLIC torrent_common)
+torrent_warnings(client_core)
+
+add_executable(tracker tracker/main.cpp)
+target_link_libraries(tracker PRIVATE tracker_core)
 torrent_warnings(tracker)
 
+add_executable(client client/main.cpp)
+target_link_libraries(client PRIVATE client_core)
+torrent_warnings(client)
+
 add_executable(torrent_keygen tools/keygen.cpp)
-target_link_libraries(torrent_keygen PRIVATE OpenSSL::Crypto)
+target_link_libraries(torrent_keygen PRIVATE torrent_common)
 torrent_warnings(torrent_keygen)
 
-add_executable(security_tests tests/security_tests.cpp)
-target_link_libraries(security_tests PRIVATE
-  Threads::Threads
-  OpenSSL::Crypto
-)
-target_compile_options(security_tests PRIVATE -UNDEBUG)
-torrent_warnings(security_tests)
-
-add_executable(peer_rejection_test tests/peer_rejection_test.cpp)
-target_link_libraries(peer_rejection_test PRIVATE Threads::Threads OpenSSL::Crypto)
-target_compile_options(peer_rejection_test PRIVATE -UNDEBUG)
-torrent_warnings(peer_rejection_test)
-
-add_executable(tracker_state_tests tests/tracker_state_tests.cpp)
-target_link_libraries(tracker_state_tests PRIVATE torrent_raft)
-target_compile_options(tracker_state_tests PRIVATE -UNDEBUG)
-torrent_warnings(tracker_state_tests)
-
-add_executable(command_parser_tests tests/command_parser_tests.cpp)
-target_compile_options(command_parser_tests PRIVATE -UNDEBUG)
-torrent_warnings(command_parser_tests)
-
-add_executable(protocol_tests tests/protocol_tests.cpp)
-target_link_libraries(protocol_tests PRIVATE Threads::Threads)
-target_compile_options(protocol_tests PRIVATE -UNDEBUG)
-torrent_warnings(protocol_tests)
-
-add_executable(download_storage_tests
-  tests/download_storage_tests.cpp client/download_storage.cpp)
-target_link_libraries(download_storage_tests PRIVATE Threads::Threads)
-target_compile_options(download_storage_tests PRIVATE -UNDEBUG)
-torrent_warnings(download_storage_tests)
-
-add_executable(tracker_integration_tests tests/tracker_integration_tests.cpp)
-target_link_libraries(tracker_integration_tests PRIVATE Threads::Threads OpenSSL::Crypto)
-target_compile_options(tracker_integration_tests PRIVATE -UNDEBUG)
-torrent_warnings(tracker_integration_tests)
-
-add_executable(client_integration_tests tests/client_integration_tests.cpp)
-target_link_libraries(client_integration_tests PRIVATE Threads::Threads OpenSSL::Crypto)
-target_compile_options(client_integration_tests PRIVATE -UNDEBUG)
-torrent_warnings(client_integration_tests)
-
+# Tests. Each takes the binaries it starts as arguments; exit code 77 means
+# "skipped" (no local sockets).
 enable_testing()
-add_test(NAME security_tests COMMAND security_tests)
-add_test(NAME tracker_state_tests COMMAND tracker_state_tests)
-add_test(NAME command_parser_tests COMMAND command_parser_tests)
-add_test(NAME protocol_tests COMMAND protocol_tests)
-add_test(NAME download_storage_tests COMMAND download_storage_tests)
-add_test(
-  NAME tracker_integration_tests
-  COMMAND tracker_integration_tests $<TARGET_FILE:tracker>
-)
-set_tests_properties(
-  tracker_integration_tests
-  PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
-)
-add_test(
-  NAME client_integration_tests
-  COMMAND client_integration_tests $<TARGET_FILE:tracker> $<TARGET_FILE:client>
-)
-set_tests_properties(
-  client_integration_tests
-  PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77
-)
-add_test(
-  NAME peer_rejection_test
-  COMMAND peer_rejection_test $<TARGET_FILE:client>
-)
-set_tests_properties(
-  peer_rejection_test
-  PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
-)
+function(torrent_test name library)
+  add_executable(${name} tests/${name}.cpp)
+  target_link_libraries(${name} PRIVATE ${library})
+  target_compile_options(${name} PRIVATE -UNDEBUG)
+  torrent_warnings(${name})
+  add_test(NAME ${name} COMMAND ${name} ${ARGN})
+  set_tests_properties(${name} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+endfunction()
+
+torrent_test(net_tests torrent_common)
+torrent_test(security_tests torrent_common)
+torrent_test(command_line_tests client_core)
+torrent_test(resume_tests client_core)
+torrent_test(tracker_state_tests tracker_core)
+torrent_test(tracker_integration_tests torrent_common $<TARGET_FILE:tracker>)
+torrent_test(client_integration_tests torrent_common $<TARGET_FILE:tracker> $<TARGET_FILE:client>)
+torrent_test(peer_rejection_test torrent_common $<TARGET_FILE:client>)

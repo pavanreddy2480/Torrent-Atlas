@@ -28,7 +28,7 @@ Resume manifests record immutable metadata, the temporary path, and a verified-p
 - Endpoint and unsigned decimal parsing require full token consumption.
 - Ports, hashes, capabilities, piece counts, and snapshot records are validated.
 - TCP connect uses nonblocking `connect` plus a deadline and `SO_ERROR` verification.
-- RAII descriptors cover shared protocol and key storage paths.
+- Sockets, files and OpenSSL objects are owned by RAII classes (`Socket`, `PieceFile`, `OpenSslPtr`).
 - The client requests cancellation, joins download threads, and joins its peer service on normal exit.
 - User-visible tracker collections and peer metrics are sorted for deterministic demonstrations.
 - Passwords are PBKDF2-HMAC-SHA256 encoded with random salts, travel only inside the encrypted client channel, and are never logged.

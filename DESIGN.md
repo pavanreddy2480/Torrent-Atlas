@@ -132,7 +132,7 @@ Every tracker is in exactly one role:
  client ── list_files demo ──▶ leader ── reads its own state ──▶ answer
 ```
 
-Reads are not logged; the leader answers from memory. The leader always has every committed write, so a client always sees its own earlier writes (read-your-writes).
+Reads are not logged; the leader answers from memory. A newly elected leader first applies every entry committed before its election, and until then answers reads with `ERR leader catching up; retry`, which the client retries. So a client always sees its own earlier writes (read-your-writes), even right after a failover or a full restart.
 
 **Edge case:** if the leader is cut off from both followers, it keeps answering reads until its lease expires (20 × heartbeat ≈ **2 s**), then steps down. Reads in that window may miss writes that a new leader accepted on the other side. Its own writes cannot commit, because it has no majority.
 
@@ -147,7 +147,7 @@ Reads are not logged; the leader answers from memory. The leader always has ever
      login on t2 → session Y   ✘ diverged
 ```
 
-`TrackerState::handle(session, command, replicated, context)` never calls the random generator or the clock directly. On the cluster, the leader builds the context once with `ApplyContext::fresh()` and stores it in the entry. Failed logins are logged too, so the five-strike lockout counter is the same on every node and survives failover. A test (`tracker_state_tests`) applies the same log to two states and checks they serialize to identical bytes.
+`TrackerState::apply(session, command, context)` never calls the random generator or the clock directly. On the cluster, the leader builds the context once with `ApplyContext::fresh()` and stores it in the entry. Failed logins are logged too, so the five-strike lockout counter is the same on every node and survives failover. A test (`tracker_state_tests`) applies the same log to two states and checks they serialize to identical bytes.
 
 ### 2.7 Durable storage
 
