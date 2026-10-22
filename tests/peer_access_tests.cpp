@@ -18,7 +18,8 @@ namespace {
 /// The seeder's peer key in these tests.
 const std::string PEER_KEY(32, 'p');
 
-// What a downloader holding (ticket, key) would get back for one request.
+/// What a downloader holding (ticket, key) would get back for one request.
+/// @param plain Receives the decrypted reply, or "" if it did not decrypt.
 std::string ask(const PeerServer &server, const std::string &ticket, const std::string &key,
                 const std::string &operation, std::size_t piece, std::string &plain) {
     std::string frame, nonce;

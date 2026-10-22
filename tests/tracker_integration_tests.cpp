@@ -20,7 +20,7 @@ static void require(bool condition, const std::string &message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-// True if any file under dir contains text, as is or hex-encoded.
+/// @return true if any file under dir contains text, as is or hex-encoded.
 static bool anyFileContains(const std::string &dir, const std::string &text) {
     for (const auto &entry : std::filesystem::recursive_directory_iterator(dir)) {
         if (!entry.is_regular_file()) continue;
