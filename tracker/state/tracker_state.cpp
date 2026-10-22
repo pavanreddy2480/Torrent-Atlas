@@ -11,6 +11,8 @@
 #include <optional>
 #include <sstream>
 
+// The session ID is masked to 63 bits so it also fits a signed 64-bit
+// integer wherever it is read.
 ApplyContext ApplyContext::fresh() {
     ApplyContext context;
     context.salt = crypto::randomBytes(16);
@@ -51,6 +53,8 @@ bool TrackerState::isMutation(const std::string &commandLine) {
     return command != commands().end() && command->second.mutates;
 }
 
+// Splits the line into words, looks the command up, enforces login and
+// arity from the table, then calls the handler with the lock held.
 CommandResult TrackerState::apply(u64 session, const std::string &commandLine,
                                   const ApplyContext &context) {
     std::istringstream input(commandLine);

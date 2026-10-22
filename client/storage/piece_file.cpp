@@ -10,6 +10,7 @@
 
 namespace {
 
+/// Byte offset where piece index starts.
 off_t pieceOffset(std::size_t index) { return static_cast<off_t>(index) * PIECE_SIZE; }
 
 }  // namespace

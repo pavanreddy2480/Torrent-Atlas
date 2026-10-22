@@ -1,3 +1,6 @@
+/// @file security_tests.cpp
+/// Crypto known-answer tests, AES-GCM and Ed25519 tampering, X25519, and the
+/// SecureChannel handshake with the right and the wrong pinned key.
 #include "common/crypto/crypto.hpp"
 #include "common/encoding.hpp"
 #include "common/net/secure_channel.hpp"

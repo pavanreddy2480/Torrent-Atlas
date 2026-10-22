@@ -1,3 +1,7 @@
+/// @file peer_rejection_test.cpp
+/// Starts a real client and sends its peer server garbage and a forged
+/// request; both must get the same "60|denied".
+/// Usage: peer_rejection_test <client binary>
 #include "common/net/net.hpp"
 
 #include <arpa/inet.h>
@@ -13,6 +17,7 @@
 #include <thread>
 #include <unistd.h>
 
+/// @return A loopback port that was free a moment ago, or -1.
 static int unusedPort() {
     Socket socket(::socket(AF_INET, SOCK_STREAM, 0));
     if (!socket) return -1;
@@ -26,6 +31,7 @@ static int unusedPort() {
     return ntohs(address.sin_port);
 }
 
+/// Sends payload to the peer server on port and returns its one reply.
 static std::string request(const std::string &payload, int port) {
     Socket socket = Socket::connect({"127.0.0.1", port});
     assert(socket);

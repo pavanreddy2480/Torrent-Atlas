@@ -22,6 +22,7 @@ using CipherContext = OpenSslPtr<EVP_CIPHER_CTX, EVP_CIPHER_CTX_free>;
 constexpr std::size_t NONCE_SIZE = 12;
 constexpr std::size_t TAG_SIZE = 16;
 
+/// The bytes of a std::string as the unsigned pointer OpenSSL expects.
 const unsigned char *bytes(const std::string &value) {
     return reinterpret_cast<const unsigned char *>(value.data());
 }
@@ -30,8 +31,11 @@ unsigned char *bytes(std::string &value) {
     return reinterpret_cast<unsigned char *>(value.data());
 }
 
+/// True if length can be passed to an OpenSSL API that takes an int.
 bool fitsInt(std::size_t length) { return length <= static_cast<std::size_t>(INT_MAX); }
 
+/// Generates a raw 32-byte key pair of the given OpenSSL type
+/// (EVP_PKEY_ED25519 or EVP_PKEY_X25519).
 std::optional<KeyPair> generateKeyPair(int type) {
     PkeyContext context(EVP_PKEY_CTX_new_id(type, nullptr));
     EVP_PKEY *raw = nullptr;

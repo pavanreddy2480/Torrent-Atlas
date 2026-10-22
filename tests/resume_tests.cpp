@@ -1,3 +1,6 @@
+/// @file resume_tests.cpp
+/// Resume manifests (saving, loading, rejecting mismatches), file hashing,
+/// and piece reads and writes.
 #include "client/storage/piece_file.hpp"
 #include "client/download/resume_manifest.hpp"
 

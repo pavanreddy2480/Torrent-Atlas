@@ -1,3 +1,5 @@
+/// @file command_line_tests.cpp
+/// Prompt parsing: quotes, escapes and two-word command names.
 #include "client/command_line.hpp"
 
 #include <cassert>

@@ -6,7 +6,11 @@
 
 namespace {
 
-// Parses "HELLO|<x25519 public>|<nonce>|<timestamp>[|signature]".
+/// Parses and checks "HELLO|<x25519 public>|<nonce>|<timestamp>[|signature]".
+/// @param expectedFields 4 for the client's hello, 5 for the tracker's.
+/// @param publicKey      Receives the sender's 32-byte X25519 public key.
+/// @return true if the field count, key and nonce sizes, and timestamp
+///         freshness all check out. The signature (if any) is not checked.
 bool parseHello(const std::vector<std::string> &fields, std::size_t expectedFields,
                 std::string &publicKey) {
     std::string nonce;
@@ -15,14 +19,20 @@ bool parseHello(const std::vector<std::string> &fields, std::size_t expectedFiel
            fromHex(fields[2], nonce) && nonce.size() == 16 && isFreshTimestamp(fields[3]);
 }
 
+/// The "<public>|<nonce>|<time>" part of a hello for our ephemeral key.
 std::string helloFields(const crypto::KeyPair &ephemeral, const std::string &nonce) {
     return toHex(ephemeral.publicKey) + "|" + toHex(nonce) + "|" + std::to_string(unixSeconds());
 }
 
+/// The text the tracker signs and both sides hash into the session key:
+/// a protocol label, the client's whole hello, then the tracker's fields.
 std::string transcript(const std::string &clientHello, const std::string &serverFields) {
     return "torrent-handshake-v1|" + clientHello + "|" + serverFields;
 }
 
+/// Derives the session key from an X25519 exchange and the transcript, then
+/// erases our ephemeral private key and the raw shared secret.
+/// @return 32 bytes, or "" if the key exchange failed.
 std::string sessionKey(crypto::KeyPair &ephemeral, const std::string &peerPublic,
                        const std::string &transcript) {
     std::string shared = crypto::x25519SharedSecret(ephemeral.privateKey, peerPublic);

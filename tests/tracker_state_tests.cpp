@@ -1,3 +1,6 @@
+/// @file tracker_state_tests.cpp
+/// TrackerState without sockets: every command, access control, member
+/// removal, ticket issue, login lockout and the saved-state round trip.
 #include "tracker/state/tracker_state.hpp"
 
 #include "common/peer_ticket.hpp"
@@ -5,6 +8,7 @@
 #include <cassert>
 #include <iostream>
 
+/// @return true if the saved form of state contains text.
 static bool serializedHas(const TrackerState &state, const std::string &text) {
     return state.serialize().find(text) != std::string::npos;
 }

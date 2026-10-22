@@ -12,6 +12,8 @@
 
 namespace {
 
+/// Converts an Endpoint into a sockaddr_in for the BSD socket calls.
+/// @return false if the port is out of range or ip is not a valid IPv4 address.
 bool toAddress(const Endpoint &endpoint, sockaddr_in &address) {
     if (endpoint.port <= 0 || endpoint.port > 65535) return false;
     address = {};
@@ -20,7 +22,9 @@ bool toAddress(const Endpoint &endpoint, sockaddr_in &address) {
     return inet_pton(AF_INET, endpoint.ip.c_str(), &address.sin_addr) == 1;
 }
 
-// Waits for a non-blocking connect() to finish.
+/// Waits for a non-blocking connect() on fd to finish.
+/// @param timeoutSeconds Overall deadline; EINTR does not extend it.
+/// @return true only if the connection was established (SO_ERROR is 0).
 bool waitForConnect(int fd, int timeoutSeconds) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
     for (;;) {
@@ -66,6 +70,8 @@ Socket &Socket::operator=(Socket &&other) noexcept {
     return *this;
 }
 
+// Connects in non-blocking mode so the timeout also covers the TCP
+// handshake, then switches back to blocking mode for normal I/O.
 Socket Socket::connect(const Endpoint &endpoint, int timeoutSeconds) {
     sockaddr_in address{};
     if (!toAddress(endpoint, address) || timeoutSeconds < 0) return {};
@@ -104,6 +110,8 @@ void Socket::setTimeout(int seconds) {
 }
 
 bool Socket::sendAll(const void *data, std::size_t length) {
+    // MSG_NOSIGNAL turns a write to a closed peer into an error instead of
+    // a process-killing SIGPIPE (Linux). macOS lacks it.
 #ifdef MSG_NOSIGNAL
     const int flags = MSG_NOSIGNAL;
 #else

@@ -1,5 +1,7 @@
-// The tracker process: commands, durability across a crash, no plaintext
-// passwords on disk, and the security of the client channel.
+/// @file tracker_integration_tests.cpp
+/// The tracker process: commands, durability across a crash, no plaintext
+/// passwords on disk, and the security of the client channel.
+/// Usage: tracker_integration_tests <tracker binary>
 #include "tracker_test_support.hpp"
 
 #include "common/crypto/crypto.hpp"
@@ -12,6 +14,8 @@
 
 using namespace tracker_test;
 
+/// Fails the test with message unless condition holds.
+/// @throws std::runtime_error
 static void require(bool condition, const std::string &message) {
     if (!condition) throw std::runtime_error(message);
 }

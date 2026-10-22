@@ -1,6 +1,11 @@
-// torrent_keygen <tracker IP:PORT> <keys-dir> <client.conf>
-// Creates the tracker's identity key and the client config. See
-// tracker_identity.hpp.
+/// @file tools/keygen.cpp
+/// torrent_keygen <tracker IP:PORT> <keys-dir> <client.conf>
+///
+/// Creates the tracker's Ed25519 identity key in keys-dir and a client.conf
+/// that points clients at IP:PORT and pins the matching public key. Run it
+/// once, on the tracker's machine; give clients only client.conf. Running it
+/// again replaces the key, so every client then needs the new client.conf.
+/// See tracker_identity.hpp. Exit code 0 on success, 1 on error.
 
 #include "common/config/tracker_identity.hpp"
 

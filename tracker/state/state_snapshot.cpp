@@ -43,7 +43,9 @@ std::string TrackerState::serialize() const {
 
 namespace {
 
-// Decodes fields[first..] as non-empty hex names.
+/// Decodes fields[first .. first+count) as non-empty hex-encoded names.
+/// @param names Receives the decoded names.
+/// @return false if any field is not hex or decodes to an empty name.
 bool decodeNames(const std::vector<std::string> &fields, std::size_t first, std::size_t count,
                  std::vector<std::string> &names) {
     names.assign(count, "");

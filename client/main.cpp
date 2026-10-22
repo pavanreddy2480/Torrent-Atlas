@@ -1,4 +1,10 @@
-// client <peer IP:PORT> <client.conf>
+/// @file client/main.cpp
+/// client <peer IP:PORT> <client.conf>
+///
+/// Starts a client: a peer server on IP:PORT and a command prompt on
+/// stdin/stdout. client.conf (from torrent_keygen) says where the tracker is
+/// and which public key it must prove it holds. Exit code 1 on bad
+/// arguments or if the peer server can't start.
 
 #include "client/client.hpp"
 

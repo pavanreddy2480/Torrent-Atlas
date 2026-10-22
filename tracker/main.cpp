@@ -1,5 +1,11 @@
-// tracker <IP:PORT> <keys-dir> <data-dir>
-// Runs the tracker. Type "quit" on stdin to stop it.
+/// @file tracker/main.cpp
+/// tracker <IP:PORT> <keys-dir> <data-dir>
+///
+/// Runs the tracker: loads its identity key from keys-dir and its saved
+/// state from data-dir/tracker.state, then serves clients on IP:PORT, one
+/// thread per connection, one encrypted request per connection.
+/// Type "quit" on stdin to stop it; with stdin closed it runs until killed.
+/// Exit code 0 after quit, 1 on a startup error.
 
 #include "tracker/tracker_service.hpp"
 

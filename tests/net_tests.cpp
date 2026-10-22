@@ -1,3 +1,5 @@
+/// @file net_tests.cpp
+/// Endpoint, number and hex parsing, and frame size limits.
 #include "common/encoding.hpp"
 #include "common/file_metadata.hpp"
 #include "common/net/net.hpp"

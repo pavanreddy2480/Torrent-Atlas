@@ -1,5 +1,6 @@
-// The peer server only answers requests with a valid tracker ticket, and
-// gives one identical answer to everything else.
+/// @file peer_access_tests.cpp
+/// The peer server only answers requests with a valid tracker ticket, and
+/// gives one identical answer to everything else.
 #include "client/peer/peer_protocol.hpp"
 #include "client/peer/peer_server.hpp"
 
@@ -14,6 +15,7 @@
 
 namespace {
 
+/// The seeder's peer key in these tests.
 const std::string PEER_KEY(32, 'p');
 
 // What a downloader holding (ticket, key) would get back for one request.
@@ -26,6 +28,7 @@ std::string ask(const PeerServer &server, const std::string &ticket, const std::
     return reply;
 }
 
+/// A ticket for bob to fetch file from group "demo", valid for the usual lifetime.
 PeerTicket ticketFor(const std::string &file) {
     return {"bob", "demo", file, unixSeconds() + PeerTicket::LIFETIME_SECONDS};
 }

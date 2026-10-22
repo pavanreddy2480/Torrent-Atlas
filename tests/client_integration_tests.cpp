@@ -1,3 +1,9 @@
+/// @file client_integration_tests.cpp
+/// End to end: a real tracker and three real client processes. Uploads a
+/// multi-piece file, downloads it, downloads again after the first seeder
+/// quits, and checks that a member's ticket works and that removing the
+/// member stops the tracker issuing more.
+/// Usage: client_integration_tests <tracker binary> <client binary>
 #include "tracker_test_support.hpp"
 
 #include "client/peer/peer_client.hpp"
@@ -19,36 +25,23 @@
 #include <thread>
 #include <vector>
 
+/// A running client process with pipes to its stdin and (optionally) stdout.
 struct ChildProcess {
     pid_t pid = -1;
     int input = -1;
     int output = -1;
-    std::string received;
+    std::string received;   ///< Output read so far since the last command().
 };
 
+/// Fails the test with message unless condition holds.
+/// @throws std::runtime_error
 static void require(bool condition, const std::string &message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-static int unusedPort() {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = 0;
-    if (bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
-        close(fd);
-        return -1;
-    }
-    socklen_t length = sizeof(address);
-    require(getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) == 0,
-            "getsockname failed");
-    int port = ntohs(address.sin_port);
-    close(fd);
-    return port;
-}
-
+/// Forks and execs arguments[0] with a pipe on stdin.
+/// @param captureOutput true to read its stdout/stderr through a pipe;
+///                      false to discard them.
 static ChildProcess startProcess(const std::vector<std::string> &arguments,
                                  bool captureOutput) {
     int inputPipe[2]{};
@@ -86,6 +79,7 @@ static ChildProcess startProcess(const std::vector<std::string> &arguments,
     return {pid, inputPipe[1], captureOutput ? outputPipe[0] : -1, ""};
 }
 
+/// Closes the pipes and terminates the process (SIGTERM), waiting for it.
 static void stopProcess(ChildProcess &process) {
     if (process.input >= 0) {
         close(process.input);
@@ -103,6 +97,8 @@ static void stopProcess(ChildProcess &process) {
     }
 }
 
+/// Polls 127.0.0.1:port.
+/// @return true once something accepts connections, within `seconds`.
 static bool waitForListener(int port, int seconds = 20) {
     int attempts = seconds * 20;
     for (int attempt = 0; attempt < attempts; ++attempt) {
@@ -112,6 +108,8 @@ static bool waitForListener(int port, int seconds = 20) {
     return false;
 }
 
+/// Reads the process's output until it contains expected.
+/// @return false if that doesn't happen within `seconds`.
 static bool waitForOutput(ChildProcess &process, const std::string &expected,
                           int seconds = 20) {
     int attempts = seconds * 20;
@@ -128,6 +126,9 @@ static bool waitForOutput(ChildProcess &process, const std::string &expected,
     return process.received.find(expected) != std::string::npos;
 }
 
+/// Types one line at the client's prompt and waits for expected in the
+/// output.
+/// @throws std::runtime_error with the output so far if it never appears.
 static void command(ChildProcess &process, const std::string &line,
                     const std::string &expected) {
     process.received.clear();
@@ -144,11 +145,13 @@ static void command(ChildProcess &process, const std::string &line,
             "command failed: " + line + "\noutput: " + process.received);
 }
 
+/// @return The last path component, like basename.
 static std::string fileName(const std::string &path) {
     std::size_t slash = path.find_last_of('/');
     return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
+/// @return true if both files have identical bytes.
 static bool filesEqual(const std::string &left, const std::string &right) {
     std::ifstream first(left, std::ios::binary);
     std::ifstream second(right, std::ios::binary);
@@ -166,9 +169,9 @@ static bool filesEqual(const std::string &left, const std::string &right) {
 
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
-    int seederPort = unusedPort();
-    int downloaderPort = unusedPort();
-    int secondDownloaderPort = unusedPort();
+    int seederPort = tracker_test::unusedPort();
+    int downloaderPort = tracker_test::unusedPort();
+    int secondDownloaderPort = tracker_test::unusedPort();
     if (seederPort < 0 || downloaderPort < 0 || secondDownloaderPort < 0) {
         std::cout << "client integration tests skipped: local sockets unavailable\n";
         return 77;

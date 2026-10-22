@@ -11,6 +11,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
+/// Where the private key lives inside keysDir.
 std::string keyPath(const std::string &keysDir) { return keysDir + "/tracker_identity.key"; }
 
 }  // namespace
