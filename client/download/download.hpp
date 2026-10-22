@@ -4,7 +4,8 @@
 // pieces first with up to eight threads, checks each piece's SHA-1, and
 // records progress in a resume manifest. Verified pieces are shared with other
 // peers right away. The finished file is checked against the full SHA-1
-// before it replaces <destination>.part.
+// before it replaces <destination>.part. Seeder tickets last a few minutes,
+// so a long download asks the tracker for fresh ones before they expire.
 
 #include "client/peer/peer_client.hpp"
 #include "client/storage/piece_file.hpp"
@@ -22,7 +23,7 @@
 class Download {
 public:
     Download(std::string group, std::string name, std::string destination, FileMetadata metadata,
-             std::vector<Endpoint> seeders, TrackerClient &tracker, SharedFiles &shared,
+             std::vector<SeederAccess> seeders, TrackerClient &tracker, SharedFiles &shared,
              PeerStats &peerStats);
 
     void run();
@@ -49,6 +50,8 @@ private:
     void complete();
     void finish(bool failed, const std::string &reason = "");
     void countFailure(TransferResult result);
+    SeederAccess seederAt(std::size_t index);   // with a ticket that is still valid
+    void scheduleTicketRefresh();             // seedersMutex_ held
     char state() const { return finished_ ? (failed_ ? 'F' : 'C') : 'D'; }
 
     const std::string group_;
@@ -56,7 +59,9 @@ private:
     const std::string destination_;
     const std::string partPath_;
     const FileMetadata metadata_;
-    const std::vector<Endpoint> seeders_;
+    std::mutex seedersMutex_;   // guards seeders_ and refreshAt_
+    std::vector<SeederAccess> seeders_;
+    long long refreshAt_ = 0;   // unix seconds
     TrackerClient &tracker_;
     SharedFiles &shared_;
     PeerClient peers_;

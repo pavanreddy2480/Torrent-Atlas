@@ -81,11 +81,13 @@ int main(int argc, char **argv) {
         unlink(config.c_str());
         return 1;
     }
-    assert(request("not-a-secure-message", peerPort).rfind("60|", 0) == 0);
-    std::string unknown =
-        "21|64656d6f|66696c65|000000000000000000000000|00|"
+    // Garbage and a well-formed request with a made-up ticket get the same
+    // answer: nothing about the request or this peer's files leaks.
+    assert(request("not-a-secure-message", peerPort) == "60|denied");
+    std::string forged =
+        "21|616c696365.64656d6f.66696c65.99999999999|000000000000000000000000|00|"
         "00000000000000000000000000000000";
-    assert(request(unknown, peerPort).rfind("60|unauthorized", 0) == 0);
+    assert(request(forged, peerPort) == "60|denied");
 
     kill(child, SIGTERM);
     waitpid(child, nullptr, 0);

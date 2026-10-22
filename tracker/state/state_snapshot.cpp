@@ -4,8 +4,8 @@
 //   T <user> <failures> <locked until>
 //   G <group> <owner>
 //   M <group> <member>            R <group> <pending user>
-//   F <group> <file> <size> <SHA-1> <capability> <piece hashes>
-//   D <group> <file> <seeder user> <ip> <port>
+//   F <group> <file> <size> <SHA-1> <piece hashes>
+//   D <group> <file> <seeder user> <ip> <port> <peer key>
 // std::map keeps every collection sorted, so equal states give equal text.
 
 #include "tracker/state/tracker_state.hpp"
@@ -31,10 +31,11 @@ std::string TrackerState::serialize() const {
             std::string f = toHex(fileName);
             const FileMetadata &meta = file.metadata;
             out << "F " << g << ' ' << f << ' ' << meta.size << ' ' << meta.fullHash << ' '
-                << meta.capability << ' ' << meta.pieceHashList() << '\n';
-            for (const auto &[user, endpoint] : file.seeders)
-                out << "D " << g << ' ' << f << ' ' << toHex(user) << ' ' << toHex(endpoint.ip)
-                    << ' ' << endpoint.port << '\n';
+                << meta.pieceHashList() << '\n';
+            for (const auto &[user, seeder] : file.seeders)
+                out << "D " << g << ' ' << f << ' ' << toHex(user) << ' '
+                    << toHex(seeder.endpoint.ip) << ' ' << seeder.endpoint.port << ' '
+                    << toHex(seeder.peerKey) << '\n';
         }
     }
     return out.str();
@@ -55,7 +56,7 @@ bool decodeNames(const std::vector<std::string> &fields, std::size_t first, std:
 
 bool TrackerState::restore(const std::string &snapshot) {
     static const std::map<char, std::size_t> fieldCounts = {
-        {'U', 3}, {'S', 3}, {'T', 4}, {'G', 3}, {'M', 3}, {'R', 3}, {'F', 7}, {'D', 6}};
+        {'U', 3}, {'S', 3}, {'T', 4}, {'G', 3}, {'M', 3}, {'R', 3}, {'F', 6}, {'D', 7}};
     Data data;
     std::istringstream input(snapshot);
     for (std::string line; std::getline(input, line);) {
@@ -95,8 +96,7 @@ bool TrackerState::restore(const std::string &snapshot) {
         case 'F': {
             FileMetadata meta;
             meta.fullHash = fields[4];
-            meta.capability = fields[5];
-            meta.pieceHashes = FileMetadata::parsePieceHashList(fields[6]);
+            meta.pieceHashes = FileMetadata::parsePieceHashList(fields[5]);
             if (!decodeNames(fields, 1, 2, names) || !parseU64(fields[3], meta.size) ||
                 !meta.valid())
                 return false;
@@ -104,12 +104,13 @@ bool TrackerState::restore(const std::string &snapshot) {
             break;
         }
         case 'D': {
-            std::string ip;
+            std::string ip, peerKey;
             std::optional<Endpoint> endpoint;
             if (!decodeNames(fields, 1, 3, names) || !fromHex(fields[4], ip) ||
-                !(endpoint = Endpoint::parse(ip + ":" + fields[5])))
+                !(endpoint = Endpoint::parse(ip + ":" + fields[5])) ||
+                !fromHex(fields[6], peerKey) || peerKey.size() != 32)
                 return false;
-            data.groups[names[0]].files[names[1]].seeders[names[2]] = *endpoint;
+            data.groups[names[0]].files[names[1]].seeders[names[2]] = {*endpoint, peerKey};
             break;
         }
         }

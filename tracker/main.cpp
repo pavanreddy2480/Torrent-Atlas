@@ -1,8 +1,9 @@
-// tracker <cluster.conf> <node-id> <keys-dir> <data-dir>
-// Runs one tracker node. Type "quit" on stdin to stop it.
+// tracker <IP:PORT> <keys-dir> <data-dir>
+// Runs the tracker. Type "quit" on stdin to stop it.
 
-#include "tracker/raft/raft_node.hpp"
+#include "tracker/tracker_service.hpp"
 
+#include "common/config/tracker_identity.hpp"
 #include "common/net/secure_channel.hpp"
 #include "common/net/tcp_server.hpp"
 
@@ -11,52 +12,39 @@
 #include <thread>
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        std::cerr << "usage: " << argv[0] << " <cluster.conf> <node-id> <keys-dir> <data-dir>\n";
+    std::optional<Endpoint> address = argc == 4 ? Endpoint::parse(argv[1]) : std::nullopt;
+    if (!address) {
+        std::cerr << "usage: " << argv[0] << " <ip:port> <keys-dir> <data-dir>\n";
         return 1;
     }
-    std::optional<ClusterConfig> cluster = ClusterConfig::load(argv[1]);
-    if (!cluster) {
-        std::cerr << "cluster.conf needs an odd number (3 or more) of lines: "
-                     "<id> <client IP:PORT> <raft IP:PORT>\n";
+    std::optional<TrackerIdentity> identity = TrackerIdentity::load(argv[2]);
+    if (!identity) {
+        std::cerr << "missing tracker identity key in " << argv[2] << " (run torrent_keygen)\n";
         return 1;
     }
-    u64 id = 0;
-    const ClusterMember *self =
-        parseU64(argv[2], id) && id <= 1000 ? cluster->find(static_cast<int>(id)) : nullptr;
-    if (!self) {
-        std::cerr << "node id not found in cluster.conf\n";
-        return 1;
-    }
-    std::optional<NodeKeys> keys = NodeKeys::load(argv[3], self->id);
-    if (!keys) {
-        std::cerr << "missing keys in " << argv[3] << " (run torrent_keygen)\n";
-        return 1;
-    }
-    std::string dataDir = argv[4];
+    std::string dataDir = argv[3];
     std::error_code ignored;
     std::filesystem::create_directories(dataDir, ignored);
     std::filesystem::permissions(dataDir, std::filesystem::perms::owner_all,
                                  std::filesystem::perm_options::replace, ignored);
 
-    RaftNode node(*self, *cluster, *keys);
+    TrackerService tracker(StateFile(dataDir + "/tracker.state"));
+    if (!tracker.load()) {
+        std::cerr << "could not read " << dataDir << "/tracker.state\n";
+        return 1;
+    }
     TcpServer server([&](Socket socket) {
         socket.setTimeout(5);
         std::optional<SecureChannel> channel =
-            SecureChannel::accept(std::move(socket), keys->identityKey);
+            SecureChannel::accept(std::move(socket), identity->privateKey());
         std::string request;
-        if (channel && channel->receive(request)) channel->send(node.handle(request));
+        if (channel && channel->receive(request)) channel->send(tracker.handle(request));
     });
-    if (!server.listen(self->client)) {
+    if (!server.listen(*address)) {
         perror("tracker listen");
         return 1;
     }
-    if (!node.start(dataDir)) {
-        std::cerr << "raft server failed to start\n";
-        return 1;
-    }
-    std::cerr << "Tracker " << self->id << " serving clients on " << self->client.toString()
-              << ", raft on " << self->raft.toString() << '\n';
+    std::cerr << "Tracker serving clients on " << address->toString() << '\n';
 
     // Without a console (stdin at end of file) the tracker runs until killed.
     std::thread console([&] {
@@ -65,6 +53,5 @@ int main(int argc, char **argv) {
     });
     server.serve();
     console.join();
-    node.stop();
     return 0;
 }

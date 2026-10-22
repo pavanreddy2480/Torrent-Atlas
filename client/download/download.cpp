@@ -1,6 +1,7 @@
 #include "client/download/download.hpp"
 
 #include "common/crypto/crypto.hpp"
+#include "common/net/freshness.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -22,16 +23,44 @@ std::chrono::milliseconds retryDelay(int round) {
 
 constexpr double MIB = 1024.0 * 1024.0;
 
+// Fetch new tickets this long before the current ones expire, and wait this
+// long before asking again if the tracker says no.
+constexpr long long TICKET_MARGIN_SECONDS = 60;
+constexpr long long TICKET_RETRY_SECONDS = 30;
+
 }  // namespace
 
 Download::Download(std::string group, std::string name, std::string destination,
-                   FileMetadata metadata, std::vector<Endpoint> seeders, TrackerClient &tracker,
+                   FileMetadata metadata, std::vector<SeederAccess> seeders, TrackerClient &tracker,
                    SharedFiles &shared, PeerStats &peerStats)
     : group_(std::move(group)), name_(std::move(name)), destination_(std::move(destination)),
       partPath_(destination_ + ".part"), metadata_(std::move(metadata)),
-      seeders_(std::move(seeders)), tracker_(tracker), shared_(shared),
-      peers_(group_, name_, metadata_.capability, peerStats),
-      manifest_(destination_ + ".resume", group_, name_, metadata_, partPath_) {}
+      seeders_(std::move(seeders)), tracker_(tracker), shared_(shared), peers_(peerStats),
+      manifest_(destination_ + ".resume", group_, name_, metadata_, partPath_) {
+    scheduleTicketRefresh();
+}
+
+void Download::scheduleTicketRefresh() {
+    long long earliest = 0;
+    for (const SeederAccess &seeder : seeders_)
+        earliest = earliest ? std::min(earliest, seeder.expires()) : seeder.expires();
+    refreshAt_ = std::max(earliest - TICKET_MARGIN_SECONDS, unixSeconds() + TICKET_RETRY_SECONDS);
+}
+
+SeederAccess Download::seederAt(std::size_t index) {
+    std::lock_guard<std::mutex> lock(seedersMutex_);
+    if (unixSeconds() >= refreshAt_) {
+        FileMetadata ignored;
+        std::vector<SeederAccess> fresh;
+        std::string error;
+        if (tracker_.locate(group_, name_, ignored, fresh, error))
+            for (SeederAccess &current : seeders_)
+                for (const SeederAccess &update : fresh)
+                    if (update.endpoint == current.endpoint) current = update;
+        scheduleTicketRefresh();
+    }
+    return seeders_[index];
+}
 
 void Download::run() {
     if (!prepare()) return;
@@ -87,7 +116,7 @@ void Download::fetchBitmaps() {
     for (std::size_t seeder = 0; seeder < seeders_.size(); ++seeder) {
         std::vector<bool> &bitmap = seederBitmaps_[seeder];
         TransferResult result =
-            peers_.fetchBitmap(seeders_[seeder], metadata_.pieceCount(), bitmap);
+            peers_.fetchBitmap(seederAt(seeder), metadata_.pieceCount(), bitmap);
         if (result != TransferResult::Success) {
             countFailure(result);
             continue;
@@ -138,8 +167,8 @@ bool Download::fetchPiece(std::size_t piece) {
         for (std::size_t seeder : candidates) {
             if (cancelled_) return false;
             std::string data;
-            TransferResult result = peers_.fetchPiece(seeders_[seeder], piece,
-                                                      metadata_.pieceHashes[piece], data);
+            TransferResult result =
+                peers_.fetchPiece(seederAt(seeder), piece, metadata_.pieceHashes[piece], data);
             if (result != TransferResult::Success) {
                 countFailure(result);
             } else if (file_.write(piece, data)) {

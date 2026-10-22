@@ -9,7 +9,7 @@ int main(int argc, char **argv) {
     std::optional<ClientConfig> config = argc == 3 ? ClientConfig::load(argv[2]) : std::nullopt;
     if (!self || !config) {
         std::cerr << "usage: " << argv[0] << " <peer-ip:port> client.conf\n"
-                  << "client.conf lists the trackers' IP:PORT and the cluster public key; "
+                  << "client.conf holds the tracker's IP:PORT and public key; "
                      "torrent_keygen creates it\n";
         return 1;
     }

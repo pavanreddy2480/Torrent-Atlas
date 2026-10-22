@@ -30,7 +30,7 @@ void DownloadManager::start(const std::string &group, const std::string &name,
             }
     }
     FileMetadata metadata;
-    std::vector<Endpoint> seeders;
+    std::vector<SeederAccess> seeders;
     std::string message;
     if (!tracker_.locate(group, name, metadata, seeders, message)) {
         out << message << '\n';

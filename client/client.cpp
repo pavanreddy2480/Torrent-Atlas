@@ -7,10 +7,15 @@
 #include <filesystem>
 
 Client::Client(Endpoint self, ClientConfig config)
-    : self_(self), tracker_(std::move(config), self), peerServer_(shared_),
+    : self_(self), peerKey_(crypto::randomBytes(32)), tracker_(std::move(config), self, peerKey_),
+      peerServer_(shared_, peerKey_),
       downloads_(tracker_, shared_, peerStats_) {}
 
 int Client::run(std::istream &in, std::ostream &out) {
+    if (peerKey_.size() != 32) {
+        out << "secure random generation failed\n";
+        return 1;
+    }
     if (!peerServer_.start(self_)) {
         out << "could not listen for peers on " << self_.toString() << '\n';
         return 1;
@@ -53,25 +58,12 @@ void Client::uploadFile(const std::string &group, const std::string &path, std::
         out << "ERR upload file: cannot read " << path << '\n';
         return;
     }
-    file.metadata.capability = toHex(crypto::randomBytes(32));
-    if (file.metadata.capability.size() != 64) {
-        out << "ERR secure random generation failed\n";
-        return;
-    }
     file.available.assign(file.metadata.pieceCount(), true);
     std::string name = std::filesystem::path(path).filename().string();
     std::string response;
     tracker_.share(group, name, file.metadata, response);
-    if (response.rfind("OK", 0) != 0) {
-        out << response << '\n';
-        return;
-    }
-    // "OK file shared <capability>": a file already shared by others keeps
-    // its first capability.
-    std::vector<std::string> words = parseCommandWords(response);
-    if (words.size() >= 4 && words[3].size() == 64) file.metadata.capability = words[3];
-    shared_.add(group, name, std::move(file));
-    out << "OK file shared\n";
+    if (response.rfind("OK", 0) == 0) shared_.add(group, name, std::move(file));
+    out << response << '\n';
 }
 
 // Every other command goes to the tracker as typed, except that file names

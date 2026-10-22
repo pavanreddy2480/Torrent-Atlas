@@ -27,6 +27,7 @@ private:
 
     // Declared in this order so downloads stop before the peer server.
     Endpoint self_;
+    const std::string peerKey_;   // see peer_ticket.hpp; new for every run
     TrackerClient tracker_;
     SharedFiles shared_;
     PeerStats peerStats_;

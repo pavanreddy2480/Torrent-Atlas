@@ -11,7 +11,6 @@ int main() {
     FileMetadata metadata;
     metadata.size = 1;
     metadata.fullHash = "0123456789abcdef0123456789abcdef01234567";
-    metadata.capability = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     metadata.pieceHashes = {"89abcdef0123456789abcdef0123456789abcdef"};
 
     ResumeManifest manifest(prefix + ".resume", "group", "file", metadata, prefix + ".part");

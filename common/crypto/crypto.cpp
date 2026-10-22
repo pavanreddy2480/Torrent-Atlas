@@ -5,6 +5,7 @@
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 #include <climits>
@@ -70,6 +71,17 @@ std::string sha256(const std::string &data) {
     std::string digest(32, '\0');
     unsigned length = 0;
     if (EVP_Digest(data.data(), data.size(), bytes(digest), &length, EVP_sha256(), nullptr) != 1)
+        return {};
+    return digest;
+}
+
+std::string hmacSha256(const std::string &key, const std::string &data) {
+    std::string digest(32, '\0');
+    unsigned length = 0;
+    if (!fitsInt(key.size()) ||
+        !HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), bytes(data), data.size(),
+              bytes(digest), &length) ||
+        length != 32)
         return {};
     return digest;
 }

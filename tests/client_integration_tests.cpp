@@ -1,4 +1,6 @@
-#include "cluster_test_support.hpp"
+#include "tracker_test_support.hpp"
+
+#include "client/peer/peer_client.hpp"
 
 #include "common/file_metadata.hpp"
 
@@ -183,16 +185,15 @@ int main(int argc, char **argv) {
             output.put(static_cast<char>((index * 31U + 17U) & 0xffU));
     }
 
-    cluster_test::Cluster cluster;
+    tracker_test::TrackerProcess tracker;
     ChildProcess seeder, downloader, secondDownloader;
     try {
-        if (!cluster.setup(argv[1], prefix + "-cluster")) {
+        if (!tracker.setup(argv[1], prefix + "-tracker")) {
             std::cout << "client integration tests skipped: local sockets unavailable\n";
             return 77;
         }
-        cluster.startAll();
-        require(cluster.leader() >= 0, "tracker cluster did not elect a leader");
-        std::string clientInfo = cluster.clientConf;
+        tracker.start();
+        std::string clientInfo = tracker.clientConf;
         const char *clientBinary = argv[2];
 
         seeder = startProcess({
@@ -237,6 +238,33 @@ int main(int argc, char **argv) {
         require(filesEqual(source, destination), "downloaded file differs from source");
 
         command(downloader, "show downloads", "[C]");
+
+        // A member gets a working ticket for each seeder; once the owner
+        // removes them, the tracker gives them nothing more.
+        require(tracker.request(0, "create_user dave secret").text == "OK user created",
+                "create dave failed");
+        u64 dave = tracker.request(0, "login dave secret").session;
+        require(tracker.request(dave, "join_group demo").text == "OK join requested",
+                "dave join failed");
+        command(seeder, "accept request demo dave", "OK request accepted");
+        std::string meta =
+            tracker.request(dave, "download_file demo " + toHex(fileName(source))).text;
+        std::string firstSeeder = split(meta.substr(meta.rfind(' ') + 1), ',')[0];
+        std::optional<SeederAccess> access = SeederAccess::decode(firstSeeder);
+        require(access.has_value(), "no seeder ticket in: " + meta);
+        PeerStats stats;
+        PeerClient peers(stats);
+        std::vector<bool> bitmap;
+        require(peers.fetchBitmap(*access, 3, bitmap) == TransferResult::Success,
+                "a member's ticket was refused");
+        SeederAccess forged = *access;
+        forged.key = std::string(32, 'x');
+        require(peers.fetchBitmap(forged, 3, bitmap) == TransferResult::AuthenticationFailure,
+                "a ticket with a guessed key was accepted");
+        command(seeder, "remove member demo dave", "OK member removed");
+        require(tracker.request(dave, "download_file demo " + toHex(fileName(source))).text ==
+                    "ERR not a group member",
+                "a removed member still got tickets");
         stopProcess(seeder);
         command(secondDownloader, "download file demo " + fileName(source) +
                                   " \"" + secondDestination + "\"",
@@ -261,8 +289,8 @@ int main(int argc, char **argv) {
         stopProcess(downloader);
         stopProcess(secondDownloader);
         stopProcess(seeder);
-        cluster.stopAll();
-        std::system(("rm -rf " + prefix + "-cluster").c_str());
+        tracker.stop();
+        std::system(("rm -rf " + prefix + "-tracker").c_str());
         unlink(source.c_str());
         unlink(destination.c_str());
         unlink(secondDestination.c_str());
@@ -276,8 +304,8 @@ int main(int argc, char **argv) {
     stopProcess(downloader);
     stopProcess(secondDownloader);
     stopProcess(seeder);
-    cluster.stopAll();
-    std::system(("rm -rf " + prefix + "-cluster").c_str());
+    tracker.stop();
+    std::system(("rm -rf " + prefix + "-tracker").c_str());
     unlink(source.c_str());
     unlink(destination.c_str());
     unlink(secondDestination.c_str());

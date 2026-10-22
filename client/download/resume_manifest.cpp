@@ -7,7 +7,7 @@
 namespace fs = std::filesystem;
 
 namespace {
-const std::string VERSION = "P2PRESUME1";
+const std::string VERSION = "P2PRESUME2";
 }
 
 ResumeManifest::ResumeManifest(std::string path, std::string group, std::string name,
@@ -15,8 +15,8 @@ ResumeManifest::ResumeManifest(std::string path, std::string group, std::string 
     : path_(std::move(path)), group_(std::move(group)), name_(std::move(name)),
       metadata_(std::move(metadata)), partPath_(std::move(partPath)) {}
 
-// Nine lines: version, hex group, hex name, size, SHA-1, capability, piece
-// hashes, a 0/1 per piece, hex .part path.
+// Eight lines: version, hex group, hex name, size, SHA-1, piece hashes, a 0/1
+// per piece, hex .part path.
 bool ResumeManifest::save(const std::vector<bool> &verified) const {
     std::string bitmap;
     for (bool piece : verified) bitmap.push_back(piece ? '1' : '0');
@@ -28,7 +28,6 @@ bool ResumeManifest::save(const std::vector<bool> &verified) const {
                << toHex(name_) << '\n'
                << metadata_.size << '\n'
                << metadata_.fullHash << '\n'
-               << metadata_.capability << '\n'
                << metadata_.pieceHashList() << '\n'
                << bitmap << '\n'
                << toHex(partPath_) << '\n';
@@ -46,13 +45,13 @@ std::optional<std::vector<bool>> ResumeManifest::load() const {
     std::vector<std::string> lines;
     for (std::string line; std::getline(input, line);) lines.push_back(line);
     std::string expectedSize = std::to_string(metadata_.size);
-    if (lines.size() != 9 || lines[0] != VERSION || lines[1] != toHex(group_) ||
+    if (lines.size() != 8 || lines[0] != VERSION || lines[1] != toHex(group_) ||
         lines[2] != toHex(name_) || lines[3] != expectedSize || lines[4] != metadata_.fullHash ||
-        lines[5] != metadata_.capability || lines[6] != metadata_.pieceHashList() ||
-        lines[7].size() != metadata_.pieceCount() || lines[8] != toHex(partPath_))
+        lines[5] != metadata_.pieceHashList() || lines[6].size() != metadata_.pieceCount() ||
+        lines[7] != toHex(partPath_))
         return std::nullopt;
     std::vector<bool> verified;
-    for (char piece : lines[7]) {
+    for (char piece : lines[6]) {
         if (piece != '0' && piece != '1') return std::nullopt;
         verified.push_back(piece == '1');
     }

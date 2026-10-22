@@ -2,13 +2,11 @@
 
 // Client <-> tracker channel, on top of Socket frames: a one-round-trip
 // handshake per connection. Both sides send a fresh X25519 public key, a
-// random nonce and a timestamp. The tracker signs the whole exchange with the
-// cluster's Ed25519 identity key, which clients know in advance from
+// random nonce and a timestamp. The tracker signs the whole exchange with its
+// Ed25519 identity key, which clients know in advance from
 // client.conf. The session key is SHA-256(X25519 secret || transcript), and
 // every message after the handshake is AES-256-GCM under that key. Fresh keys
 // from both sides make a recorded connection useless to replay.
-//
-// Tracker <-> tracker Raft traffic uses mutual TLS instead (raft_node.cpp).
 
 #include "common/net/net.hpp"
 

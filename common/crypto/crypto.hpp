@@ -14,6 +14,7 @@ void secureErase(std::string &secret);
 bool constantTimeEqual(const std::string &left, const std::string &right);
 
 std::string sha256(const std::string &data);
+std::string hmacSha256(const std::string &key, const std::string &data);   // 32 bytes
 std::string pbkdf2Sha256(const std::string &password, const std::string &salt,
                          unsigned iterations, std::size_t length);
 
@@ -50,7 +51,7 @@ struct KeyPair {
     std::string publicKey;
 };
 
-// Ed25519 signatures: the tracker cluster's long-term identity.
+// Ed25519 signatures: the tracker's long-term identity.
 std::optional<KeyPair> ed25519KeyPair();
 std::string ed25519Sign(const std::string &privateKey, const std::string &message);
 bool ed25519Verify(const std::string &publicKey, const std::string &message,

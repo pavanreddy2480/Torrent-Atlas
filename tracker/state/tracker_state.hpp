@@ -1,8 +1,8 @@
 #pragma once
 
 // The tracker's data: users, sessions, groups and the files shared in them.
-// Every client command is applied here. On a Raft cluster each node holds one
-// TrackerState and applies the same committed commands in the same order.
+// Every client command is applied here. Passwords are kept only as PBKDF2
+// hashes; serialize() is what the tracker saves to disk.
 
 #include "common/file_metadata.hpp"
 #include "common/net/net.hpp"
@@ -13,13 +13,12 @@
 #include <string>
 #include <vector>
 
-// Everything random or time-dependent that a command needs. On a Raft
-// cluster the leader fills this in once and stores it in the log entry, so
-// every replica applies the command identically.
+// Everything random or time-dependent that a command needs, passed in so
+// tests can control it.
 struct ApplyContext {
     std::string salt;     // 16 bytes, used by create_user
     u64 newSession = 0;   // used by login
-    long long now = 0;    // unix seconds, used by the login lockout
+    long long now = 0;    // unix seconds: login lockout and ticket expiry
 
     static ApplyContext fresh();
 };
@@ -31,7 +30,7 @@ struct CommandResult {
 
 class TrackerState {
 public:
-    // True for commands that change state; only those go through the Raft log.
+    // True for commands that change state; the tracker saves after those.
     static bool isMutation(const std::string &commandLine);
 
     CommandResult apply(u64 session, const std::string &commandLine,
@@ -42,9 +41,13 @@ public:
     bool restore(const std::string &snapshot);
 
 private:
+    struct Seeder {
+        Endpoint endpoint;
+        std::string peerKey;   // raw 32 bytes; see peer_ticket.hpp
+    };
     struct SharedFile {
         FileMetadata metadata;
-        std::map<std::string, Endpoint> seeders;   // user -> peer address
+        std::map<std::string, Seeder> seeders;   // user -> seeder
     };
     struct Group {
         std::string owner;
@@ -92,6 +95,7 @@ private:
     CommandResult listGroups(Request &request);
     CommandResult listRequests(Request &request);
     CommandResult acceptRequest(Request &request);
+    CommandResult removeMember(Request &request);
     CommandResult uploadFile(Request &request);
     CommandResult listFiles(Request &request);
     CommandResult downloadFile(Request &request);

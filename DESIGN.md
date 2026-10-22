@@ -1,6 +1,6 @@
-# Distributed design
+# Design
 
-This document explains every distributed piece of Torrent Atlas: what it does, how it works, and which problem it solves. For the project overview see [PROJECT.md](PROJECT.md); for security see [SECURITY.md](SECURITY.md).
+This document explains how Torrent Atlas works and which problem each part solves. For the project overview see [PROJECT.md](PROJECT.md); for security see [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -12,11 +12,11 @@ The system splits into two planes with very different needs.
                     CONTROL PLANE (small, must be correct)
    ┌──────────────────────────────────────────────────────────────────┐
    │  users · password hashes · sessions · groups · members ·         │
-   │  join requests · file metadata (size, hashes, key) · seeders     │
+   │  join requests · file metadata (size, hashes) · seeders          │
    │                                                                  │
-   │        tracker 1  ◀──Raft──▶  tracker 2  ◀──Raft──▶  tracker 3   │
+   │                    tracker  ── tracker.state on disk              │
    └──────────────────────────────────────────────────────────────────┘
-                 ▲ metadata only (a few KB per request)
+                 ▲ metadata and peer tickets (a few KB per request)
                  │
    ┌─────────────┴────────────────────────────────────────────────────┐
    │                    DATA PLANE (large, must be fast)               │
@@ -29,225 +29,69 @@ The system splits into two planes with very different needs.
 | --- | --- | --- |
 | Holds | Who exists, who is allowed, where files are | The file bytes |
 | Size | Kilobytes | Up to gigabytes |
-| What matters most | Every replica agrees; no acknowledged change is ever lost | Throughput and integrity |
-| Mechanism | Raft consensus over 3 trackers | Direct parallel peer transfer |
+| What matters most | Correct access decisions; no acknowledged change lost | Throughput and integrity |
+| Mechanism | One tracker that saves its state after every change | Direct parallel peer transfer |
 
-**Why split them:** if file bytes went through the trackers, the trackers would be the bandwidth bottleneck and a single point of failure for data. Keeping trackers to metadata lets a small consensus cluster stay fast, and lets file transfers scale with the number of peers.
+**Why split them:** if file bytes went through the tracker, it would be the bandwidth bottleneck. Keeping the tracker to metadata keeps it small and fast, and lets file transfers scale with the number of peers.
 
 ---
 
-## 2. The tracker cluster
+## 2. The tracker
 
-### 2.1 The problem it solves
+### 2.1 One process, one state
 
-One tracker is a single point of failure: if it dies, nobody can log in or find files, and if its disk dies, every account is gone. Adding copies raises a harder question: **how do several machines agree on the same state when any of them can crash, restart or be cut off at any moment?**
-
-Simple approaches fail:
+There is a single tracker. It holds a `TrackerState` in memory (users, password hashes, sessions, login lockouts, groups, members, join requests, files and seeders) and answers every client command from it.
 
 ```text
- "Write to all, answer when done"     one slow or dead copy blocks every write
- "Write to one, copy later"           crash before the copy loses the write
- "Fixed primary + backups"            primary dies, writes stop until a human acts;
-                                      a backup promoted by hand may be missing writes
+ client ── sealed "C\t<session>\t<command>" ──▶ TrackerService::handle
+                                                  │
+                                read-only command ├──▶ TrackerState::apply ──▶ reply
+                                                  │
+                          state-changing command  └──▶ lock ─▶ apply ─▶ save ─▶ reply
 ```
 
-Raft solves this. Each change is acknowledged only once a **majority** stores it, and a **new leader is elected automatically**. Election rules guarantee the new leader already has every acknowledged change.
+- **Reads** (`list_groups`, `list_files`, `download_file`, ...) run concurrently; `TrackerState` has its own lock.
+- **Writes** (`create_user`, `login`, `upload_file`, `remove_member`, ...) run one at a time. Each one is applied and then the whole state is saved before the client gets its answer.
 
-### 2.2 Why three nodes, and why a majority
+The command table in `TrackerState` marks which commands need a login and which change state, so `TrackerService` knows when to save.
+
+### 2.2 Durable storage
 
 ```text
-  nodes   majority   failures tolerated
-    1        1             0
-    3        2             1        ◀── this project
-    5        3             2
+ data/
+ └── tracker.state    one record per line, every name hex-encoded:
+                      U <user> <pbkdf2 hash>      S <session> <user>
+                      T <user> <failures> <locked until>
+                      G <group> <owner>           M / R <group> <member / pending user>
+                      F <group> <file> <size> <SHA-1> <piece hashes>
+                      D <group> <file> <seeder> <ip> <port> <peer key>
 ```
 
-Any two majorities of three nodes share at least one node:
+Every save writes `tracker.state.tmp` (mode `0600`), fsyncs it and renames it over the old file, so a crash leaves either the old state or the new one, never a mix. On start the tracker loads the file; a missing file means a fresh tracker, and a corrupt one stops it rather than start empty.
 
-```text
-   {1,2}   {2,3}   {1,3}      every pair overlaps
-```
+Only the serialized state is ever written. Commands are never logged, so the passwords inside `create_user` and `login` never reach the disk; the state holds PBKDF2 hashes only (`tracker_integration_tests` scans the data directory for the typed passwords after signup, a failed login and a good login).
 
-So if a write reached a majority, every later majority (including whichever one elects the next leader) contains at least one node that has the write. That overlap is what makes "acknowledged means never lost" true.
+**Trade-off:** the whole state is rewritten on every change. That is simple and plenty fast for the kilobytes of metadata a class-sized deployment has. A much larger deployment would want an append-only journal or an embedded database.
 
-Even cluster sizes add no tolerance: 4 nodes still tolerate only 1 failure (majority is 3), so `cluster.conf` must list an odd number of trackers.
-
-### 2.3 Roles and terms
-
-Every tracker is in exactly one role:
-
-```text
-              timeout, no heartbeat from a leader
-   ┌──────────┐ ───────────────────────────────▶ ┌───────────┐
-   │ FOLLOWER │                                  │ CANDIDATE │
-   └──────────┘ ◀─────────────────────────────── └───────────┘
-        ▲        sees a higher term / a leader        │
-        │                                             │ wins votes from a majority
-        │        sees a higher term                   ▼
-        └──────────────────────────────────────  ┌──────────┐
-                                                 │  LEADER  │
-                                                 └──────────┘
-```
-
-- **Term:** a number that only goes up. Each election starts a new term, and at most one leader can win in a term. Any message from a higher term makes a node step down to follower.
-- **Heartbeat:** the leader sends one to each follower every **100 ms**.
-- **Election timeout:** a follower that hears nothing for a random **400 to 800 ms** becomes a candidate and asks for votes. The randomness keeps two nodes from repeatedly splitting the vote.
-- **Vote rule:** a node votes for at most one candidate per term, and only for one whose log is at least as up to date as its own. This is what keeps a node with missing writes from becoming leader.
-
-### 2.4 How a write flows
-
-```text
- client          tracker 2 (follower)   tracker 1 (leader)     tracker 3 (follower)
-   │  create_group demo  │                      │                      │
-   │────────────────────▶│                      │                      │
-   │◀── REDIRECT t1 ─────│                      │                      │
-   │                                            │                      │
-   │  create_group demo                         │                      │
-   │───────────────────────────────────────────▶│                      │
-   │                       1. build log entry:  │                      │
-   │                          session, salt,    │                      │
-   │                          new session id,   │                      │
-   │                          time, command     │                      │
-   │                       2. append + fsync    │                      │
-   │                                            │── AppendEntries ────▶│
-   │                    ◀────── AppendEntries ──│                      │
-   │                          3. followers append + fsync, reply OK    │
-   │                    ─────────────────────▶  │ ◀────────────────────│
-   │                       4. 2 of 3 have it:   │                      │
-   │                          COMMITTED         │                      │
-   │                       5. apply to state    │                      │
-   │◀── OK group created ───────────────────────│                      │
-   │                       6. followers apply on the next heartbeat    │
-```
-
-1. **Redirect:** clients may contact any tracker. A follower answers `REDIRECT <leader address>`, and the client remembers the leader for next time.
-2. **The leader fixes all randomness** (password salt, new session ID, current time) inside the log entry. This matters because each replica *re-runs* the command: if each one picked its own salt or session ID, the replicas would end up with different state. With everything in the entry, every replica computes exactly the same result (see 2.6).
-3. **fsync before acknowledging:** each node writes the entry to `raft.log` and syncs it to disk before telling the leader it has it, so "stored" means it survives power loss.
-4. **Commit on a majority:** the leader needs one follower plus itself. A slow or dead third node does not hold up writes.
-5. **Answer after apply:** the client's reply is the result of applying the committed entry, such as `OK group created` or `ERR group already exists`.
-
-### 2.5 How a read flows
-
-```text
- client ── list_files demo ──▶ leader ── reads its own state ──▶ answer
-```
-
-Reads are not logged; the leader answers from memory. A newly elected leader first applies every entry committed before its election, and until then answers reads with `ERR leader catching up; retry`, which the client retries. So a client always sees its own earlier writes (read-your-writes), even right after a failover or a full restart.
-
-**Edge case:** if the leader is cut off from both followers, it keeps answering reads until its lease expires (20 × heartbeat ≈ **2 s**), then steps down. Reads in that window may miss writes that a new leader accepted on the other side. Its own writes cannot commit, because it has no majority.
-
-### 2.6 Determinism: why the state machine takes an `ApplyContext`
-
-```text
- WITHOUT a fixed context                   WITH ApplyContext in the log entry
- ───────────────────────                   ──────────────────────────────────
- t1: create_user → salt A → hash A         entry: salt S, session N, time T
- t2: create_user → salt B → hash B         t1, t2, t3 all → hash(S), session N
- t3: login       → session X               state identical everywhere ✔
-     login on t2 → session Y   ✘ diverged
-```
-
-`TrackerState::apply(session, command, context)` never calls the random generator or the clock directly. On the cluster, the leader builds the context once with `ApplyContext::fresh()` and stores it in the entry. Failed logins are logged too, so the five-strike lockout counter is the same on every node and survives failover. A test (`tracker_state_tests`) applies the same log to two states and checks they serialize to identical bytes.
-
-### 2.7 Durable storage
-
-Each tracker owns a data directory:
-
-```text
- data/node1/
- ├── raft.log       [start index] then [index][length][entry] records
- ├── state.bin      current term and the vote cast in it
- ├── config.bin     cluster membership
- └── snapshot.bin   snapshot metadata + full serialized tracker state
-```
-
-| File | Why it must survive a crash |
-| --- | --- |
-| `raft.log` | A node that acknowledged an entry must still have it after a restart, or the majority guarantee breaks. |
-| `state.bin` | A node that forgot its vote could vote twice in one term and allow two leaders. |
-| `config.bin` | The node must remember who is in the cluster. |
-| `snapshot.bin` | It lets the log be trimmed, and a restart begins from it. |
-
-Every whole-file write goes to a temporary file, is fsynced, and is renamed over the old file, so a crash leaves either the old version or the new one, never a mix. Appends to `raft.log` are fsynced one by one. A torn final record is ignored on load, and the leader then re-sends that entry.
-
-### 2.8 Snapshots and log compaction
-
-Without compaction the log would grow forever, and a new node would have to replay every command ever run.
-
-```text
- log:   [1][2][3] ... [1000][1001][1002] ...
-                        ▲
-                snapshot at 1000 = full state after entry 1000
- after compaction:  snapshot@1000 + [1001][1002] ...
-```
-
-- A snapshot is taken every **1000** committed entries, from the state at exactly that point, and saved to `snapshot.bin`.
-- Older entries are dropped from `raft.log`.
-- A follower too far behind to catch up from the log receives the snapshot in **1 MiB chunks**, installs it, then receives the newer entries. Chunking avoids any single message hitting the 16 MiB frame limit.
-
-### 2.9 What happens when things fail
-
-```text
- normal          leader crash          follower crash        2 of 3 down
- ┌──┐┌──┐┌──┐    ┌──┐┌──┐┌──┐          ┌──┐┌──┐┌──┐          ┌──┐┌──┐┌──┐
- │L ││F ││F │    │✖ ││F ││F │          │L ││F ││✖ │          │✖ ││F ││✖ │
- └──┘└──┘└──┘    └──┘└──┘└──┘          └──┘└──┘└──┘          └──┘└──┘└──┘
- reads ✔          ~0.4-0.8 s later:     reads ✔               no leader can be
- writes ✔         a follower wins       writes ✔ (L + F       elected; writes
-                  the vote, becomes L;  is a majority)        refused, nothing
-                  reads ✔ writes ✔                            half-applied
-```
+### 2.3 What happens when it fails
 
 | Failure | What happens | Data at risk |
 | --- | --- | --- |
-| Leader crashes | New leader in about one election timeout; clients follow `REDIRECT` | None that was acknowledged |
-| Follower crashes | Unnoticed by clients | None |
-| Crashed node restarts | Loads snapshot, replays log, catches up from the leader | None |
-| 2 of 3 down | Writes refused (`ERR no leader` or `ERR write not committed`) | None; the cluster becomes unavailable rather than unsafe |
-| All 3 restart | Each rebuilds from disk, elects a leader | None |
-| Network partition | Only the majority side elects a leader and commits; the minority side's old leader steps down after about 2 s | None that was acknowledged |
-| Disk lost on one node | Treat it as a fresh node; it catches up by snapshot | None, while the other two have it |
+| Tracker crashes | Clients get `ERR tracker unavailable` until it restarts; peer transfers already under way keep going | None that was acknowledged |
+| Tracker restarts | Loads `tracker.state`; sessions, groups and seeders are as they were | None |
+| Disk lost | Everything is gone | All metadata; keep backups of `data/` |
 
-These are exercised by `tracker_integration_tests`, which kills real processes with `SIGKILL`.
+`tracker_integration_tests` kills the tracker with `SIGKILL`, restarts it and checks that state and sessions survived.
 
-### 2.10 Why NuRaft instead of hand-written Raft
+### 2.4 `ApplyContext`
 
-Raft is small on paper, but correct implementations must handle log conflicts, term races, snapshot transfer and joint membership. NuRaft (eBay) is a production C++ library that does all of that. This project supplies the parts that are specific to it:
-
-```text
- ┌─────────────────────── NuRaft ───────────────────────┐
- │ elections · heartbeats · AppendEntries · commit index │
- │ log conflict resolution · snapshot transfer · TLS RPC │
- └───────▲───────────────▲────────────────▲──────────────┘
-         │ state_machine │ log_store      │ state_mgr
- ┌───────┴──────┐ ┌──────┴───────┐ ┌──────┴────────┐
- │TrackerState- │ │ FileLogStore │ │FileStateManager│   ◀── this project
- │Machine       │ │ (raft.log)   │ │(state, config) │
- └──────────────┘ └──────────────┘ └────────────────┘
-```
+`TrackerState::apply(session, command, context)` never calls the random generator or the clock itself. `ApplyContext::fresh()` supplies the password salt, a new session ID and the current time. That keeps `TrackerState` easy to test: a test can pass a fixed time and check the exact ticket the tracker issues.
 
 ---
 
-## 3. Clients and the cluster
+## 3. Clients and the tracker
 
-### 3.1 Finding the leader
-
-```text
- client.conf: t1, t2, t3, <cluster public key>
-
- request ─▶ last known leader ──answer────────────────────────▶ done
-                │
-                ├─ REDIRECT tX ─▶ remember tX, retry there
-                ├─ no connection ─▶ try the next tracker
-                └─ "no leader yet" / "not committed" ─▶ wait 250 ms, retry
-                   (up to 12 attempts, which covers an election)
-```
-
-**What this solves:** there is no load balancer to become a single point of failure, and clients ride through a leader change without user action.
-
-### 3.2 One connection per request
-
-Each request opens a TCP connection, does the security handshake ([SECURITY.md](SECURITY.md#4-client-to-tracker-channel)), sends one sealed request and reads one sealed reply. This is simple and makes replay attacks impossible, at the cost of one extra round trip per command. Tracker commands are infrequent compared with piece transfers, so the cost is small.
+`client.conf` holds the tracker's address and its Ed25519 public key. Each request opens a TCP connection, does the security handshake ([SECURITY.md](SECURITY.md#4-client-to-tracker-channel)), sends one sealed request and reads one sealed reply. This is simple and makes replay attacks impossible, at the cost of one extra round trip per command. Tracker commands are infrequent compared with piece transfers, so the cost is small.
 
 ---
 
@@ -269,7 +113,32 @@ Files are cut into **512 KiB** pieces (the last may be shorter). The tracker sto
 
 **What this solves:** pieces can come from different peers in parallel, a corrupt piece costs only 512 KiB to refetch, and progress can be saved piece by piece.
 
-### 4.2 Choosing pieces: rarest first
+### 4.2 Who may ask a seeder: peer tickets
+
+A seeder must only serve people the tracker currently lets into the group, and it must be possible to cut someone off. There is no long-lived file key to leak. Instead:
+
+```text
+ seeder A starts:       peer key kA = RAND_bytes(32), new every run
+ A shares a file:       upload_file … A's address, kA ──▶ tracker   (sealed)
+
+ member B:              download_file group file ──▶ tracker
+                        tracker: B is a member? ──no──▶ ERR not a group member
+                                                 yes
+                        ticket = "<B>.<group>.<file>.<now + 300 s>"   (names hex)
+                        key    = HMAC-SHA256(kA, ticket)
+                        ◀── META … A's address / ticket / key        (sealed)
+
+ B ──▶ A:               21 | ticket | AES-256-GCM(key, request)
+ A:                     key' = HMAC-SHA256(kA, ticket); decrypt with key'
+```
+
+Only the tracker and A know `kA`, so only the tracker can make a ticket whose key A will accept. The ticket names the user, group, file and expiry, and any edit changes the key. B never holds anything that outlives five minutes or works at another seeder.
+
+- **Revocation:** `remove_member` (owner) or `leave_group` ends membership. The tracker refuses that user new tickets at once and stops listing their own shares; tickets already issued die within five minutes.
+- **Long downloads:** `Download` asks the tracker for fresh tickets a minute before the current ones expire. A user removed mid-download can't refresh, so the download stops.
+- **No file-existence oracle:** the seeder checks the ticket and decrypts the request *before* it looks up the file, and answers every failure with the same `60|denied`. Someone without a valid ticket can't tell which files the peer has.
+
+### 4.3 Choosing pieces: rarest first
 
 ```text
  holders per piece (from BITMAP replies):
@@ -280,7 +149,7 @@ Files are cut into **512 KiB** pieces (the last may be shorter). The tracker sto
 
 **What this solves:** a piece held by only one peer is the most at risk of disappearing. Fetching it first, and re-seeding it immediately, makes it available from more places.
 
-### 4.3 Parallel workers
+### 4.4 Parallel workers
 
 ```text
  queue: [1][4][2][5][0][3]
@@ -296,9 +165,9 @@ Files are cut into **512 KiB** pieces (the last may be shorter). The tracker sto
 
 **What this solves:** downloads use many peers' upload bandwidth at once, and one slow or broken peer does not stall the transfer.
 
-### 4.4 Partial seeding
+### 4.5 Partial seeding
 
-When a download starts, the downloader registers with the tracker as a seeder of the file, so other peers can find it from the beginning. Then, as soon as each piece is verified, it:
+When a download starts, the downloader registers with the tracker as a seeder of the file (with its own peer key), so other peers can find it from the beginning. Then, as soon as each piece is verified, it:
 
 1. writes the piece and fsyncs,
 2. marks it in the resume manifest, and
@@ -312,17 +181,19 @@ When a download starts, the downloader registers with the tracker as a seeder of
 
 **What this solves:** popular files spread faster, and the original seeder's upload bandwidth is not the bottleneck.
 
-### 4.5 Resume after a crash
+### 4.6 Resume after a crash
 
 ```text
  bob.bin.part     the file being built (full size from the start)
- bob.bin.resume   P2PRESUME1 / group / name / size / hash / key / piece hashes /
+ bob.bin.resume   P2PRESUME2 / group / name / size / hash / piece hashes /
                   verified-bitmap 0110100… / path of .part     (mode 0600)
 
  on resume:  for every piece marked verified ─▶ re-read and re-hash it
              mismatch ─▶ treat as missing
  finish:     full-file SHA-1 ─▶ rename .part to the final name, delete .resume
 ```
+
+The manifest holds no keys; a resumed download gets fresh tickets from the tracker like any other.
 
 **What this solves:** a crash or `cancel download` does not throw away finished work, and a manifest corrupted or edited on disk cannot inject bad data, because everything is re-verified.
 
@@ -331,19 +202,19 @@ When a download starts, the downloader registers with the tracker as a seeder of
 ## 5. End-to-end example
 
 ```text
- alice (seeder)        tracker cluster (L = leader)          bob (downloader)
-     │ create_user, login ──▶ L: log, commit 2/3
-     │ create_group demo ──▶ L: log, commit
+ alice (seeder)              tracker                       bob (downloader)
+     │ create_user, login ──▶ save
+     │ create_group demo ──▶ save
      │                                       ◀── create_user, login, join_group demo
-     │ accept_request demo bob ──▶ L: log, commit
-     │ upload_file demo song.mp3 ──▶ L: log (hashes, capability, alice's address)
+     │ accept_request demo bob ──▶ save
+     │ upload_file demo song.mp3 ──▶ save (hashes, alice's address, alice's peer key)
      │                                       ◀── download_file demo song.mp3
-     │                          L: bob is a member ─▶ META … capability … alice
-     │◀══════════ BITMAP, GET piece 0..n (AES-GCM under capability) ═════════│
+     │                       bob is a member ─▶ META … alice / ticket / key
+     │◀══════ BITMAP, GET piece 0..n (ticket + AES-GCM under its key) ═══════│
      │                                       bob verifies, writes, re-seeds
-     │                          ◀── upload_file (bob is now a seeder too)
-   ✖ L crashes
-                                follower wins election (~0.5 s)
-                                       ◀── list_files demo  (REDIRECT, then answer)
-                                           song.mp3 is still there ✔
+     │                       ◀── upload_file (bob is now a seeder too)
+     │ remove_member demo bob ──▶ save
+     │                                       ◀── download_file demo song.mp3
+     │                       ERR not a group member ──▶ bob
+     │                       bob's tickets expire within 5 minutes
 ```

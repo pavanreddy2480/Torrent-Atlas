@@ -4,6 +4,7 @@
 
 #include "common/crypto/crypto.hpp"
 #include "common/net/freshness.hpp"
+#include "common/peer_ticket.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -32,6 +33,8 @@ const std::map<std::string, TrackerState::Command> &TrackerState::commands() {
         {"list_requests", {&TrackerState::listRequests, true, false, 1, "list_requests <group>"}},
         {"accept_request",
          {&TrackerState::acceptRequest, true, true, 2, "accept_request <group> <user>"}},
+        {"remove_member",
+         {&TrackerState::removeMember, true, true, 2, "remove_member <group> <user>"}},
         {"upload_file", {&TrackerState::uploadFile, true, true, -1, "upload_file"}},
         {"list_files", {&TrackerState::listFiles, true, false, 1, "list_files <group>"}},
         {"download_file",
@@ -182,7 +185,20 @@ CommandResult TrackerState::acceptRequest(Request &request) {
     return request.reply("OK request accepted");
 }
 
-// upload_file <group> <hex name> <size> <SHA-1> <capability> <piece hashes> <ip> <port>
+// The removed user gets no more peer tickets for this group's files, and
+// stops being offered as a seeder.
+CommandResult TrackerState::removeMember(Request &request) {
+    Group *group = findGroup(request.args[0]);
+    const std::string &user = request.args[1];
+    if (!group) return request.reply("ERR no such group");
+    if (group->owner != request.user) return request.reply("ERR only owner may remove members");
+    if (user == group->owner) return request.reply("ERR owner cannot be removed");
+    if (!group->members.erase(user)) return request.reply("ERR not a member");
+    group->removeSharesOf(user);
+    return request.reply("OK member removed");
+}
+
+// upload_file <group> <hex name> <size> <SHA-1> <piece hashes> <ip> <port> <hex peer key>
 CommandResult TrackerState::uploadFile(Request &request) {
     const std::vector<std::string> &args = request.args;
     Group *group = findGroup(args.empty() ? "" : args[0]);
@@ -191,23 +207,24 @@ CommandResult TrackerState::uploadFile(Request &request) {
 
     std::string name;
     FileMetadata metadata;
-    std::optional<Endpoint> seeder;
+    std::optional<Endpoint> endpoint;
+    std::string peerKey;
     if (args.size() == 8) {
         metadata.fullHash = args[3];
-        metadata.capability = args[4];
-        metadata.pieceHashes = FileMetadata::parsePieceHashList(args[5]);
-        seeder = Endpoint::parse(args[6] + ":" + args[7]);
+        metadata.pieceHashes = FileMetadata::parsePieceHashList(args[4]);
+        endpoint = Endpoint::parse(args[5] + ":" + args[6]);
     }
     if (args.size() != 8 || !fromHex(args[1], name) || name.empty() ||
-        !parseU64(args[2], metadata.size) || !metadata.valid() || !seeder)
+        !parseU64(args[2], metadata.size) || !metadata.valid() || !endpoint ||
+        !fromHex(args[7], peerKey) || peerKey.size() != 32)
         return request.reply("ERR invalid upload metadata");
 
     SharedFile &file = group->files[name];
     if (file.metadata.fullHash.empty()) file.metadata = metadata;
     else if (!file.metadata.sameContent(metadata))
         return request.reply("ERR conflicting file metadata");
-    file.seeders[request.user] = *seeder;
-    return request.reply("OK file shared " + file.metadata.capability);
+    file.seeders[request.user] = {*endpoint, peerKey};
+    return request.reply("OK file shared");
 }
 
 CommandResult TrackerState::listFiles(Request &request) {
@@ -219,7 +236,8 @@ CommandResult TrackerState::listFiles(Request &request) {
     return request.reply(response);
 }
 
-// Replies "META <size> <SHA-1> <capability> <piece hashes> <ip:port,...>".
+// Replies "META <size> <SHA-1> <piece hashes> <seeder>,<seeder>...", where each
+// seeder is a SeederAccess: its address, a fresh ticket and that ticket's key.
 CommandResult TrackerState::downloadFile(Request &request) {
     Group *group = findGroup(request.args[0]);
     std::string name;
@@ -231,12 +249,17 @@ CommandResult TrackerState::downloadFile(Request &request) {
         return request.reply("ERR file has no online seeders");
 
     const FileMetadata &metadata = file->second.metadata;
+    PeerTicket ticket{request.user, request.args[0], name,
+                      request.context.now + PeerTicket::LIFETIME_SECONDS};
     std::vector<std::string> seeders;
-    for (const auto &seeder : file->second.seeders) seeders.push_back(seeder.second.toString());
+    for (const auto &[user, seeder] : file->second.seeders) {
+        SeederAccess access{seeder.endpoint, ticket.encode(), ticket.key(seeder.peerKey)};
+        if (access.key.empty()) return request.reply("ERR could not issue peer tickets");
+        seeders.push_back(access.encode());
+    }
     std::sort(seeders.begin(), seeders.end());
     return request.reply("META " + std::to_string(metadata.size) + " " + metadata.fullHash + " " +
-                         metadata.capability + " " + metadata.pieceHashList() + " " +
-                         join(seeders, ','));
+                         metadata.pieceHashList() + " " + join(seeders, ','));
 }
 
 CommandResult TrackerState::stopShare(Request &request) {

@@ -11,35 +11,6 @@ option(TORRENT_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorS
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# Raft consensus for the tracker cluster: eBay NuRaft, which needs the
-# header-only standalone asio for networking.
-include(FetchContent)
-FetchContent_Declare(
-  asio
-  GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-  GIT_TAG asio-1-30-2
-  GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(asio)
-set(ASIO_INCLUDE_DIR ${asio_SOURCE_DIR}/asio/include CACHE PATH "" FORCE)
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-  nuraft
-  GIT_REPOSITORY https://github.com/eBay/NuRaft.git
-  GIT_TAG 0b01b18
-)
-FetchContent_MakeAvailable(nuraft)
-
-add_library(torrent_raft INTERFACE)
-target_include_directories(torrent_raft SYSTEM INTERFACE
-  ${nuraft_SOURCE_DIR}/include
-  ${nuraft_SOURCE_DIR}/include/libnuraft
-  ${ASIO_INCLUDE_DIR})
-target_compile_definitions(torrent_raft INTERFACE ASIO_STANDALONE)
-target_link_libraries(torrent_raft INTERFACE
-  NuRaft::static_lib OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
-
 function(torrent_warnings target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   if(TORRENT_ENABLE_SANITIZERS)
@@ -54,11 +25,11 @@ endfunction()
 # Code shared by every program: networking, crypto, configuration and keys.
 add_library(torrent_common STATIC
   common/config/client_config.cpp
-  common/config/cluster_config.cpp
-  common/config/cluster_keys.cpp
+  common/config/tracker_identity.cpp
   common/crypto/crypto.cpp
   common/encoding.cpp
   common/file_metadata.cpp
+  common/peer_ticket.cpp
   common/net/net.cpp
   common/net/secure_channel.cpp
   common/net/tcp_server.cpp
@@ -70,16 +41,13 @@ torrent_warnings(torrent_common)
 
 # Everything in the tracker except main(), so tests can use it.
 add_library(tracker_core STATIC
-  tracker/raft/log_command.cpp
-  tracker/raft/raft_node.cpp
-  tracker/raft/raft_storage.cpp
-  tracker/raft/state_machine.cpp
-  tracker/raft/storage_io.cpp
   tracker/state/password.cpp
   tracker/state/state_snapshot.cpp
   tracker/state/tracker_state.cpp
+  tracker/state_file.cpp
+  tracker/tracker_service.cpp
 )
-target_link_libraries(tracker_core PUBLIC torrent_common torrent_raft)
+target_link_libraries(tracker_core PUBLIC torrent_common)
 torrent_warnings(tracker_core)
 
 # Everything in the client except main().
@@ -129,6 +97,7 @@ torrent_test(security_tests torrent_common)
 torrent_test(command_line_tests client_core)
 torrent_test(resume_tests client_core)
 torrent_test(tracker_state_tests tracker_core)
+torrent_test(peer_access_tests client_core)
 torrent_test(tracker_integration_tests torrent_common $<TARGET_FILE:tracker>)
-torrent_test(client_integration_tests torrent_common $<TARGET_FILE:tracker> $<TARGET_FILE:client>)
+torrent_test(client_integration_tests client_core $<TARGET_FILE:tracker> $<TARGET_FILE:client>)
 torrent_test(peer_rejection_test torrent_common $<TARGET_FILE:client>)

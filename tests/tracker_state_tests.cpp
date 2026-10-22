@@ -1,8 +1,13 @@
-#include "tracker/raft/log_command.hpp"
 #include "tracker/state/tracker_state.hpp"
+
+#include "common/peer_ticket.hpp"
 
 #include <cassert>
 #include <iostream>
+
+static bool serializedHas(const TrackerState &state, const std::string &text) {
+    return state.serialize().find(text) != std::string::npos;
+}
 
 int main() {
     TrackerState state;
@@ -25,14 +30,16 @@ int main() {
     assert(state.apply(session, "list_groups trailing").response == "ERR usage: list_groups");
     assert(state.apply(session, "bogus").response == "ERR unknown command");
     assert(state.apply(session, "").response == "ERR empty command");
-    std::string capability(64, 'a');
+    std::string peerKey(32, 'k');
+    std::string hexPeerKey = toHex(peerKey);
     assert(state.apply(session, "upload_file demo 66696c65 1 "
-                                "0123456789abcdef0123456789abcdef0123456z " + capability +
-                                " 0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000")
+                                "0123456789abcdef0123456789abcdef0123456z "
+                                "0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000 " +
+                                hexPeerKey)
                .response == "ERR invalid upload metadata");
     assert(state.apply(session, "upload_file demo 66696c65 1 "
-                                "0123456789abcdef0123456789abcdef01234567 " + capability +
-                                " 0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000 extra")
+                                "0123456789abcdef0123456789abcdef01234567 "
+                                "0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000 abcd")
                .response == "ERR invalid upload metadata");
 
     TrackerState replica;
@@ -61,12 +68,21 @@ int main() {
         assert(acl.apply(0, "create_group secret").response == "ERR login required");
         assert(acl.apply(owner, "create_group secret").response == "OK group created");
         std::string upload = "upload_file secret " + toHex("a.txt") +
-                             " 0 0123456789abcdef0123456789abcdef01234567 " + capability +
-                             " - 127.0.0.1 9000";
-        assert(acl.apply(owner, upload).response == "OK file shared " + capability);
-        assert(acl.apply(owner, "download_file secret " + toHex("a.txt")).response ==
-               "META 0 0123456789abcdef0123456789abcdef01234567 " + capability +
-                   " - 127.0.0.1:9000");
+                             " 0 0123456789abcdef0123456789abcdef01234567 - 127.0.0.1 9000 " +
+                             hexPeerKey;
+        assert(acl.apply(owner, upload).response == "OK file shared");
+
+        // download_file gives a ticket for the seeder, keyed with its peer key.
+        ApplyContext at = ApplyContext::fresh();
+        at.now = 1000;
+        std::string meta = acl.apply(owner, "download_file secret " + toHex("a.txt"), at).response;
+        PeerTicket ticket{"owner", "secret", "a.txt", 1000 + PeerTicket::LIFETIME_SECONDS};
+        SeederAccess expected{*Endpoint::parse("127.0.0.1:9000"), ticket.encode(),
+                              ticket.key(peerKey)};
+        assert(meta == "META 0 0123456789abcdef0123456789abcdef01234567 - " + expected.encode());
+        std::optional<SeederAccess> parsed = SeederAccess::decode(expected.encode());
+        assert(parsed && parsed->key == expected.key && parsed->expires() == ticket.expires);
+        assert(serializedHas(acl, hexPeerKey));
         assert(acl.apply(outsider, "list_files secret").response == "ERR not a group member");
         assert(acl.apply(outsider, "download_file secret " + toHex("a.txt")).response ==
                "ERR not a group member");
@@ -80,6 +96,25 @@ int main() {
         assert(acl.apply(owner, "list_requests secret").response == "OK outsider");
         assert(acl.apply(owner, "leave_group secret").response == "ERR owner cannot leave group");
 
+        // A removed member gets no more tickets and is no longer a seeder.
+        assert(acl.apply(owner, "accept_request secret outsider").response == "OK request accepted");
+        std::string outsiderUpload = "upload_file secret " + toHex("a.txt") +
+                                     " 0 0123456789abcdef0123456789abcdef01234567 - 127.0.0.1 "
+                                     "9001 " + toHex(std::string(32, 'o'));
+        assert(acl.apply(outsider, outsiderUpload).response == "OK file shared");
+        assert(acl.apply(outsider, "download_file secret " + toHex("a.txt")).response.rfind(
+                   "META ", 0) == 0);
+        assert(acl.apply(outsider, "remove_member secret owner").response ==
+               "ERR only owner may remove members");
+        assert(acl.apply(owner, "remove_member secret owner").response ==
+               "ERR owner cannot be removed");
+        assert(acl.apply(owner, "remove_member secret outsider").response == "OK member removed");
+        assert(acl.apply(owner, "remove_member secret outsider").response == "ERR not a member");
+        assert(acl.apply(outsider, "download_file secret " + toHex("a.txt")).response ==
+               "ERR not a group member");
+        assert(acl.apply(owner, "download_file secret " + toHex("a.txt")).response.find("9001") ==
+               std::string::npos);
+
         // Logging out stops sharing; the file disappears with its last seeder.
         assert(acl.apply(owner, "logout").session == 0);
         assert(acl.apply(owner, "logout").response == "ERR not logged in");
@@ -87,38 +122,20 @@ int main() {
         assert(acl.apply(again, "list_files secret").response == "OK");
     }
 
-    // Raft replicas must reach identical state from identical log entries:
-    // all randomness and time come from the entry, not the replica.
+    // Snapshots carry the login lockout too.
     {
-        ApplyContext first = ApplyContext::fresh();
-        ApplyContext second = ApplyContext::fresh();
-        second.now = first.now + 1;
-        std::vector<LogCommand> log = {{0, first, "create_user carol secret"},
-                                       {0, second, "login carol wrong"},
-                                       {0, second, "login carol secret"}};
-        TrackerState replicaA, replicaB;
-        for (const LogCommand &entry : log) {
-            std::optional<LogCommand> decoded = LogCommand::decode(entry.encode());
-            assert(decoded && decoded->command == entry.command &&
-                   decoded->context.salt == entry.context.salt &&
-                   decoded->context.newSession == entry.context.newSession &&
-                   decoded->context.now == entry.context.now);
-            CommandResult a = replicaA.apply(decoded->session, decoded->command, decoded->context);
-            CommandResult b = replicaB.apply(decoded->session, decoded->command, decoded->context);
-            assert(a.response == b.response && a.session == b.session);
-        }
-        assert(replicaA.serialize() == replicaB.serialize());
-
-        // Snapshots carry the login lockout too.
         TrackerState restored;
-        assert(restored.restore(replicaA.serialize()));
-        assert(restored.serialize() == replicaA.serialize());
+        assert(restored.restore(cleanRestart.serialize()));
+        assert(restored.serialize() == cleanRestart.serialize());
+        assert(restored.apply(0, "login eve secret").response ==
+               "ERR too many login attempts; try again later");
         assert(!restored.restore("X junk\n"));
     }
 
     assert(TrackerState::isMutation("login alice secret"));
     assert(TrackerState::isMutation("upload_file demo x"));
     assert(!TrackerState::isMutation("list_files demo"));
+    assert(TrackerState::isMutation("remove_member demo x"));
     assert(!TrackerState::isMutation("download_file demo x"));
 
     std::cout << "tracker state tests passed\n";

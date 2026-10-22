@@ -38,7 +38,7 @@ std::vector<std::string> parseCommandWords(const std::string &line) {
 CommandLine CommandLine::parse(const std::string &line) {
     static const std::set<std::string> verbs = {"create", "join", "leave",  "list",   "accept",
                                                 "upload", "download", "stop", "show", "cancel",
-                                                "resume"};
+                                                "resume", "remove"};
     std::vector<std::string> words = parseCommandWords(line);
     if (words.empty()) return {};
     std::size_t argsStart = 1;
