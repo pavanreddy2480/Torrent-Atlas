@@ -63,7 +63,6 @@ add_library(client_core STATIC
   client/command_line.cpp
   client/download/download.cpp
   client/download/download_manager.cpp
-  client/download/resume_manifest.cpp
   client/peer/peer_client.cpp
   client/peer/peer_protocol.cpp
   client/peer/peer_server.cpp
@@ -103,7 +102,7 @@ endfunction()
 torrent_test(net_tests torrent_common)
 torrent_test(security_tests torrent_common)
 torrent_test(command_line_tests client_core)
-torrent_test(resume_tests client_core)
+torrent_test(piece_file_tests client_core)
 torrent_test(tracker_state_tests tracker_core)
 torrent_test(peer_access_tests client_core)
 torrent_test(tracker_integration_tests torrent_common $<TARGET_FILE:tracker>)

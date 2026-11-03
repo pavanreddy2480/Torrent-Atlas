@@ -30,7 +30,7 @@ All cryptography comes from **OpenSSL 3**. Nothing cryptographic is hand-rolled.
    stranger          ───▶ no account; can reach a peer's port and may hold
                           a ticket someone leaked
    stolen disk/file  ───▶ attacker gets a copy of the tracker's data
-                          directory or a client's resume manifest
+                          directory or a client's partial download
 ```
 
 **In scope:** eavesdropping, tampering, replay, impersonating the tracker, brute-forcing passwords, unauthorized access to groups and files, access after leaving or being removed, probing peers for which files they hold.
@@ -248,8 +248,7 @@ Sessions are random 63-bit IDs. They are only ever sent inside the encrypted cli
 | --- | --- | --- |
 | `config/keys/*.key` | Private keys | Mode `0600`, git-ignored |
 | `data/tracker.state` | Password hashes, sessions, lockouts, groups, file metadata, seeders' addresses and peer keys | Directory created `0700`; file `0600`; written atomically |
-| `<dest>.resume` (client) | Group and file name, piece hashes, verified bitmap; no keys | Mode `0600` |
-| `<dest>.part` (client) | Partial file | Re-verified piece by piece on resume, so tampering can't inject data |
+| `<dest>.part` (client) | Partial file | Mode `0600`; every piece re-hashed on resume, so tampering can't inject data |
 
 **No password is ever written to disk.** The tracker saves only its serialized state, never the commands it received, so the passwords inside `create_user` and `login` stay in memory, are hashed or checked, and are erased (`OPENSSL_cleanse`). `tracker_integration_tests` signs up, fails a login and logs in, then scans every file in the data directory for the typed passwords, plain and hex-encoded.
 

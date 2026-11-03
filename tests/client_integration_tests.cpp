@@ -298,9 +298,7 @@ int main(int argc, char **argv) {
         unlink(destination.c_str());
         unlink(secondDestination.c_str());
         unlink((destination + ".part").c_str());
-        unlink((destination + ".resume").c_str());
         unlink((secondDestination + ".part").c_str());
-        unlink((secondDestination + ".resume").c_str());
         return 1;
     }
 

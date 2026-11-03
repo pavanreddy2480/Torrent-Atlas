@@ -6,27 +6,18 @@
 #include <algorithm>
 #include <filesystem>
 #include <iomanip>
-#include <random>
 #include <thread>
 
 namespace {
 
 constexpr std::size_t MAX_THREADS = 8;
-constexpr int ROUNDS_PER_PIECE = 3;
+constexpr std::size_t PASSES_PER_PIECE = 3;
+constexpr std::chrono::milliseconds PASS_PAUSE{200};
 
-// Exponential backoff with jitter: about 150 ms, 300 ms, 600 ms...
-std::chrono::milliseconds retryDelay(int round) {
-    thread_local std::mt19937 random{std::random_device{}()};
-    return std::chrono::milliseconds(150 * (1 << std::min(round, 4)) +
-                                     std::uniform_int_distribution<int>(0, 100)(random));
-}
+// Fetch new tickets when the current one expires within this many seconds.
+constexpr long long TICKET_MARGIN_SECONDS = 60;
 
 constexpr double MIB = 1024.0 * 1024.0;
-
-// Fetch new tickets this long before the current ones expire, and wait this
-// long before asking again if the tracker says no.
-constexpr long long TICKET_MARGIN_SECONDS = 60;
-constexpr long long TICKET_RETRY_SECONDS = 30;
 
 }  // namespace
 
@@ -35,21 +26,11 @@ Download::Download(std::string group, std::string name, std::string destination,
                    SharedFiles &shared, PeerStats &peerStats)
     : group_(std::move(group)), name_(std::move(name)), destination_(std::move(destination)),
       partPath_(destination_ + ".part"), metadata_(std::move(metadata)),
-      seeders_(std::move(seeders)), tracker_(tracker), shared_(shared), peers_(peerStats),
-      manifest_(destination_ + ".resume", group_, name_, metadata_, partPath_) {
-    scheduleTicketRefresh();
-}
-
-void Download::scheduleTicketRefresh() {
-    long long earliest = 0;
-    for (const SeederAccess &seeder : seeders_)
-        earliest = earliest ? std::min(earliest, seeder.expires()) : seeder.expires();
-    refreshAt_ = std::max(earliest - TICKET_MARGIN_SECONDS, unixSeconds() + TICKET_RETRY_SECONDS);
-}
+      seeders_(std::move(seeders)), tracker_(tracker), shared_(shared), peers_(peerStats) {}
 
 SeederAccess Download::seederAt(std::size_t index) {
     std::lock_guard<std::mutex> lock(seedersMutex_);
-    if (unixSeconds() >= refreshAt_) {
+    if (seeders_[index].expires() - unixSeconds() < TICKET_MARGIN_SECONDS) {
         FileMetadata ignored;
         std::vector<SeederAccess> fresh;
         std::string error;
@@ -57,7 +38,6 @@ SeederAccess Download::seederAt(std::size_t index) {
             for (SeederAccess &current : seeders_)
                 for (const SeederAccess &update : fresh)
                     if (update.endpoint == current.endpoint) current = update;
-        scheduleTicketRefresh();
     }
     return seeders_[index];
 }
@@ -73,27 +53,24 @@ void Download::run() {
 
     bool gotAll = fetchPieces(rarestFirst());
     file_ = PieceFile();
-    if (cancelled_) return finish(true, "cancelled by user; resume data retained");
+    if (cancelled_) return finish(true, "cancelled by user; partial file kept for resume");
     if (!gotAll) return finish(true, "one or more pieces could not be reconstructed");
     complete();
 }
 
-// Opens <destination>.part, keeping pieces a resume manifest says are done
-// if they still match their hashes.
+// Opens <destination>.part. Any piece already in it that matches its hash is
+// kept, so a later download of the same file resumes where this one stopped.
 bool Download::prepare() {
-    std::optional<std::vector<bool>> resumed = manifest_.load();
     std::error_code error;
-    bool resuming = resumed && std::filesystem::is_regular_file(partPath_, error) &&
-                    std::filesystem::file_size(partPath_, error) == metadata_.size;
-    file_ = PieceFile::openForWriting(partPath_, metadata_.size, resuming);
+    bool resuming = std::filesystem::exists(partPath_, error);
+    file_ = PieceFile::openForWriting(partPath_, metadata_.size, true);
     if (!file_) {
         finish(true, "unable to create destination file");
         return false;
     }
-    verified_ = resuming ? *resumed : std::vector<bool>(metadata_.pieceCount(), false);
+    verified_.assign(metadata_.pieceCount(), false);
     std::string data;
-    for (std::size_t piece = 0; piece < verified_.size(); ++piece) {
-        if (!verified_[piece]) continue;
+    for (std::size_t piece = 0; resuming && piece < verified_.size(); ++piece) {
         verified_[piece] = file_.read(piece, metadata_.pieceLength(piece), data) &&
                            crypto::sha1Hex(data) == metadata_.pieceHashes[piece];
         if (verified_[piece]) {
@@ -103,10 +80,6 @@ bool Download::prepare() {
     }
     completed_ = resumedPieces_.load();
     verifiedBytes_ = resumedBytes_.load();
-    if (!manifest_.save(verified_)) {
-        finish(true, "unable to persist resume manifest");
-        return false;
-    }
     return true;
 }
 
@@ -115,21 +88,16 @@ void Download::fetchBitmaps() {
     rarity_.assign(metadata_.pieceCount(), 0);
     for (std::size_t seeder = 0; seeder < seeders_.size(); ++seeder) {
         std::vector<bool> &bitmap = seederBitmaps_[seeder];
-        TransferResult result =
-            peers_.fetchBitmap(seederAt(seeder), metadata_.pieceCount(), bitmap);
-        if (result != TransferResult::Success) {
-            countFailure(result);
+        if (peers_.fetchBitmap(seederAt(seeder), metadata_.pieceCount(), bitmap) !=
+            TransferResult::Success) {
+            ++retries_;
             continue;
         }
-        ++responsiveSeeders_;
         for (std::size_t piece = 0; piece < bitmap.size(); ++piece) rarity_[piece] += bitmap[piece];
     }
-    if (!rarity_.empty())
-        rarePieces_ = std::count(rarity_.begin(), rarity_.end(),
-                                 *std::min_element(rarity_.begin(), rarity_.end()));
 }
 
-std::vector<std::size_t> Download::rarestFirst() {
+std::vector<std::size_t> Download::rarestFirst() const {
     std::vector<std::size_t> order;
     for (std::size_t piece = 0; piece < verified_.size(); ++piece)
         if (!verified_[piece]) order.push_back(piece);
@@ -152,42 +120,32 @@ bool Download::fetchPieces(const std::vector<std::size_t> &order) {
     return !failed;
 }
 
-// Tries every seeder that has the piece, a few rounds with backoff.
 bool Download::fetchPiece(std::size_t piece) {
-    std::vector<std::size_t> candidates;
+    std::vector<std::size_t> holders;
     for (std::size_t seeder = 0; seeder < seeders_.size(); ++seeder)
         if (piece < seederBitmaps_[seeder].size() && seederBitmaps_[seeder][piece])
-            candidates.push_back(seeder);
-    // Start at a different seeder for each piece to spread the load.
-    if (!candidates.empty())
-        std::rotate(candidates.begin(), candidates.begin() + piece % candidates.size(),
-                    candidates.end());
+            holders.push_back(seeder);
 
-    for (int round = 0; round < ROUNDS_PER_PIECE && !cancelled_; ++round) {
-        for (std::size_t seeder : candidates) {
-            if (cancelled_) return false;
-            std::string data;
-            TransferResult result =
-                peers_.fetchPiece(seederAt(seeder), piece, metadata_.pieceHashes[piece], data);
-            if (result != TransferResult::Success) {
-                countFailure(result);
-            } else if (file_.write(piece, data)) {
-                markVerified(piece);
-                return true;
-            }
+    std::size_t attempts = PASSES_PER_PIECE * holders.size();
+    for (std::size_t attempt = 0; attempt < attempts && !cancelled_; ++attempt) {
+        // Starting at piece % holders spreads the pieces over the seeders.
+        std::size_t seeder = holders[(piece + attempt) % holders.size()];
+        std::string data;
+        TransferResult result =
+            peers_.fetchPiece(seederAt(seeder), piece, metadata_.pieceHashes[piece], data);
+        if (result == TransferResult::Success && file_.write(piece, data)) {
+            markVerified(piece);
+            return true;
         }
-        if (!cancelled_) std::this_thread::sleep_for(retryDelay(round));
+        ++retries_;
+        if (result == TransferResult::IntegrityFailure) ++integrityFailures_;
+        // Pause after each full pass over the holders.
+        if ((attempt + 1) % holders.size() == 0) std::this_thread::sleep_for(PASS_PAUSE);
     }
     return false;
 }
 
 void Download::markVerified(std::size_t piece) {
-    file_.sync();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        verified_[piece] = true;
-        manifest_.save(verified_);
-    }
     verifiedBytes_ += metadata_.pieceLength(piece);
     ++completed_;
     shared_.markAvailable(group_, name_, piece);
@@ -202,7 +160,6 @@ void Download::complete() {
     std::error_code error;
     std::filesystem::rename(partPath_, destination_, error);
     if (error) return finish(true, "unable to move completed file into place");
-    manifest_.remove();
     std::string ignored;
     tracker_.share(group_, name_, metadata_, ignored);
     shared_.add(group_, name_, {destination_, metadata_, std::vector<bool>(metadata_.pieceCount(), true)});
@@ -210,39 +167,37 @@ void Download::complete() {
 }
 
 void Download::finish(bool failed, const std::string &reason) {
-    {
-        std::lock_guard<std::mutex> lock(reasonMutex_);
-        failureReason_ = reason;
-    }
+    std::lock_guard<std::mutex> lock(statusMutex_);
+    failureReason_ = reason;
     failed_ = failed;
     elapsed_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
     finished_ = true;
 }
 
-void Download::countFailure(TransferResult result) {
-    ++retries_;
-    switch (result) {
-    case TransferResult::NetworkFailure: ++networkFailures_; break;
-    case TransferResult::AuthenticationFailure: ++authenticationFailures_; break;
-    case TransferResult::Unavailable: ++unavailable_; break;
-    case TransferResult::IntegrityFailure: ++integrityFailures_; break;
-    case TransferResult::Success: break;
-    }
+bool Download::finished() const {
+    std::lock_guard<std::mutex> lock(statusMutex_);
+    return finished_;
+}
+
+char Download::state() const {
+    std::lock_guard<std::mutex> lock(statusMutex_);
+    return finished_ ? (failed_ ? 'F' : 'C') : 'D';
 }
 
 double Download::elapsedSeconds() const {
-    double seconds = finished_ ? elapsed_.load()
+    std::lock_guard<std::mutex> lock(statusMutex_);
+    double seconds = finished_ ? elapsed_
                                : std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                                started_).count();
     return std::max(0.001, seconds);
 }
 
 void Download::printSummary(std::ostream &out) const {
-    out << '[' << state() << "] [" << group_ << "] " << name_;
-    if (!finished_) out << " (" << completed_ << '/' << metadata_.pieceCount() << " pieces)";
-    out << " rare=" << rarePieces_ << " resumed=" << resumedPieces_
-        << " integrity-failures=" << integrityFailures_;
-    std::lock_guard<std::mutex> lock(reasonMutex_);
+    char current = state();
+    out << '[' << current << "] [" << group_ << "] " << name_;
+    if (current == 'D') out << " (" << completed_ << '/' << metadata_.pieceCount() << " pieces)";
+    out << " resumed=" << resumedPieces_ << " integrity-failures=" << integrityFailures_;
+    std::lock_guard<std::mutex> lock(statusMutex_);
     if (failed_ && !failureReason_.empty()) out << " reason=\"" << failureReason_ << '"';
     out << '\n';
 }
@@ -259,11 +214,8 @@ void Download::printStats(std::ostream &out) const {
         << std::fixed << std::setprecision(1)
         << "  progress: " << progress << "% (" << completed_ << '/' << metadata_.pieceCount()
         << " pieces, " << verified / (1024 * 1024) << '/' << metadata_.size / (1024 * 1024)
-        << " MiB)\n"
+        << " MiB, " << resumedPieces_ << " resumed)\n"
         << "  speed: " << speed << " MiB/s  elapsed: " << elapsed << "s  eta: " << eta << "s\n"
-        << "  peers: " << responsiveSeeders_ << '/' << seeders_.size() << " responsive\n"
-        << "  scheduler: rare=" << rarePieces_ << " resumed=" << resumedPieces_ << '\n'
-        << "  reliability: retries=" << retries_ << " network=" << networkFailures_
-        << " auth=" << authenticationFailures_ << " unavailable=" << unavailable_
+        << "  peers: " << seeders_.size() << " seeders, retries=" << retries_
         << " corrupt=" << integrityFailures_ << '\n';
 }

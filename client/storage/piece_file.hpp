@@ -44,13 +44,9 @@ public:
     /// @return false if the file ends early or the read fails.
     bool read(std::size_t index, std::size_t length, std::string &data) const;
 
-    /// Writes one piece at index * PIECE_SIZE. Not durable until sync().
+    /// Writes one piece at index * PIECE_SIZE.
     /// @return false if the write fails.
     bool write(std::size_t index, const std::string &data) const;
-
-    /// Flushes written data to the disk (fsync).
-    /// @return false if the flush fails.
-    bool sync() const;
 
     /// Reads a whole file and computes its metadata.
     /// @param path     A regular file.

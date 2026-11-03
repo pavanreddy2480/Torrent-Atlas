@@ -70,10 +70,9 @@ The prompt and tracker connection sit at the top; `peer/` talks to other peers, 
 | `peer/peer_client` | `PeerClient`: asks a seeder for its bitmap or a piece and checks the piece hash. |
 | `peer/peer_protocol` | The encrypted peer-to-peer message format, shared by both sides. |
 | `peer/peer_stats` | `PeerStats`: per-peer successes, failures and speed for `show peers`. |
-| `download/download` | `Download`: one download, from resume check to rarest-first parallel fetch to the final hash check; renews tickets before they expire. |
+| `download/download` | `Download`: one download, from re-hashing any existing `.part` (resume) to rarest-first parallel fetch to the final hash check; renews tickets before they expire. |
 | `download/download_manager` | `DownloadManager`: starts, lists, measures and cancels downloads. |
 | `storage/piece_file` | `PieceFile`: reads, writes and hashes a file one 512 KiB piece at a time. |
-| `download/resume_manifest` | `ResumeManifest`: the `<dest>.resume` file that lets a download continue. |
 | `storage/local_file.hpp` | `LocalFile`: a seeded file's path, metadata and available pieces. |
 
 ### 2.3 Shared code (`common/`)
@@ -127,9 +126,9 @@ The client prints a `>` prompt. Every command accepts both `create user` and `cr
 | `download file <group> <name> <dest>` | Download from the group's peers | Members |
 | `resume download <group> <name> <dest>` | Continue an interrupted download | Members |
 | `show downloads` | `[D]` downloading, `[C]` complete, `[F]` failed, with progress | Local |
-| `stats` | Progress, speed, ETA, responsive peers and retries for each download | Local |
+| `stats` | Progress, speed, ETA, seeders and retries for each download | Local |
 | `show peers` | Per-peer successes, failures and throughput | Local |
-| `cancel download <name>` | Stop a download; resume data is kept | Local |
+| `cancel download <name>` | Stop a download; the `.part` file is kept for resume | Local |
 | `stop share <group> <name>` | Stop seeding a file | Seeder |
 | `quit` | Exit the client | Local |
 
@@ -166,11 +165,10 @@ The peer key is a random 256-bit key the client makes when it starts. Only the t
     │ start up to 8 workers; each takes the next piece:
     │      GET piece i (ticket + encrypted) ────────────────────▶ a holder
     │      ◀──────────────────────────────── piece bytes (encrypted)
-    │      SHA-1 matches? ── no ─▶ try another holder (3 rounds, back-off)
+    │      SHA-1 matches? ── no ─▶ try the next holder (3 passes, 200 ms pause)
     │            │ yes
-    │      write piece, fsync, update resume manifest,
-    │      start seeding this piece to others immediately
-    │ a minute before tickets expire ─▶ download_file again for fresh ones
+    │      write piece, start seeding it to others immediately
+    │ ticket expires within a minute ─▶ download_file again for fresh ones
     │
     │ all pieces done ─▶ SHA-1 of the whole file ─▶ rename .part to final name
     │ upload_file (now a full seeder) ──▶ tracker
@@ -178,7 +176,7 @@ The peer key is a random 256-bit key the client makes when it starts. Only the t
 
 - **Rarest first:** pieces that few peers hold are fetched first, so they spread before those peers leave.
 - **Partial seeding:** as soon as a piece is verified, the downloader serves it to others.
-- **Resume:** a manifest (`<dest>.resume`, mode `0600`) records which pieces are verified. On resume, every claimed piece is re-read and re-hashed before it is trusted.
+- **Resume:** there is no separate resume file. When a download starts and `<dest>.part` already exists, every piece in it is re-hashed against the tracker's piece hashes; matching pieces are kept and the rest are fetched.
 - **Integrity:** a piece is written only if its SHA-1 matches the tracker's hash, and the file is renamed into place only if the full-file SHA-1 matches.
 
 ---
@@ -192,7 +190,7 @@ The peer key is a random 256-bit key the client makes when it starts. Only the t
 │                           keys/ and client.conf
 ├── client/                 client program
 │   ├── peer/               peer server, peer requests, peer stats
-│   ├── download/           downloads and resume manifests
+│   ├── download/           downloads and the download manager
 │   └── storage/            piece files and the list of seeded files
 ├── tracker/                tracker program: service, state file
 │   └── state/              users, groups, files, passwords, saved format
@@ -251,7 +249,7 @@ ctest --test-dir build --output-on-failure
 | `net_tests` | Endpoint, number and hex parsing; frame limits |
 | `security_tests` | SHA-1, SHA-256 and PBKDF2 known answers; AES-GCM tampering; Ed25519; X25519; handshake success and wrong-key failure |
 | `command_line_tests` | Quoting, escaping and two-word command names |
-| `resume_tests` | Resume manifests, file hashing, piece reads and writes |
+| `piece_file_tests` | File hashing, piece reads and writes |
 | `tracker_state_tests` | Tracker commands; access control (login, member-only, owner-only); removing members; ticket issue; lockout; saved-state round trip |
 | `peer_access_tests` | The peer server accepts a valid ticket and gives one identical `60\|denied` to guessed keys, edited or expired tickets, garbage, and files it doesn't have |
 | `tracker_integration_tests` | Tracker process: commands, crash and restart, no plaintext password on disk, plain-text, wrong-key and replay attacks |

@@ -22,9 +22,9 @@ Files are divided into 512 KiB pieces. The tracker stores the full SHA-1, ordere
 
 Peers exchange framed AES-256-GCM messages. Authenticated data binds each request to its ticket and each response to the request nonce. Each received piece must match its SHA-1 before it is committed. A final full-file SHA-1 check runs before the temporary file is renamed.
 
-The scheduler collects peer bitmaps and uses deterministic rarest-first ordering. Parallel workers choose only peers advertising a piece, rotate the starting peer to spread work, and retry failures. Telemetry reports availability, measured throughput, successes, and failure categories without converting them into trust or reputation scores.
+The scheduler collects peer bitmaps and uses deterministic rarest-first ordering. Parallel workers choose only peers advertising a piece, start each piece at a different holder to spread work, and retry failures. Telemetry reports measured throughput, successes, and failure categories without converting them into trust or reputation scores.
 
-Resume manifests record immutable metadata, the temporary path, and a verified-piece bitmap; they hold no keys. A resumed download re-hashes every claimed piece. Verified partial pieces are immediately available through the peer service.
+Resume needs no extra state: an existing `.part` file is re-hashed piece by piece against the tracker's hashes, and only matching pieces are kept. Verified partial pieces are immediately available through the peer service.
 
 ## Reliability and safety
 
@@ -39,7 +39,7 @@ Resume manifests record immutable metadata, the temporary path, and a verified-p
 
 ## Verification
 
-CTest covers parser strictness, frame boundaries, SHA-1 vectors, cryptography, resume manifests, tracker commands and access control, member removal, ticket issue and checking (guessed keys, edited, stretched and expired tickets), identical peer rejections, tracker crash and restart durability, the absence of plaintext passwords on disk, handshake and replay attacks, and a complete encrypted client transfer. CI runs a release configuration and an AddressSanitizer/UndefinedBehaviorSanitizer configuration on Ubuntu.
+CTest covers parser strictness, frame boundaries, SHA-1 vectors, cryptography, piece files, tracker commands and access control, member removal, ticket issue and checking (guessed keys, edited, stretched and expired tickets), identical peer rejections, tracker crash and restart durability, the absence of plaintext passwords on disk, handshake and replay attacks, and a complete encrypted client transfer. CI runs a release configuration and an AddressSanitizer/UndefinedBehaviorSanitizer configuration on Ubuntu.
 
 ## Known limits
 

@@ -135,7 +135,7 @@ A seeder must only serve people the tracker currently lets into the group, and i
 Only the tracker and A know `kA`, so only the tracker can make a ticket whose key A will accept. The ticket names the user, group, file and expiry, and any edit changes the key. B never holds anything that outlives five minutes or works at another seeder.
 
 - **Revocation:** `remove_member` (owner) or `leave_group` ends membership. The tracker refuses that user new tickets at once and stops listing their own shares; tickets already issued die within five minutes.
-- **Long downloads:** `Download` asks the tracker for fresh tickets a minute before the current ones expire. A user removed mid-download can't refresh, so the download stops.
+- **Long downloads:** `Download` asks the tracker for fresh tickets when the one it is about to use expires within a minute. A user removed mid-download can't refresh, so the download stops.
 - **No file-existence oracle:** the seeder checks the ticket and decrypts the request *before* it looks up the file, and answers every failure with the same `60|denied`. Someone without a valid ticket can't tell which files the peer has.
 
 ### 4.3 Choosing pieces: rarest first
@@ -158,9 +158,9 @@ Only the tracker and A know `kA`, so only the tracker can make a ticket whose ke
    W2 ◀──────┘  │        or of missing pieces
    W3 ◀─────────┘
  each worker:
-   take next piece ─▶ ask a holder (holders rotated per piece to spread load)
-        └─ fail or bad hash ─▶ next holder ─▶ after all: back-off, retry
-           (3 rounds; back-off 150 ms × 2^round + jitter)
+   take piece p ─▶ ask holders[(p + attempt) % holders]   (spreads the load)
+        └─ fail or bad hash ─▶ next holder ─▶ after a full pass: 200 ms pause
+           (3 passes over the holders, then the piece fails)
 ```
 
 **What this solves:** downloads use many peers' upload bandwidth at once, and one slow or broken peer does not stall the transfer.
@@ -169,9 +169,8 @@ Only the tracker and A know `kA`, so only the tracker can make a ticket whose ke
 
 When a download starts, the downloader registers with the tracker as a seeder of the file (with its own peer key), so other peers can find it from the beginning. Then, as soon as each piece is verified, it:
 
-1. writes the piece and fsyncs,
-2. marks it in the resume manifest, and
-3. marks it available in its own peer server, so the next `BITMAP` request shows it.
+1. writes the piece, and
+2. marks it available in its own peer server, so the next `BITMAP` request shows it.
 
 ```text
  time ─▶
@@ -184,18 +183,16 @@ When a download starts, the downloader registers with the tracker as a seeder of
 ### 4.6 Resume after a crash
 
 ```text
- bob.bin.part     the file being built (full size from the start)
- bob.bin.resume   P2PRESUME2 / group / name / size / hash / piece hashes /
-                  verified-bitmap 0110100… / path of .part     (mode 0600)
+ bob.bin.part     the file being built (full size from the start, mode 0600)
 
- on resume:  for every piece marked verified ─▶ re-read and re-hash it
-             mismatch ─▶ treat as missing
- finish:     full-file SHA-1 ─▶ rename .part to the final name, delete .resume
+ on start:   .part exists? ─▶ re-read and re-hash every piece
+             matches the tracker's hash ─▶ keep    mismatch ─▶ fetch it
+ finish:     full-file SHA-1 ─▶ rename .part to the final name
 ```
 
-The manifest holds no keys; a resumed download gets fresh tickets from the tracker like any other.
+There is no separate resume file: the tracker's piece hashes already say which bytes are correct. A resumed download gets fresh tickets from the tracker like any other.
 
-**What this solves:** a crash or `cancel download` does not throw away finished work, and a manifest corrupted or edited on disk cannot inject bad data, because everything is re-verified.
+**What this solves:** a crash or `cancel download` does not throw away finished work, and a `.part` file corrupted or edited on disk cannot inject bad data, because every piece is re-verified.
 
 ---
 

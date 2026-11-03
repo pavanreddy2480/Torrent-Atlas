@@ -63,8 +63,6 @@ bool PieceFile::write(std::size_t index, const std::string &data) const {
     return true;
 }
 
-bool PieceFile::sync() const { return ::fsync(fd_) == 0; }
-
 bool PieceFile::hash(const std::string &path, FileMetadata &metadata) {
     std::error_code error;
     if (!std::filesystem::is_regular_file(path, error)) return false;
