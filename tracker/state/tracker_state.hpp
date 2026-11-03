@@ -67,6 +67,10 @@ public:
     CommandResult apply(u64 session, const std::string &commandLine,
                         const ApplyContext &context = ApplyContext::fresh());
 
+    /// @param session A session ID.
+    /// @return The user logged in with it, or "" if none.
+    std::string userOf(u64 session) const;
+
     /// @return A text snapshot of all data. Equal states give identical
     ///         text (every collection is sorted), and it holds no plaintext
     ///         passwords.

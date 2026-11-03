@@ -29,12 +29,13 @@ public:
     ///         tracker); false if it exists but is unreadable or corrupt.
     bool load();
 
-    /// Handles one request.
+    /// Handles one request and logs it (without secrets) to the console.
     /// @param request "C\t<session>\t<command>".
+    /// @param client  Who sent it, e.g. "127.0.0.1:50123"; used in the log.
     /// @return "<response>\t<session>", or "ERR malformed request\t0" if the
     ///         request isn't in that form. If saving fails, the command still
-    ///         takes effect in memory and an error is printed to stderr.
-    std::string handle(const std::string &request);
+    ///         takes effect in memory and an error is logged.
+    std::string handle(const std::string &request, const std::string &client = "?");
 
 private:
     TrackerState state_;

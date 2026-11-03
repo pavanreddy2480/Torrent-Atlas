@@ -75,6 +75,12 @@ CommandResult TrackerState::apply(u64 session, const std::string &commandLine,
     return (this->*spec.handler)(request);
 }
 
+std::string TrackerState::userOf(u64 session) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto user = data_.sessions.find(session);
+    return user == data_.sessions.end() ? "" : user->second;
+}
+
 TrackerState::Group *TrackerState::findGroup(const std::string &name) {
     auto group = data_.groups.find(name);
     return group == data_.groups.end() ? nullptr : &group->second;

@@ -7,12 +7,15 @@
 /// Type "quit" on stdin to stop it; with stdin closed it runs until killed.
 /// Exit code 0 after quit, 1 on a startup error.
 
+#include "tracker/tracker_log.hpp"
 #include "tracker/tracker_service.hpp"
 
 #include "common/config/tracker_identity.hpp"
 #include "common/net/secure_channel.hpp"
 #include "common/net/tcp_server.hpp"
 
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <thread>
@@ -28,6 +31,7 @@ int main(int argc, char **argv) {
         std::cerr << "missing tracker identity key in " << argv[2] << " (run torrent_keygen)\n";
         return 1;
     }
+    TrackerLog::info("Loaded tracker identity key from " + std::string(argv[2]));
     std::string dataDir = argv[3];
     std::error_code ignored;
     std::filesystem::create_directories(dataDir, ignored);
@@ -35,29 +39,40 @@ int main(int argc, char **argv) {
                                  std::filesystem::perm_options::replace, ignored);
 
     TrackerService tracker(StateFile(dataDir + "/tracker.state"));
-    if (!tracker.load()) {
-        std::cerr << "could not read " << dataDir << "/tracker.state\n";
-        return 1;
-    }
+    if (!tracker.load()) return 1;
     TcpServer server([&](Socket socket) {
+        std::optional<Endpoint> peer = socket.peer();
+        std::string client = peer ? peer->toString() : "unknown client";
+        TrackerLog::info("Connection from " + client);
         socket.setTimeout(5);
         std::optional<SecureChannel> channel =
             SecureChannel::accept(std::move(socket), identity->privateKey());
         std::string request;
-        if (channel && channel->receive(request)) channel->send(tracker.handle(request));
+        if (!channel) return TrackerLog::error(client + ": secure handshake failed");
+        if (!channel->receive(request)) return TrackerLog::error(client + ": no request received");
+        if (!channel->send(tracker.handle(request, client)))
+            TrackerLog::error(client + ": could not send the reply");
     });
     if (!server.listen(*address)) {
-        perror("tracker listen");
+        TrackerLog::error("could not listen on " + address->toString() + ": " +
+                          std::strerror(errno));
         return 1;
     }
-    std::cerr << "Tracker serving clients on " << address->toString() << '\n';
+    TrackerLog::info("Tracker serving clients on " + address->toString() +
+                     " (type \"quit\" to stop)");
 
     // Without a console (stdin at end of file) the tracker runs until killed.
     std::thread console([&] {
-        for (std::string line; std::getline(std::cin, line);)
-            if (line == "quit") return server.stop();
+        for (std::string line; std::getline(std::cin, line);) {
+            if (line == "quit") {
+                TrackerLog::info("Stopping: waiting for open connections to finish");
+                return server.stop();
+            }
+            if (!line.empty()) TrackerLog::info("Unknown console command \"" + line + "\"; type quit");
+        }
     });
     server.serve();
     console.join();
+    TrackerLog::info("Tracker stopped");
     return 0;
 }

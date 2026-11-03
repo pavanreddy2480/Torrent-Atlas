@@ -45,6 +45,7 @@ add_library(tracker_core STATIC
   tracker/state/state_snapshot.cpp
   tracker/state/tracker_state.cpp
   tracker/state_file.cpp
+  tracker/tracker_log.cpp
   tracker/tracker_service.cpp
 )
 target_link_libraries(tracker_core PUBLIC torrent_common)

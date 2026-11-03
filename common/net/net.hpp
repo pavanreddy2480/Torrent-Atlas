@@ -88,6 +88,10 @@ public:
     /// @return false on disconnect, timeout, or a length over MAX_FRAME.
     bool receiveFrame(std::string &payload);
 
+    /// @return The remote end of this connection, or std::nullopt if it is
+    ///         not connected or not IPv4.
+    std::optional<Endpoint> peer() const;
+
     /// @return The raw descriptor, or -1 if invalid. Ownership stays here.
     int fd() const { return fd_; }
     /// @return true if this socket holds an open descriptor.

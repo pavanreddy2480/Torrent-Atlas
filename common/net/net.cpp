@@ -102,6 +102,17 @@ Socket Socket::listen(const Endpoint &endpoint, int backlog) {
 
 Socket Socket::accept() const { return Socket(::accept(fd_, nullptr, nullptr)); }
 
+std::optional<Endpoint> Socket::peer() const {
+    sockaddr_in address{};
+    socklen_t length = sizeof(address);
+    if (getpeername(fd_, reinterpret_cast<sockaddr *>(&address), &length) != 0 ||
+        address.sin_family != AF_INET)
+        return std::nullopt;
+    char ip[INET_ADDRSTRLEN] = {};
+    if (!inet_ntop(AF_INET, &address.sin_addr, ip, sizeof(ip))) return std::nullopt;
+    return Endpoint{ip, ntohs(address.sin_port)};
+}
+
 void Socket::setTimeout(int seconds) {
     timeval timeout{};
     timeout.tv_sec = seconds;
