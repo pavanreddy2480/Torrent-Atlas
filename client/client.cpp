@@ -1,5 +1,6 @@
 #include "client/client.hpp"
 
+#include "client/prompt.hpp"
 #include "client/storage/piece_file.hpp"
 
 #include "common/crypto/crypto.hpp"
@@ -21,7 +22,8 @@ int Client::run(std::istream &in, std::ostream &out) {
         return 1;
     }
     out << "Client listening on " << self_.toString() << '\n';
-    for (std::string line; out << "> " && std::getline(in, line);) {
+    Prompt prompt(in, out);
+    for (std::string line; prompt.read(line);) {
         CommandLine command = CommandLine::parse(line);
         if (command.name == "quit") break;
         if (!command.name.empty()) execute(command, out);

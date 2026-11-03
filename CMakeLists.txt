@@ -10,6 +10,12 @@ option(TORRENT_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorS
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
+# libedit gives the client prompt line editing and up-arrow history. macOS
+# ships it; on Debian/Ubuntu install libedit-dev.
+find_library(EDIT_LIBRARY edit)
+if(NOT EDIT_LIBRARY)
+  message(FATAL_ERROR "libedit not found (on Debian/Ubuntu: apt install libedit-dev)")
+endif()
 
 function(torrent_warnings target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
@@ -62,11 +68,12 @@ add_library(client_core STATIC
   client/peer/peer_protocol.cpp
   client/peer/peer_server.cpp
   client/peer/peer_stats.cpp
+  client/prompt.cpp
   client/storage/piece_file.cpp
   client/storage/shared_files.cpp
   client/tracker_client.cpp
 )
-target_link_libraries(client_core PUBLIC torrent_common)
+target_link_libraries(client_core PUBLIC torrent_common ${EDIT_LIBRARY})
 torrent_warnings(client_core)
 
 add_executable(tracker tracker/main.cpp)
