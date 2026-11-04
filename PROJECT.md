@@ -21,7 +21,7 @@ Related documents:
 ```text
                         ┌───────────────────────────┐
                         │          tracker          │
-                        │  disk: tracker.state      │
+                        │  state in memory          │
                         └──▲──────────▲──────────▲──┘
                            │ encrypted request / reply, peer tickets
      ┌─────────────────────┘          │          └─────────────────────┐
@@ -48,11 +48,9 @@ Each program is split into small classes, grouped into subfolders by area, one p
 
 | File | Role |
 | --- | --- |
-| `main.cpp` | Entry point: `tracker <IP:PORT> <keys-dir> <data-dir>`. Loads the identity key and saved state, and serves clients with a `TcpServer` over `SecureChannel`. |
+| `main.cpp` | Entry point: `tracker <IP:PORT> <keys-dir>`. Loads the identity key and serves clients with a `TcpServer` over `SecureChannel`. |
 | `tracker_service` | `TrackerService`: turns one decrypted request into a `TrackerState` command, and saves the state after every command that changes it. |
-| `state_file` | `StateFile`: reads `tracker.state` and replaces it atomically (temporary file, fsync, rename). |
-| `state/tracker_state` | `TrackerState`: users, password hashes, sessions, login lockouts, groups, membership, files and seeders. Every command is one method, picked from a table that also says whether it needs a login and whether it changes state. `download_file` issues peer tickets. |
-| `state/state_snapshot.cpp` | `TrackerState::serialize` and `restore`: the saved text format. |
+| `state/tracker_state` | `TrackerState`: users, password hashes, sessions, groups, membership, files and seeders, in memory. Every command is one method, picked from a table that also says whether it needs a login. `download_file` issues peer tickets. |
 | `state/password` | PBKDF2 password hashing and checking. |
 
 ### 2.2 Client (`client/`)
@@ -69,7 +67,6 @@ The prompt and tracker connection sit at the top; `peer/` talks to other peers, 
 | `peer/peer_server` | `PeerServer`: answers other peers' bitmap and piece requests that carry a valid ticket. |
 | `peer/peer_client` | `PeerClient`: asks a seeder for its bitmap or a piece and checks the piece hash. |
 | `peer/peer_protocol` | The encrypted peer-to-peer message format, shared by both sides. |
-| `peer/peer_stats` | `PeerStats`: per-peer successes, failures and speed for `show peers`. |
 | `download/download` | `Download`: one download, from re-hashing any existing `.part` (resume) to rarest-first parallel fetch to the final hash check; renews tickets before they expire. |
 | `download/download_manager` | `DownloadManager`: starts, lists, measures and cancels downloads. |
 | `storage/piece_file` | `PieceFile`: reads, writes and hashes a file one 512 KiB piece at a time. |
@@ -124,10 +121,7 @@ The client prints a `>` prompt. Every command accepts both `create user` and `cr
 | `upload file <group> <path>` | Share a file with the group | Members |
 | `list files <group>` | Files shared in the group | Members |
 | `download file <group> <name> <dest>` | Download from the group's peers | Members |
-| `resume download <group> <name> <dest>` | Continue an interrupted download | Members |
 | `show downloads` | `[D]` downloading, `[C]` complete, `[F]` failed, with progress | Local |
-| `stats` | Progress, speed, ETA, seeders and retries for each download | Local |
-| `show peers` | Per-peer successes, failures and throughput | Local |
 | `cancel download <name>` | Stop a download; the `.part` file is kept for resume | Local |
 | `stop share <group> <name>` | Stop seeding a file | Seeder |
 | `quit` | Exit the client | Local |
@@ -189,7 +183,7 @@ The peer key is a random 256-bit key the client makes when it starts. Only the t
 ├── config/                 created by torrent_keygen (git-ignored):
 │                           keys/ and client.conf
 ├── client/                 client program
-│   ├── peer/               peer server, peer requests, peer stats
+│   ├── peer/               peer server and peer requests
 │   ├── download/           downloads and the download manager
 │   └── storage/            piece files and the list of seeded files
 ├── tracker/                tracker program: service, state file
@@ -207,7 +201,7 @@ The peer key is a random 256-bit key the client makes when it starts. Only the t
 └── README.md               quick start
 ```
 
-`config/` (keys and `client.conf`) and `data/` (tracker storage) are created at run time and ignored by git.
+`config/` (keys and `client.conf`) is created at run time and ignored by git.
 
 ---
 
@@ -250,11 +244,10 @@ ctest --test-dir build --output-on-failure
 | `security_tests` | SHA-1, SHA-256 and PBKDF2 known answers; AES-GCM tampering; Ed25519; X25519; handshake success and wrong-key failure |
 | `command_line_tests` | Quoting, escaping and two-word command names |
 | `piece_file_tests` | File hashing, piece reads and writes |
-| `tracker_state_tests` | Tracker commands; access control (login, member-only, owner-only); removing members; ticket issue; lockout; saved-state round trip |
+| `tracker_state_tests` | Tracker commands; access control (login, member-only, owner-only); removing members; ticket issue |
 | `peer_access_tests` | The peer server accepts a valid ticket and gives one identical `60\|denied` to guessed keys, edited or expired tickets, garbage, and files it doesn't have |
-| `tracker_integration_tests` | Tracker process: commands, crash and restart, no plaintext password on disk, plain-text, wrong-key and replay attacks |
+| `tracker_integration_tests` | Tracker process: commands, starting empty after a restart, plain-text, wrong-key and replay attacks |
 | `client_integration_tests` | Full upload and encrypted multi-peer download, `show downloads`, retry after a seeder leaves, a member's ticket working and stopping after `remove member` |
-| `peer_rejection_test` | A running client answers garbage and forged requests with the same `60\|denied` |
 
 CI (`.github/workflows/ci.yml`) runs a release build and an AddressSanitizer/UBSan build on every push.
 
@@ -262,7 +255,7 @@ CI (`.github/workflows/ci.yml`) runs a release build and an AddressSanitizer/UBS
 
 ## 7. Limits and future work
 
-- **One tracker:** if it is down, nobody can log in or start a download (transfers already running continue). Back up `data/`.
+- **One in-memory tracker:** if it is down, nobody can log in or start a download (transfers already running continue), and a restart loses all users, groups and shared files.
 - **Revocation takes up to 5 minutes at seeders:** a removed member's tickets work until they expire.
 - **Crashed seeders stay listed** until that user logs out, stops sharing or leaves the group. Downloads still succeed by retrying other peers.
 - **SHA-1 for integrity** is kept for compatibility; SHA-256 would be the modern choice.

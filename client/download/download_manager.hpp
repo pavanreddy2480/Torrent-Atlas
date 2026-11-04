@@ -17,8 +17,8 @@
 class DownloadManager {
 public:
     /// The references must outlive the manager.
-    DownloadManager(TrackerClient &tracker, SharedFiles &shared, PeerStats &peerStats)
-        : tracker_(tracker), shared_(shared), peerStats_(peerStats) {}
+    DownloadManager(TrackerClient &tracker, SharedFiles &shared)
+        : tracker_(tracker), shared_(shared) {}
     /// Cancels unfinished downloads and waits for every download thread.
     ~DownloadManager();
 
@@ -34,13 +34,10 @@ public:
     void cancel(const std::string &name, std::ostream &out);
     /// Prints one summary line per download, oldest first.
     void printDownloads(std::ostream &out) const;
-    /// Prints each download's stats and an aggregate line.
-    void printStats(std::ostream &out) const;
 
 private:
     TrackerClient &tracker_;
     SharedFiles &shared_;
-    PeerStats &peerStats_;
     mutable std::mutex mutex_;   ///< Guards downloads_ and threads_.
     std::vector<std::shared_ptr<Download>> downloads_;
     std::vector<std::thread> threads_;

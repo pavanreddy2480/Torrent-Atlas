@@ -48,9 +48,7 @@ torrent_warnings(torrent_common)
 # Everything in the tracker except main(), so tests can use it.
 add_library(tracker_core STATIC
   tracker/state/password.cpp
-  tracker/state/state_snapshot.cpp
   tracker/state/tracker_state.cpp
-  tracker/state_file.cpp
   tracker/tracker_log.cpp
   tracker/tracker_service.cpp
 )
@@ -66,7 +64,6 @@ add_library(client_core STATIC
   client/peer/peer_client.cpp
   client/peer/peer_protocol.cpp
   client/peer/peer_server.cpp
-  client/peer/peer_stats.cpp
   client/prompt.cpp
   client/storage/piece_file.cpp
   client/storage/shared_files.cpp
@@ -107,4 +104,3 @@ torrent_test(tracker_state_tests tracker_core)
 torrent_test(peer_access_tests client_core)
 torrent_test(tracker_integration_tests torrent_common $<TARGET_FILE:tracker>)
 torrent_test(client_integration_tests client_core $<TARGET_FILE:tracker> $<TARGET_FILE:client>)
-torrent_test(peer_rejection_test torrent_common $<TARGET_FILE:client>)

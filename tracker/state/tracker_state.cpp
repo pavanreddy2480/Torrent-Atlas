@@ -25,32 +25,25 @@ ApplyContext ApplyContext::fresh() {
 
 const std::map<std::string, TrackerState::Command> &TrackerState::commands() {
     static const std::map<std::string, Command> table = {
-        {"create_user", {&TrackerState::createUser, false, true, 2, "create_user <user> <password>"}},
-        {"login", {&TrackerState::login, false, true, 2, "login <user> <password>"}},
-        {"logout", {&TrackerState::logout, false, true, 0, "logout"}},
-        {"create_group", {&TrackerState::createGroup, true, true, 1, "create_group <group>"}},
-        {"join_group", {&TrackerState::joinGroup, true, true, 1, "join_group <group>"}},
-        {"leave_group", {&TrackerState::leaveGroup, true, true, 1, "leave_group <group>"}},
-        {"list_groups", {&TrackerState::listGroups, true, false, 0, "list_groups"}},
-        {"list_requests", {&TrackerState::listRequests, true, false, 1, "list_requests <group>"}},
+        {"create_user", {&TrackerState::createUser, false, 2, "create_user <user> <password>"}},
+        {"login", {&TrackerState::login, false, 2, "login <user> <password>"}},
+        {"logout", {&TrackerState::logout, false, 0, "logout"}},
+        {"create_group", {&TrackerState::createGroup, true, 1, "create_group <group>"}},
+        {"join_group", {&TrackerState::joinGroup, true, 1, "join_group <group>"}},
+        {"leave_group", {&TrackerState::leaveGroup, true, 1, "leave_group <group>"}},
+        {"list_groups", {&TrackerState::listGroups, true, 0, "list_groups"}},
+        {"list_requests", {&TrackerState::listRequests, true, 1, "list_requests <group>"}},
         {"accept_request",
-         {&TrackerState::acceptRequest, true, true, 2, "accept_request <group> <user>"}},
+         {&TrackerState::acceptRequest, true, 2, "accept_request <group> <user>"}},
         {"remove_member",
-         {&TrackerState::removeMember, true, true, 2, "remove_member <group> <user>"}},
-        {"upload_file", {&TrackerState::uploadFile, true, true, -1, "upload_file"}},
-        {"list_files", {&TrackerState::listFiles, true, false, 1, "list_files <group>"}},
+         {&TrackerState::removeMember, true, 2, "remove_member <group> <user>"}},
+        {"upload_file", {&TrackerState::uploadFile, true, -1, "upload_file"}},
+        {"list_files", {&TrackerState::listFiles, true, 1, "list_files <group>"}},
         {"download_file",
-         {&TrackerState::downloadFile, true, false, 2, "download_file <group> <file>"}},
-        {"stop_share", {&TrackerState::stopShare, true, true, 2, "stop_share <group> <file>"}},
+         {&TrackerState::downloadFile, true, 2, "download_file <group> <file>"}},
+        {"stop_share", {&TrackerState::stopShare, true, 2, "stop_share <group> <file>"}},
     };
     return table;
-}
-
-bool TrackerState::isMutation(const std::string &commandLine) {
-    std::string name;
-    std::istringstream(commandLine) >> name;
-    auto command = commands().find(name);
-    return command != commands().end() && command->second.mutates;
 }
 
 // Splits the line into words, looks the command up, enforces login and
@@ -65,8 +58,8 @@ CommandResult TrackerState::apply(u64 session, const std::string &commandLine,
     std::lock_guard<std::mutex> lock(mutex_);
     auto command = commands().find(words[0]);
     if (command == commands().end()) return {"ERR unknown command", session};
-    auto loggedIn = data_.sessions.find(session);
-    Request request{session, loggedIn == data_.sessions.end() ? "" : loggedIn->second,
+    auto loggedIn = sessions_.find(session);
+    Request request{session, loggedIn == sessions_.end() ? "" : loggedIn->second,
                     std::vector<std::string>(words.begin() + 1, words.end()), context};
     const Command &spec = command->second;
     if (spec.needsLogin && request.user.empty()) return request.reply("ERR login required");
@@ -77,13 +70,13 @@ CommandResult TrackerState::apply(u64 session, const std::string &commandLine,
 
 std::string TrackerState::userOf(u64 session) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto user = data_.sessions.find(session);
-    return user == data_.sessions.end() ? "" : user->second;
+    auto user = sessions_.find(session);
+    return user == sessions_.end() ? "" : user->second;
 }
 
 TrackerState::Group *TrackerState::findGroup(const std::string &name) {
-    auto group = data_.groups.find(name);
-    return group == data_.groups.end() ? nullptr : &group->second;
+    auto group = groups_.find(name);
+    return group == groups_.end() ? nullptr : &group->second;
 }
 
 void TrackerState::Group::removeSharesOf(const std::string &user) {
@@ -96,11 +89,11 @@ void TrackerState::Group::removeSharesOf(const std::string &user) {
 CommandResult TrackerState::createUser(Request &request) {
     const std::string &name = request.args[0];
     std::string &secret = request.args[1];
-    if (data_.users.count(name)) return request.reply("ERR user already exists");
+    if (users_.count(name)) return request.reply("ERR user already exists");
     std::string stored = password::hash(secret, request.context.salt);
     crypto::secureErase(secret);
     if (stored.empty()) return request.reply("ERR secure random generation failed");
-    data_.users[name] = std::move(stored);
+    users_[name] = std::move(stored);
     return request.reply("OK user created");
 }
 
@@ -108,45 +101,34 @@ CommandResult TrackerState::login(Request &request) {
     const std::string &name = request.args[0];
     std::string &secret = request.args[1];
     if (!request.user.empty()) return request.reply("ERR logout before logging in again");
-    auto user = data_.users.find(name);
-    if (user == data_.users.end()) return request.reply("ERR no such user");
+    auto user = users_.find(name);
+    if (user == users_.end()) return request.reply("ERR no such user");
 
-    // Five wrong passwords lock the account for 30 seconds.
-    LoginThrottle &throttle = data_.throttles[name];
-    const long long now = request.context.now;
-    if (throttle.lockedUntil > now)
-        return request.reply("ERR too many login attempts; try again later");
     bool valid = password::verify(secret, user->second);
     crypto::secureErase(secret);
-    if (!valid) {
-        if (++throttle.failures < 5) return request.reply("ERR invalid password");
-        throttle.failures = 0;
-        throttle.lockedUntil = now + 30;
-        return request.reply("ERR too many login attempts; try again later");
-    }
-    data_.throttles.erase(name);
+    if (!valid) return request.reply("ERR invalid password");
 
     u64 session = request.session;
     if (session == 0) {
         session = request.context.newSession;
-        if (session == 0 || data_.sessions.count(session))
+        if (session == 0 || sessions_.count(session))
             return {"ERR secure random generation failed", 0};
     }
-    data_.sessions[session] = name;
+    sessions_[session] = name;
     return {"OK logged in", session};
 }
 
 CommandResult TrackerState::logout(Request &request) {
     if (request.user.empty()) return request.reply("ERR not logged in");
-    for (auto &group : data_.groups) group.second.removeSharesOf(request.user);
-    data_.sessions.erase(request.session);
+    for (auto &group : groups_) group.second.removeSharesOf(request.user);
+    sessions_.erase(request.session);
     return {"OK logged out", 0};
 }
 
 CommandResult TrackerState::createGroup(Request &request) {
     const std::string &name = request.args[0];
-    if (data_.groups.count(name)) return request.reply("ERR group already exists");
-    Group &group = data_.groups[name];
+    if (groups_.count(name)) return request.reply("ERR group already exists");
+    Group &group = groups_[name];
     group.owner = request.user;
     group.members.insert(request.user);
     return request.reply("OK group created");
@@ -172,7 +154,7 @@ CommandResult TrackerState::leaveGroup(Request &request) {
 
 CommandResult TrackerState::listGroups(Request &request) {
     std::string response = "OK";
-    for (const auto &group : data_.groups) response += " " + group.first;
+    for (const auto &group : groups_) response += " " + group.first;
     return request.reply(response);
 }
 

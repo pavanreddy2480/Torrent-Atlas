@@ -20,7 +20,7 @@ struct CommandLine {
 
     /// Parses a line. Two-word spellings are joined with '_' when the first
     /// word is a known verb (create, join, leave, list, accept, remove,
-    /// upload, download, stop, show, cancel, resume): "create user alice pw"
+    /// upload, download, stop, show, cancel): "create user alice pw"
     /// and "create_user alice pw" both give name "create_user" and args
     /// {"alice", "pw"}.
     static CommandLine parse(const std::string &line);

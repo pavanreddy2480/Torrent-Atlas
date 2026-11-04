@@ -10,7 +10,7 @@
 Client::Client(Endpoint self, ClientConfig config)
     : self_(self), peerKey_(crypto::randomBytes(32)), tracker_(std::move(config), self, peerKey_),
       peerServer_(shared_, peerKey_),
-      downloads_(tracker_, shared_, peerStats_) {}
+      downloads_(tracker_, shared_) {}
 
 int Client::run(std::istream &in, std::ostream &out) {
     if (peerKey_.size() != 32) {
@@ -37,18 +37,14 @@ void Client::execute(CommandLine &command, std::ostream &out) {
     if (name == "upload_file") {
         if (args.size() < 2) out << "ERR usage: upload_file <group> <path>\n";
         else uploadFile(args[0], args[1], out);
-    } else if (name == "download_file" || name == "resume_download") {
-        if (args.size() < 3) out << "ERR usage: " << name << " <group> <file-name> <destination>\n";
+    } else if (name == "download_file") {
+        if (args.size() < 3) out << "ERR usage: download_file <group> <file-name> <destination>\n";
         else downloads_.start(args[0], args[1], args[2], out);
     } else if (name == "show_downloads") {
         downloads_.printDownloads(out);
     } else if (name == "cancel_download") {
         if (args.empty()) out << "ERR usage: cancel download <file-name>\n";
         else downloads_.cancel(args[0], out);
-    } else if (name == "peer_stats" || name == "show_peers") {
-        peerStats_.print(out);
-    } else if (name == "stats") {
-        downloads_.printStats(out);
     } else {
         forwardToTracker(command, out);
     }

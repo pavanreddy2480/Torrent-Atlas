@@ -7,7 +7,6 @@
 #include "client/command_line.hpp"
 #include "client/download/download_manager.hpp"
 #include "client/peer/peer_server.hpp"
-#include "client/peer/peer_stats.hpp"
 #include "client/storage/shared_files.hpp"
 #include "client/tracker_client.hpp"
 
@@ -16,9 +15,8 @@
 
 /// Owns every part of a running client and routes each typed command.
 ///
-/// Local commands (upload_file, download_file, resume_download,
-/// show_downloads, cancel_download, peer_stats/show_peers, stats) are
-/// handled here; everything else is forwarded to the tracker as typed.
+/// Local commands (upload_file, download_file, show_downloads,
+/// cancel_download) are handled here; everything else is forwarded to the tracker as typed.
 class Client {
 public:
     /// Makes a fresh random peer key for this run (see peer_ticket.hpp).
@@ -53,7 +51,6 @@ private:
     const std::string peerKey_;   ///< Raw 32 bytes; see peer_ticket.hpp. New for every run.
     TrackerClient tracker_;
     SharedFiles shared_;
-    PeerStats peerStats_;
     PeerServer peerServer_;
     DownloadManager downloads_;
 };

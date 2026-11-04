@@ -61,7 +61,7 @@ struct Response {
 class TrackerProcess {
 public:
     Endpoint address;
-    std::string keys, dataDir, clientConf, publicKey;
+    std::string keys, clientConf, publicKey;
 
     /// Picks a port and creates keys and client.conf under dir.
     /// @return false if local sockets are unavailable.
@@ -70,7 +70,6 @@ public:
         binary_ = trackerBinary;
         ::mkdir(dir.c_str(), 0700);
         keys = dir + "/keys";
-        dataDir = dir + "/data";
         clientConf = dir + "/client.conf";
         int port = unusedPort();
         if (port < 0) return false;
@@ -94,7 +93,7 @@ public:
             dup2(nullOut, STDOUT_FILENO);
             dup2(nullOut, STDERR_FILENO);
             std::string listen = address.toString();
-            execl(binary_.c_str(), binary_.c_str(), listen.c_str(), keys.c_str(), dataDir.c_str(),
+            execl(binary_.c_str(), binary_.c_str(), listen.c_str(), keys.c_str(),
                   static_cast<char *>(nullptr));
             _exit(127);
         }
@@ -102,11 +101,11 @@ public:
         if (!waitForListener(address.port)) throw std::runtime_error("tracker did not start");
     }
 
-    /// Kills the tracker with SIGKILL (a crash, not a clean shutdown).
+    /// Kills the tracker with SIGKILL.
     /// No-op if it isn't running.
     void stop() {
         if (pid_ <= 0) return;
-        kill(pid_, SIGKILL);   // a crash, not a clean shutdown
+        kill(pid_, SIGKILL);
         waitpid(pid_, nullptr, 0);
         pid_ = -1;
     }

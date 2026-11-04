@@ -5,8 +5,8 @@
 /// sessions, login lockouts, groups, members, join requests, and the files
 /// shared in each group with their seeders.
 ///
-/// Passwords are kept only as PBKDF2 hashes. serialize() is what the
-/// tracker saves to disk (see state_snapshot.cpp for the format).
+/// Everything lives in memory: restarting the tracker starts it empty.
+/// Passwords are kept only as PBKDF2 hashes.
 
 #include "common/file_metadata.hpp"
 #include "common/net/net.hpp"
@@ -23,7 +23,7 @@
 struct ApplyContext {
     std::string salt;     ///< 16 random bytes; used by create_user.
     u64 newSession = 0;   ///< Random 63-bit session ID; used by login.
-    long long now = 0;    ///< Unix seconds; login lockout and ticket expiry.
+    long long now = 0;    ///< Unix seconds; ticket expiry.
 
     /// @return A context with a fresh random salt and session ID and the
     ///         current time. The salt is empty if the RNG failed, which
@@ -39,8 +39,8 @@ struct CommandResult {
 
 /// Holds all tracker data and applies client commands to it.
 ///
-/// Thread-safe: apply(), serialize() and restore() each take an internal
-/// lock, so concurrent callers see each command as atomic.
+/// Thread-safe: apply() and userOf() take an internal lock, so concurrent
+/// callers see each command as atomic.
 ///
 /// Commands (one line, space-separated words; file names travel hex-encoded):
 ///   create_user <user> <password>        login <user> <password>     logout
@@ -52,11 +52,6 @@ struct CommandResult {
 /// Each answers "OK ...", "ERR <reason>", or (download_file) "META ...".
 class TrackerState {
 public:
-    /// @param commandLine A full command line; only the first word matters.
-    /// @return true for commands that change state (the tracker saves after
-    ///         those); false for read-only and unknown commands.
-    static bool isMutation(const std::string &commandLine);
-
     /// Runs one client command.
     /// @param session     The caller's session ID, or 0 if not logged in.
     ///                    Unknown IDs are treated as not logged in.
@@ -70,16 +65,6 @@ public:
     /// @param session A session ID.
     /// @return The user logged in with it, or "" if none.
     std::string userOf(u64 session) const;
-
-    /// @return A text snapshot of all data. Equal states give identical
-    ///         text (every collection is sorted), and it holds no plaintext
-    ///         passwords.
-    std::string serialize() const;
-
-    /// Replaces all data with a snapshot from serialize().
-    /// @return false (leaving the current data untouched) if any line is
-    ///         malformed.
-    bool restore(const std::string &snapshot);
 
 private:
     /// One seeder of a file.
@@ -102,18 +87,6 @@ private:
         /// files that are left with no seeders.
         void removeSharesOf(const std::string &user);
     };
-    /// Failed-login tracking for one user.
-    struct LoginThrottle {
-        u64 failures = 0;           ///< Wrong passwords since the last lock or success.
-        long long lockedUntil = 0;  ///< Unix seconds; logins refused before this.
-    };
-    /// Everything serialize() saves.
-    struct Data {
-        std::map<std::string, std::string> users;   ///< user -> password::hash() string
-        std::map<u64, std::string> sessions;        ///< session -> user
-        std::map<std::string, Group> groups;
-        std::map<std::string, LoginThrottle> throttles;
-    };
 
     /// One command being applied, as handed to a handler.
     struct Request {
@@ -131,7 +104,6 @@ private:
     struct Command {
         Handler handler;
         bool needsLogin;     ///< Refuse with "ERR login required" if not logged in.
-        bool mutates;        ///< See isMutation().
         int arity;           ///< Number of arguments, or -1 to let the handler check.
         const char *usage;   ///< Shown in "ERR usage: ..." on a wrong arity.
     };
@@ -143,8 +115,7 @@ private:
 
     /// Adds a user with a hashed password. Erases the password argument.
     CommandResult createUser(Request &request);
-    /// Checks the password (with lockout after 5 failures for 30 s) and
-    /// starts a session. A caller that sent a nonzero (unknown) session ID
+    /// Checks the password and starts a session. A caller that sent a nonzero (unknown) session ID
     /// keeps it; otherwise context.newSession is used.
     CommandResult login(Request &request);
     /// Ends the session and stops all the user's shares.
@@ -176,6 +147,8 @@ private:
     /// @return The group, or nullptr if it does not exist. mutex_ held.
     Group *findGroup(const std::string &name);
 
-    mutable std::mutex mutex_;   ///< Guards data_.
-    Data data_;
+    mutable std::mutex mutex_;   ///< Guards the three maps below.
+    std::map<std::string, std::string> users_;   ///< user -> password::hash() string
+    std::map<u64, std::string> sessions_;        ///< session -> user
+    std::map<std::string, Group> groups_;
 };

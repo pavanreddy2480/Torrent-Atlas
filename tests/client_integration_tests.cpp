@@ -255,8 +255,7 @@ int main(int argc, char **argv) {
         std::string firstSeeder = split(meta.substr(meta.rfind(' ') + 1), ',')[0];
         std::optional<SeederAccess> access = SeederAccess::decode(firstSeeder);
         require(access.has_value(), "no seeder ticket in: " + meta);
-        PeerStats stats;
-        PeerClient peers(stats);
+        PeerClient peers;
         std::vector<bool> bitmap;
         require(peers.fetchBitmap(*access, 3, bitmap) == TransferResult::Success,
                 "a member's ticket was refused");

@@ -1,6 +1,6 @@
 /// @file tracker_state_tests.cpp
 /// TrackerState without sockets: every command, access control, member
-/// removal, ticket issue, login lockout and the saved-state round trip.
+/// removal and ticket issue.
 #include "tracker/state/tracker_state.hpp"
 
 #include "common/peer_ticket.hpp"
@@ -8,19 +8,9 @@
 #include <cassert>
 #include <iostream>
 
-/// @return true if the saved form of state contains text.
-static bool serializedHas(const TrackerState &state, const std::string &text) {
-    return state.serialize().find(text) != std::string::npos;
-}
-
 int main() {
     TrackerState state;
     assert(state.apply(0, "create_user alice secret").response == "OK user created");
-
-    std::string snapshot = state.serialize();
-    assert(snapshot.find("secret") == std::string::npos);
-    assert(snapshot.find(toHex("secret")) == std::string::npos);
-    assert(snapshot.find("pbkdf2-sha256") == std::string::npos);   // hex-encoded
 
     CommandResult wrong = state.apply(0, "login alice incorrect");
     assert(wrong.response == "ERR invalid password" && wrong.session == 0);
@@ -46,22 +36,6 @@ int main() {
                                 "0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000 abcd")
                .response == "ERR invalid upload metadata");
 
-    TrackerState replica;
-    assert(replica.restore(state.serialize()));
-    assert(replica.apply(0, "login alice secret").response == "OK logged in");
-
-    TrackerState cleanRestart;
-    assert(cleanRestart.apply(0, "login alice secret").response == "ERR no such user");
-
-    // Five wrong passwords lock the account, even for the right password.
-    assert(cleanRestart.apply(0, "create_user eve secret").response == "OK user created");
-    for (int attempt = 0; attempt < 4; ++attempt)
-        assert(cleanRestart.apply(0, "login eve wrong").response == "ERR invalid password");
-    assert(cleanRestart.apply(0, "login eve wrong").response ==
-           "ERR too many login attempts; try again later");
-    assert(cleanRestart.apply(0, "login eve secret").response ==
-           "ERR too many login attempts; try again later");
-
     // Access control: login required, members-only files, owner-only admin.
     {
         TrackerState acl;
@@ -86,7 +60,6 @@ int main() {
         assert(meta == "META 0 0123456789abcdef0123456789abcdef01234567 - " + expected.encode());
         std::optional<SeederAccess> parsed = SeederAccess::decode(expected.encode());
         assert(parsed && parsed->key == expected.key && parsed->expires() == ticket.expires);
-        assert(serializedHas(acl, hexPeerKey));
         assert(acl.apply(outsider, "list_files secret").response == "ERR not a group member");
         assert(acl.apply(outsider, "download_file secret " + toHex("a.txt")).response ==
                "ERR not a group member");
@@ -125,22 +98,6 @@ int main() {
         u64 again = acl.apply(0, "login owner pw").session;
         assert(acl.apply(again, "list_files secret").response == "OK");
     }
-
-    // Snapshots carry the login lockout too.
-    {
-        TrackerState restored;
-        assert(restored.restore(cleanRestart.serialize()));
-        assert(restored.serialize() == cleanRestart.serialize());
-        assert(restored.apply(0, "login eve secret").response ==
-               "ERR too many login attempts; try again later");
-        assert(!restored.restore("X junk\n"));
-    }
-
-    assert(TrackerState::isMutation("login alice secret"));
-    assert(TrackerState::isMutation("upload_file demo x"));
-    assert(!TrackerState::isMutation("list_files demo"));
-    assert(TrackerState::isMutation("remove_member demo x"));
-    assert(!TrackerState::isMutation("download_file demo x"));
 
     std::cout << "tracker state tests passed\n";
 }

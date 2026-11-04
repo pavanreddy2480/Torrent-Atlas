@@ -1,9 +1,9 @@
 /// @file tracker/main.cpp
-/// tracker <IP:PORT> <keys-dir> <data-dir>
+/// tracker <IP:PORT> <keys-dir>
 ///
-/// Runs the tracker: loads its identity key from keys-dir and its saved
-/// state from data-dir/tracker.state, then serves clients on IP:PORT, one
-/// thread per connection, one encrypted request per connection.
+/// Runs the tracker: loads its identity key from keys-dir, then serves
+/// clients on IP:PORT, one thread per connection, one encrypted request per
+/// connection. All state is in memory; a restart starts empty.
 /// Type "quit" on stdin to stop it; with stdin closed it runs until killed.
 /// Exit code 0 after quit, 1 on a startup error.
 
@@ -16,14 +16,13 @@
 
 #include <cerrno>
 #include <cstring>
-#include <filesystem>
 #include <iostream>
 #include <thread>
 
 int main(int argc, char **argv) {
-    std::optional<Endpoint> address = argc == 4 ? Endpoint::parse(argv[1]) : std::nullopt;
+    std::optional<Endpoint> address = argc == 3 ? Endpoint::parse(argv[1]) : std::nullopt;
     if (!address) {
-        std::cerr << "usage: " << argv[0] << " <ip:port> <keys-dir> <data-dir>\n";
+        std::cerr << "usage: " << argv[0] << " <ip:port> <keys-dir>\n";
         return 1;
     }
     std::optional<TrackerIdentity> identity = TrackerIdentity::load(argv[2]);
@@ -32,14 +31,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     TrackerLog::info("Loaded tracker identity key from " + std::string(argv[2]));
-    std::string dataDir = argv[3];
-    std::error_code ignored;
-    std::filesystem::create_directories(dataDir, ignored);
-    std::filesystem::permissions(dataDir, std::filesystem::perms::owner_all,
-                                 std::filesystem::perm_options::replace, ignored);
-
-    TrackerService tracker(StateFile(dataDir + "/tracker.state"));
-    if (!tracker.load()) return 1;
+    TrackerService tracker;
     TcpServer server([&](Socket socket) {
         std::optional<Endpoint> peer = socket.peer();
         std::string client = peer ? peer->toString() : "unknown client";

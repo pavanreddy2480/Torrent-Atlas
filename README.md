@@ -5,8 +5,8 @@ Torrent Atlas is a BitTorrent-style file sharing system written in C++17: a trac
 ## Architecture
 
 ```text
-                       tracker      users, groups, files; saves tracker.state
-                          ▲         after every change
+                       tracker      users, groups, files (in memory)
+                          ▲
                           │  signed X25519 handshake + AES-256-GCM
               ┌───────────┴───────────┐
               │                       │
@@ -14,7 +14,7 @@ Torrent Atlas is a BitTorrent-style file sharing system written in C++17: a trac
                     ticket + AES-256-GCM
 ```
 
-- **The tracker** holds the metadata and answers every client command. It saves its state to disk (atomically, password hashes only) after each change, so a restart loses nothing.
+- **The tracker** holds the metadata in memory (password hashes only) and answers every client command. Nothing is saved to disk, so a restart starts it empty.
 - **Peers** send file pieces directly to each other. A seeder serves only requests carrying a ticket the tracker issued, in the last five minutes, to a current member of the group. Removing someone from a group (`remove member`) or leaving it stops their tickets.
 
 File bytes never pass through the tracker. Full overview: [PROJECT.md](PROJECT.md). How it works: [DESIGN.md](DESIGN.md). Keys and encryption: [SECURITY.md](SECURITY.md).
@@ -47,10 +47,10 @@ Create the tracker's key once. This writes its signing key to `config/keys/` and
 ./build/torrent_keygen 127.0.0.1:6000 config/keys config/client.conf
 ```
 
-Start the tracker (it keeps its state in `data/`), then the clients:
+Start the tracker, then the clients:
 
 ```sh
-./build/tracker 127.0.0.1:6000 config/keys data
+./build/tracker 127.0.0.1:6000 config/keys
 ./build/client 127.0.0.1:8101 config/client.conf
 ./build/client 127.0.0.1:8102 config/client.conf
 ```
@@ -69,7 +69,6 @@ upload file demo /path/to/file.bin
 list files demo
 download file demo file.bin /tmp/file.bin
 show downloads
-show peers
 cancel download file.bin
 stop share demo file.bin
 logout
@@ -79,9 +78,8 @@ quit
 ## Five-minute interview demo
 
 1. Start the tracker and two clients. Create Alice and Bob, create a group, join it, and accept Bob.
-2. Upload a multi-piece file from Alice and download it from Bob. Use `show downloads` and `stats` to show rarest-first progress and throughput.
-3. Kill the tracker and start it again: groups, files and logins are all still there.
-4. `remove member demo bob` from Alice: Bob's next `download file` is refused, and Alice's peer stops accepting his tickets once they expire.
+2. Upload a multi-piece file from Alice and download it from Bob. Use `show downloads` to show progress.
+3. `remove member demo bob` from Alice: Bob's next `download file` is refused, and Alice's peer stops accepting his tickets once they expire.
 
 ## Transfer behavior
 
@@ -90,15 +88,14 @@ quit
 - Tracker-issued, five-minute peer tickets; AES-256-GCM peer requests and responses under each ticket's key.
 - One identical `60|denied` for every rejected peer request, so peers don't reveal which files they hold.
 - Assignment-required SHA-1 per-piece and full-file verification.
-- Resume manifests that re-hash claimed pieces before reuse.
+- Resume by re-hashing an existing `.part` file; only matching pieces are kept.
 - Partial seeding as pieces are verified.
 - Retry from another available peer after disconnect, authentication failure, or corruption.
 - Explicit cancellation and joined client service lifecycles.
-- Factual peer availability, throughput, success, and failure metrics; no trust score or blacklist heuristic.
 
 ## Design limits
 
-- One tracker: while it is down nobody can log in or start a download. Transfers already running continue.
+- One tracker, in memory only: while it is down nobody can log in or start a download, and a restart loses all users, groups and shared files. Transfers already running continue.
 - Removing a member takes effect at seeders when that member's tickets expire, within five minutes.
 - SHA-1 is kept for piece and file integrity for compatibility; it is not recommended for new designs.
 - A seeder that crashes without `logout` stays listed until that user logs out or stops sharing; downloads still succeed by retrying other peers.

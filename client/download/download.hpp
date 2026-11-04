@@ -9,7 +9,6 @@
 #include "client/tracker_client.hpp"
 
 #include <atomic>
-#include <chrono>
 #include <mutex>
 #include <ostream>
 #include <string>
@@ -40,10 +39,8 @@ public:
     /// @param seeders     Where to fetch from, with their tickets.
     /// @param tracker     For registering as a seeder and renewing tickets.
     /// @param shared      Where verified pieces are published to the peer server.
-    /// @param peerStats   Where every peer request's outcome is recorded.
     Download(std::string group, std::string name, std::string destination, FileMetadata metadata,
-             std::vector<SeederAccess> seeders, TrackerClient &tracker, SharedFiles &shared,
-             PeerStats &peerStats);
+             std::vector<SeederAccess> seeders, TrackerClient &tracker, SharedFiles &shared);
 
     /// Runs the whole download (see the class comment); blocks until it
     /// completes, fails or is cancelled. Call once.
@@ -57,19 +54,9 @@ public:
     const std::string &name() const { return name_; }
     const std::string &destination() const { return destination_; }
 
-    /// @return The file's size in bytes.
-    u64 totalBytes() const { return metadata_.size; }
-    /// @return Bytes fetched from peers in this run (excludes resumed pieces).
-    u64 transferredBytes() const { return verifiedBytes_ - resumedBytes_; }
-    /// @return Seconds since the download started (frozen once finished);
-    ///         at least 0.001 so it is safe to divide by.
-    double elapsedSeconds() const;
-
     /// Prints one line for show_downloads: [D]ownloading, [C]omplete or
     /// [F]ailed, progress, and the failure reason if any.
     void printSummary(std::ostream &out) const;
-    /// Prints a block for stats: progress, speed, ETA, peers and retries.
-    void printStats(std::ostream &out) const;
 
 private:
     /// Opens the .part file and keeps every piece in it whose SHA-1 matches.
@@ -91,7 +78,7 @@ private:
     /// Checks the full-file SHA-1, renames .part into place and seeds the
     /// complete file.
     void complete();
-    /// Records the outcome and stops the clock.
+    /// Records the outcome.
     void finish(bool failed, const std::string &reason = "");
     /// @return Seeder index's access, first renewing every ticket from the
     ///         tracker if this one is about to expire. Thread-safe.
@@ -116,19 +103,14 @@ private:
     std::vector<std::vector<bool>> seederBitmaps_;
     std::vector<std::size_t> rarity_;   ///< How many seeders have each piece.
 
-    const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
     std::atomic<bool> cancelled_{false};
-    mutable std::mutex statusMutex_;   ///< Guards the four fields below.
+    mutable std::mutex statusMutex_;   ///< Guards the three fields below.
     bool finished_ = false;
     bool failed_ = false;
-    double elapsed_ = 0.0;   ///< Seconds, set once finished.
     std::string failureReason_;
 
-    // Counters shown by show_downloads and stats.
+    // Counters shown by show_downloads.
     std::atomic<std::size_t> completed_{0};
     std::atomic<std::size_t> resumedPieces_{0};
-    std::atomic<u64> verifiedBytes_{0};
-    std::atomic<u64> resumedBytes_{0};
-    std::atomic<u64> retries_{0};
-    std::atomic<u64> integrityFailures_{0};
+    std::atomic<std::size_t> integrityFailures_{0};
 };

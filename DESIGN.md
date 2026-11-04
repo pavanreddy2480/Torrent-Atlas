@@ -14,7 +14,7 @@ The system splits into two planes with very different needs.
    │  users · password hashes · sessions · groups · members ·         │
    │  join requests · file metadata (size, hashes) · seeders          │
    │                                                                  │
-   │                    tracker  ── tracker.state on disk              │
+   │                    tracker  (in memory only)                     │
    └──────────────────────────────────────────────────────────────────┘
                  ▲ metadata and peer tickets (a few KB per request)
                  │
@@ -29,8 +29,8 @@ The system splits into two planes with very different needs.
 | --- | --- | --- |
 | Holds | Who exists, who is allowed, where files are | The file bytes |
 | Size | Kilobytes | Up to gigabytes |
-| What matters most | Correct access decisions; no acknowledged change lost | Throughput and integrity |
-| Mechanism | One tracker that saves its state after every change | Direct parallel peer transfer |
+| What matters most | Correct access decisions | Throughput and integrity |
+| Mechanism | One in-memory tracker | Direct parallel peer transfer |
 
 **Why split them:** if file bytes went through the tracker, it would be the bandwidth bottleneck. Keeping the tracker to metadata keeps it small and fast, and lets file transfers scale with the number of peers.
 
@@ -40,50 +40,23 @@ The system splits into two planes with very different needs.
 
 ### 2.1 One process, one state
 
-There is a single tracker. It holds a `TrackerState` in memory (users, password hashes, sessions, login lockouts, groups, members, join requests, files and seeders) and answers every client command from it.
+There is a single tracker. It holds a `TrackerState` in memory (users, password hashes, sessions, groups, members, join requests, files and seeders) and answers every client command from it. Nothing is written to disk.
 
 ```text
- client ── sealed "C\t<session>\t<command>" ──▶ TrackerService::handle
-                                                  │
-                                read-only command ├──▶ TrackerState::apply ──▶ reply
-                                                  │
-                          state-changing command  └──▶ lock ─▶ apply ─▶ save ─▶ reply
+ client ── sealed "C\t<session>\t<command>" ──▶ TrackerService::handle ──▶ TrackerState::apply ──▶ reply
 ```
 
-- **Reads** (`list_groups`, `list_files`, `download_file`, ...) run concurrently; `TrackerState` has its own lock.
-- **Writes** (`create_user`, `login`, `upload_file`, `remove_member`, ...) run one at a time. Each one is applied and then the whole state is saved before the client gets its answer.
+Each connection runs on its own thread; `TrackerState` takes one lock per command, so every command is atomic. The command table in `TrackerState` maps each name to its handler, says whether it needs a login, and gives its argument count.
 
-The command table in `TrackerState` marks which commands need a login and which change state, so `TrackerService` knows when to save.
+### 2.2 What happens when it fails
 
-### 2.2 Durable storage
-
-```text
- data/
- └── tracker.state    one record per line, every name hex-encoded:
-                      U <user> <pbkdf2 hash>      S <session> <user>
-                      T <user> <failures> <locked until>
-                      G <group> <owner>           M / R <group> <member / pending user>
-                      F <group> <file> <size> <SHA-1> <piece hashes>
-                      D <group> <file> <seeder> <ip> <port> <peer key>
-```
-
-Every save writes `tracker.state.tmp` (mode `0600`), fsyncs it and renames it over the old file, so a crash leaves either the old state or the new one, never a mix. On start the tracker loads the file; a missing file means a fresh tracker, and a corrupt one stops it rather than start empty.
-
-Only the serialized state is ever written. Commands are never logged, so the passwords inside `create_user` and `login` never reach the disk; the state holds PBKDF2 hashes only (`tracker_integration_tests` scans the data directory for the typed passwords after signup, a failed login and a good login).
-
-**Trade-off:** the whole state is rewritten on every change. That is simple and plenty fast for the kilobytes of metadata a class-sized deployment has. A much larger deployment would want an append-only journal or an embedded database.
-
-### 2.3 What happens when it fails
-
-| Failure | What happens | Data at risk |
+| Failure | What happens | Data lost |
 | --- | --- | --- |
-| Tracker crashes | Clients get `ERR tracker unavailable` until it restarts; peer transfers already under way keep going | None that was acknowledged |
-| Tracker restarts | Loads `tracker.state`; sessions, groups and seeders are as they were | None |
-| Disk lost | Everything is gone | All metadata; keep backups of `data/` |
+| Tracker crashes or restarts | Clients get `ERR tracker unavailable` while it is down; peer transfers already under way keep going. It comes back empty | All users, groups and shared files; users sign up and share again |
 
-`tracker_integration_tests` kills the tracker with `SIGKILL`, restarts it and checks that state and sessions survived.
+**Trade-off:** keeping everything in memory removes the state file, its format and the save after every change. With one tracker it is already a single point of failure, so persistence would only cover restarts. A real deployment would add it back, for example with atomic snapshot writes or an embedded database.
 
-### 2.4 `ApplyContext`
+### 2.3 `ApplyContext`
 
 `TrackerState::apply(session, command, context)` never calls the random generator or the clock itself. `ApplyContext::fresh()` supplies the password salt, a new session ID and the current time. That keeps `TrackerState` easy to test: a test can pass a fixed time and check the exact ticket the tracker issues.
 

@@ -29,7 +29,7 @@ All cryptography comes from **OpenSSL 3**. Nothing cryptographic is hand-rolled.
                           being removed
    stranger          ───▶ no account; can reach a peer's port and may hold
                           a ticket someone leaked
-   stolen disk/file  ───▶ attacker gets a copy of the tracker's data
+   stolen disk/file  ───▶ attacker gets a copy of the tracker's key
                           directory or a client's partial download
 ```
 
@@ -66,7 +66,7 @@ All cryptography comes from **OpenSSL 3**. Nothing cryptographic is hand-rolled.
             └──────────────┘        └──────────────────────────────┘
 ```
 
-`config/keys/`, `config/client.conf` and `data/` are git-ignored.
+`config/keys/` and `config/client.conf` are git-ignored.
 
 ---
 
@@ -193,7 +193,7 @@ Seeders do not share a key with downloaders. Each running client makes a random 
 
 ### 5.3 One answer for every rejection
 
-Before a request is known to be genuine, every failure gets exactly `60|denied`: a malformed frame, a bad or expired ticket, a wrong key, a stale timestamp, or a file the peer is not sharing. The seeder checks the ticket and decrypts **before** it looks the file up, so a stranger cannot tell "no such file" from "wrong key" and cannot list what a peer holds. Only a request with a valid ticket can get the other answer, `60|unavailable` (that piece isn't here). `peer_access_tests` and `peer_rejection_test` check that these replies are byte-for-byte identical.
+Before a request is known to be genuine, every failure gets exactly `60|denied`: a malformed frame, a bad or expired ticket, a wrong key, a stale timestamp, or a file the peer is not sharing. The seeder checks the ticket and decrypts **before** it looks the file up, so a stranger cannot tell "no such file" from "wrong key" and cannot list what a peer holds. Only a request with a valid ticket can get the other answer, `60|unavailable` (that piece isn't here). `peer_access_tests` checks that these replies are byte-for-byte identical.
 
 ---
 
@@ -217,16 +217,7 @@ Before a request is known to be genuine, every failure gets exactly `60|denied`:
 - **20 000 iterations** slow down guessing if the hashes leak.
 - **Constant-time comparison** avoids leaking how many bytes matched.
 
-### 6.2 Brute-force lockout
-
-```text
- wrong password ×5 ──▶ account locked for 30 s ──▶ every login refused
-                        (even with the right password) until it expires
-```
-
-The counter and the lock time are part of the saved tracker state, so restarting the tracker does not reset them.
-
-### 6.3 Who may do what
+### 6.2 Who may do what
 
 | Action | Check (on the tracker) |
 | --- | --- |
@@ -247,12 +238,9 @@ Sessions are random 63-bit IDs. They are only ever sent inside the encrypted cli
 | File | Contains | Protection |
 | --- | --- | --- |
 | `config/keys/*.key` | Private keys | Mode `0600`, git-ignored |
-| `data/tracker.state` | Password hashes, sessions, lockouts, groups, file metadata, seeders' addresses and peer keys | Directory created `0700`; file `0600`; written atomically |
 | `<dest>.part` (client) | Partial file | Mode `0600`; every piece re-hashed on resume, so tampering can't inject data |
 
-**No password is ever written to disk.** The tracker saves only its serialized state, never the commands it received, so the passwords inside `create_user` and `login` stay in memory, are hashed or checked, and are erased (`OPENSSL_cleanse`). `tracker_integration_tests` signs up, fails a login and logs in, then scans every file in the data directory for the typed passwords, plain and hex-encoded.
-
-Tracker data is **not encrypted on disk**. Anyone who can read `tracker.state` gets the password hashes, which are slow to crack, plus live sessions and the peer keys of seeders that are online, which would let them mint tickets for those seeders until the seeders restart. Protect the host accordingly.
+**The tracker writes nothing to disk** except reading its identity key. Users, password hashes, sessions, groups and seeders' peer keys live only in its memory, and typed passwords are hashed or checked and then erased (`OPENSSL_cleanse`).
 
 ---
 
@@ -263,24 +251,22 @@ Tracker data is **not encrypted on disk**. Anyone who can read `tracker.state` g
 | 1 | Plain-text command sent to the tracker | `tracker_integration_tests` | Connection dropped, no reply |
 | 2 | Client pinned to the wrong public key | `tracker_integration_tests`, `security_tests` | Handshake fails |
 | 3 | Recorded sealed request replayed on a new connection | `tracker_integration_tests` | Fails to decrypt, dropped |
-| 4 | Looking for typed passwords in the tracker's data directory | `tracker_integration_tests` | Not found, plain or hex |
-| 5 | Tampered AES-GCM tag, ciphertext, nonce or AAD; wrong key | `security_tests` | Decryption fails |
-| 6 | Tampered Ed25519 signature, wrong signer, changed transcript | `security_tests` | Verification fails |
-| 7 | Wrong password, unknown user, 5 wrong attempts | `tracker_state_tests` | Rejected, then locked |
-| 8 | Command without login; non-member listing, downloading or uploading; non-owner listing, accepting or removing | `tracker_state_tests` | `ERR login required`, `ERR not a group member`, `ERR only owner may …` |
-| 9 | Removed member asks for the file again | `tracker_state_tests`, `client_integration_tests` | `ERR not a group member`; their own shares are dropped |
-| 10 | Peer request with a guessed key, an edited ticket, a stretched expiry, or an expired ticket | `peer_access_tests`, `client_integration_tests` | `60\|denied` |
-| 11 | Probing a peer for a file it has vs one it doesn't | `peer_access_tests`, `peer_rejection_test` | Identical `60\|denied` |
+| 4 | Tampered AES-GCM tag, ciphertext, nonce or AAD; wrong key | `security_tests` | Decryption fails |
+| 5 | Tampered Ed25519 signature, wrong signer, changed transcript | `security_tests` | Verification fails |
+| 6 | Wrong password, unknown user | `tracker_state_tests` | Rejected |
+| 7 | Command without login; non-member listing, downloading or uploading; non-owner listing, accepting or removing | `tracker_state_tests` | `ERR login required`, `ERR not a group member`, `ERR only owner may …` |
+| 8 | Removed member asks for the file again | `tracker_state_tests`, `client_integration_tests` | `ERR not a group member`; their own shares are dropped |
+| 9 | Peer request with a guessed key, an edited ticket, a stretched expiry, or an expired ticket | `peer_access_tests`, `client_integration_tests` | `60\|denied` |
+| 10 | Probing a peer for a file it has vs one it doesn't | `peer_access_tests` | Identical `60\|denied` |
 
 ## 9. Known limits
 
 | Limit | Impact | Possible fix |
 | --- | --- | --- |
 | Revocation is not instant at the seeder | A removed member's tickets keep working for up to 5 minutes | Shorter tickets, or seeders asking the tracker |
-| No forward secrecy between peers | Someone who later gets a seeder's peer key (from its memory or the tracker's disk) and recorded the traffic can decrypt it | Per-transfer X25519 between peers |
+| No forward secrecy between peers | Someone who later gets a seeder's peer key (from its memory or the tracker's memory) and recorded the traffic can decrypt it | Per-transfer X25519 between peers |
 | A peer request can be replayed while its ticket and timestamp are valid | The replayer gets an encrypted piece it can't read | Remember recent request nonces |
-| Single tracker | If it is down, nobody can log in or start a download | Run it under a supervisor; keep backups of `data/` |
-| Tracker data not encrypted on disk | A stolen disk exposes hashes, sessions and online seeders' peer keys | Disk encryption |
+| Single tracker | If it is down, nobody can log in or start a download | Run it under a supervisor |
 | SHA-1 for piece integrity | Weaker than SHA-256 against a peer crafting collisions | Move piece hashes to SHA-256 |
 | Peer clocks must agree within 5 min | Requests from badly skewed peers are refused | Peer handshake with nonces instead of timestamps |
 | Sessions never expire by time | A stolen session stays valid until logout | Session TTL |
@@ -288,6 +274,6 @@ Tracker data is **not encrypted on disk**. Anyone who can read `tracker.state` g
 ## 10. Operational checklist
 
 1. Run `torrent_keygen` on the tracker's machine. Give clients only `client.conf`.
-2. Keep `config/keys/` and `data/` readable only by the tracker's user.
+2. Keep `config/keys/` readable only by the tracker's user.
 3. If the tracker is compromised: generate a new key, give clients the new `client.conf`, and have every user restart their client so it makes a new peer key.
 4. Run `ctest` after any change to the crypto or protocol code.

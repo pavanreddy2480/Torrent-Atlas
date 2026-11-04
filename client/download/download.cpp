@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <iomanip>
 #include <thread>
 
 namespace {
@@ -17,16 +16,14 @@ constexpr std::chrono::milliseconds PASS_PAUSE{200};
 // Fetch new tickets when the current one expires within this many seconds.
 constexpr long long TICKET_MARGIN_SECONDS = 60;
 
-constexpr double MIB = 1024.0 * 1024.0;
-
 }  // namespace
 
 Download::Download(std::string group, std::string name, std::string destination,
                    FileMetadata metadata, std::vector<SeederAccess> seeders, TrackerClient &tracker,
-                   SharedFiles &shared, PeerStats &peerStats)
+                   SharedFiles &shared)
     : group_(std::move(group)), name_(std::move(name)), destination_(std::move(destination)),
       partPath_(destination_ + ".part"), metadata_(std::move(metadata)),
-      seeders_(std::move(seeders)), tracker_(tracker), shared_(shared), peers_(peerStats) {}
+      seeders_(std::move(seeders)), tracker_(tracker), shared_(shared) {}
 
 SeederAccess Download::seederAt(std::size_t index) {
     std::lock_guard<std::mutex> lock(seedersMutex_);
@@ -73,13 +70,9 @@ bool Download::prepare() {
     for (std::size_t piece = 0; resuming && piece < verified_.size(); ++piece) {
         verified_[piece] = file_.read(piece, metadata_.pieceLength(piece), data) &&
                            crypto::sha1Hex(data) == metadata_.pieceHashes[piece];
-        if (verified_[piece]) {
-            ++resumedPieces_;
-            resumedBytes_ += data.size();
-        }
+        if (verified_[piece]) ++resumedPieces_;
     }
     completed_ = resumedPieces_.load();
-    verifiedBytes_ = resumedBytes_.load();
     return true;
 }
 
@@ -89,10 +82,8 @@ void Download::fetchBitmaps() {
     for (std::size_t seeder = 0; seeder < seeders_.size(); ++seeder) {
         std::vector<bool> &bitmap = seederBitmaps_[seeder];
         if (peers_.fetchBitmap(seederAt(seeder), metadata_.pieceCount(), bitmap) !=
-            TransferResult::Success) {
-            ++retries_;
+            TransferResult::Success)
             continue;
-        }
         for (std::size_t piece = 0; piece < bitmap.size(); ++piece) rarity_[piece] += bitmap[piece];
     }
 }
@@ -137,7 +128,6 @@ bool Download::fetchPiece(std::size_t piece) {
             markVerified(piece);
             return true;
         }
-        ++retries_;
         if (result == TransferResult::IntegrityFailure) ++integrityFailures_;
         // Pause after each full pass over the holders.
         if ((attempt + 1) % holders.size() == 0) std::this_thread::sleep_for(PASS_PAUSE);
@@ -146,7 +136,6 @@ bool Download::fetchPiece(std::size_t piece) {
 }
 
 void Download::markVerified(std::size_t piece) {
-    verifiedBytes_ += metadata_.pieceLength(piece);
     ++completed_;
     shared_.markAvailable(group_, name_, piece);
 }
@@ -170,7 +159,6 @@ void Download::finish(bool failed, const std::string &reason) {
     std::lock_guard<std::mutex> lock(statusMutex_);
     failureReason_ = reason;
     failed_ = failed;
-    elapsed_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
     finished_ = true;
 }
 
@@ -184,14 +172,6 @@ char Download::state() const {
     return finished_ ? (failed_ ? 'F' : 'C') : 'D';
 }
 
-double Download::elapsedSeconds() const {
-    std::lock_guard<std::mutex> lock(statusMutex_);
-    double seconds = finished_ ? elapsed_
-                               : std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                               started_).count();
-    return std::max(0.001, seconds);
-}
-
 void Download::printSummary(std::ostream &out) const {
     char current = state();
     out << '[' << current << "] [" << group_ << "] " << name_;
@@ -200,22 +180,4 @@ void Download::printSummary(std::ostream &out) const {
     std::lock_guard<std::mutex> lock(statusMutex_);
     if (failed_ && !failureReason_.empty()) out << " reason=\"" << failureReason_ << '"';
     out << '\n';
-}
-
-void Download::printStats(std::ostream &out) const {
-    u64 verified = verifiedBytes_;
-    double elapsed = elapsedSeconds();
-    double speed = transferredBytes() / elapsed / MIB;
-    double progress = metadata_.size ? 100.0 * verified / metadata_.size : 100.0;
-    double eta = speed > 0.0 && verified < metadata_.size
-                     ? (metadata_.size - verified) / (speed * MIB)
-                     : 0.0;
-    out << '[' << state() << "] [" << group_ << "] " << name_ << '\n'
-        << std::fixed << std::setprecision(1)
-        << "  progress: " << progress << "% (" << completed_ << '/' << metadata_.pieceCount()
-        << " pieces, " << verified / (1024 * 1024) << '/' << metadata_.size / (1024 * 1024)
-        << " MiB, " << resumedPieces_ << " resumed)\n"
-        << "  speed: " << speed << " MiB/s  elapsed: " << elapsed << "s  eta: " << eta << "s\n"
-        << "  peers: " << seeders_.size() << " seeders, retries=" << retries_
-        << " corrupt=" << integrityFailures_ << '\n';
 }

@@ -1,7 +1,6 @@
 #include "client/download/download_manager.hpp"
 
 #include <filesystem>
-#include <iomanip>
 
 namespace fs = std::filesystem;
 
@@ -37,7 +36,7 @@ void DownloadManager::start(const std::string &group, const std::string &name,
         return;
     }
     auto download = std::make_shared<Download>(group, name, path, metadata, seeders, tracker_,
-                                               shared_, peerStats_);
+                                               shared_);
     std::lock_guard<std::mutex> lock(mutex_);
     downloads_.push_back(download);
     threads_.emplace_back([download] { download->run(); });
@@ -58,23 +57,4 @@ void DownloadManager::cancel(const std::string &name, std::ostream &out) {
 void DownloadManager::printDownloads(std::ostream &out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto &download : downloads_) download->printSummary(out);
-}
-
-void DownloadManager::printStats(std::ostream &out) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (downloads_.empty()) {
-        out << "No downloads recorded\n";
-        return;
-    }
-    u64 transferred = 0, scheduled = 0;
-    double seconds = 0.0;
-    for (const auto &download : downloads_) {
-        download->printStats(out);
-        transferred += download->transferredBytes();
-        scheduled += download->totalBytes();
-        seconds = std::max(seconds, download->elapsedSeconds());
-    }
-    out << std::fixed << std::setprecision(1) << "Aggregate: " << downloads_.size()
-        << " downloads, " << transferred / seconds / (1024.0 * 1024.0) << " MiB/s, "
-        << scheduled / (1024 * 1024) << " MiB scheduled\n";
 }
