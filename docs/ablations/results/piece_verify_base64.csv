@@ -1,0 +1,11 @@
+experiment,variant,rep,seeders,size_mb,seconds,mb_per_s,cpu_seconds,wire_mb,completed,intact
+piece_verify,sha1 per piece (shipped),0,4,64,0.1599,419.7031,0.27,90.0583,1,1
+piece_verify,sha1 per piece (shipped),1,4,64,0.1528,439.1173,0.28,90.056,1,1
+piece_verify,sha1 per piece (shipped),2,4,64,0.1584,423.6793,0.27,90.0561,1,1
+piece_verify,sha1 per piece (shipped),3,4,64,0.1607,417.5671,0.27,90.056,1,1
+piece_verify,sha1 per piece (shipped),4,4,64,0.1545,434.4397,0.27,90.0581,1,1
+piece_verify,no piece check,0,4,64,0.1576,425.7564,0.25,90.0578,1,1
+piece_verify,no piece check,1,4,64,0.1764,380.365,0.25,90.0541,1,1
+piece_verify,no piece check,2,4,64,0.1792,374.4765,0.25,90.0517,1,1
+piece_verify,no piece check,3,4,64,0.1594,421.0063,0.26,90.0546,1,1
+piece_verify,no piece check,4,4,64,0.1468,457.03,0.25,90.0561,1,1

@@ -1,0 +1,11 @@
+experiment,variant,rep,seeders,size_mb,seconds,mb_per_s,cpu_seconds,wire_mb,completed,intact
+encoding,hex (shipped),0,4,64,0.4055,165.5045,1.29,134.9892,1,1
+encoding,hex (shipped),1,4,64,0.4952,135.5266,1.3,134.9874,1,1
+encoding,hex (shipped),2,4,64,0.413,162.4834,1.29,134.987,1,1
+encoding,hex (shipped),3,4,64,0.4027,166.6568,1.3,134.9931,1,1
+encoding,hex (shipped),4,4,64,0.4044,165.9355,1.28,134.9886,1,1
+encoding,base64,0,4,64,0.1683,398.633,0.27,90.0577,1,1
+encoding,base64,1,4,64,0.2407,278.8003,0.29,90.0569,1,1
+encoding,base64,2,4,64,0.1524,440.4709,0.26,90.0592,1,1
+encoding,base64,3,4,64,0.1758,381.7267,0.27,90.056,1,1
+encoding,base64,4,4,64,0.1958,342.7962,0.28,90.0572,1,1

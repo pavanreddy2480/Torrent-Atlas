@@ -5,13 +5,14 @@
 /// to fetch and verify it: its size and the SHA-1 of the whole file and of
 /// every 512 KiB piece.
 
+#include "common/ablation.hpp"
 #include "common/encoding.hpp"
 
 #include <string>
 #include <vector>
 
 /// Every file is cut into pieces of this size; the last may be shorter.
-constexpr std::size_t PIECE_SIZE = 512U * 1024U;
+inline const std::size_t PIECE_SIZE = static_cast<std::size_t>(ablation::pieceSize());
 
 /// @return How many pieces a file of `size` bytes has (0 for an empty file).
 inline u64 pieceCountForSize(u64 size) { return size / PIECE_SIZE + (size % PIECE_SIZE != 0); }

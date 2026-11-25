@@ -1,0 +1,16 @@
+experiment,variant,rep,seeders,size_mb,seconds,mb_per_s,cpu_seconds,wire_mb,completed,intact
+combined,shipped,0,4,64,0.6604,101.6111,1.31,134.9914,1,1
+combined,shipped,1,4,64,0.6933,96.7942,1.39,134.9824,1,1
+combined,shipped,2,4,64,0.6696,100.2218,1.32,134.9847,1,1
+combined,base64 only,0,4,64,0.4274,157.0345,0.34,90.0589,1,1
+combined,base64 only,1,4,64,0.4041,166.0578,0.33,90.0687,1,1
+combined,base64 only,2,4,64,0.4237,158.398,0.33,90.059,1,1
+combined,threads=16 only,0,4,64,0.344,195.0654,1.6,135.0767,1,1
+combined,threads=16 only,1,4,64,0.3542,189.4588,1.62,135.1588,1,1
+combined,threads=16 only,2,4,64,0.3506,191.4332,1.58,135.081,1,1
+combined,base64 + 16 threads,0,4,64,0.2126,315.685,0.36,90.0656,1,1
+combined,base64 + 16 threads,1,4,64,0.2078,322.8802,0.36,90.0645,1,1
+combined,base64 + 16 threads,2,4,64,0.2366,283.6294,0.36,90.0689,1,1
+combined,base64 + 16 threads + 2 MiB pieces,0,4,64,0.172,390.1309,0.36,89.906,1,1
+combined,base64 + 16 threads + 2 MiB pieces,1,4,64,0.1694,396.0696,0.37,89.8893,1,1
+combined,base64 + 16 threads + 2 MiB pieces,2,4,64,0.1698,395.1644,0.37,89.8888,1,1

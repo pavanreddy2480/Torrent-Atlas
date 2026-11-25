@@ -46,6 +46,13 @@ inline std::string replyAad(const std::string &requestAad, const std::string &he
     return REPLY + "|" + requestAad + "|" + hexRequestNonce;
 }
 
+/// AES-256-GCM encrypt / decrypt for peer transfers (a pass-through under the
+/// TORRENT_ABL_ENCRYPT=0 ablation; see common/ablation.hpp).
+bool seal(const std::string &key, const std::string &aad, const std::string &plain,
+          crypto::AesGcmMessage &message);
+bool unseal(const std::string &key, const std::string &aad, const crypto::AesGcmMessage &message,
+            std::string &plain);
+
 /// Serializes an encrypted message as "<prefix>|<nonce>|<ciphertext>|<tag>",
 /// each part hex.
 std::string encode(const std::string &prefix, const crypto::AesGcmMessage &message);

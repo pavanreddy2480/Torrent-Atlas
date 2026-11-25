@@ -1,0 +1,11 @@
+experiment,variant,rep,seeders,size_mb,seconds,mb_per_s,cpu_seconds,wire_mb,completed,intact
+final_verify,full-file sha1 (shipped),0,4,64,0.1624,413.1803,0.27,90.0572,1,1
+final_verify,full-file sha1 (shipped),1,4,64,0.1669,402.1776,0.28,90.0559,1,1
+final_verify,full-file sha1 (shipped),2,4,64,0.1454,461.5874,0.29,90.0555,1,1
+final_verify,full-file sha1 (shipped),3,4,64,0.1639,409.4237,0.3,90.0505,1,1
+final_verify,full-file sha1 (shipped),4,4,64,0.1518,442.2077,0.28,90.0513,1,1
+final_verify,no final check,0,4,64,0.1644,408.1037,0.27,90.0557,1,1
+final_verify,no final check,1,4,64,0.186,360.8476,0.27,90.0554,1,1
+final_verify,no final check,2,4,64,0.1653,405.9044,0.27,90.0564,1,1
+final_verify,no final check,3,4,64,0.1446,463.952,0.28,90.0526,1,1
+final_verify,no final check,4,4,64,0.139,482.8168,0.27,90.051,1,1

@@ -1,0 +1,11 @@
+experiment,variant,rep,seeders,size_mb,seconds,mb_per_s,cpu_seconds,wire_mb,completed,intact
+encryption,aes-gcm (shipped),0,4,64,0.1494,449.1427,0.29,90.0539,1,1
+encryption,aes-gcm (shipped),1,4,64,0.1672,401.322,0.28,90.0559,1,1
+encryption,aes-gcm (shipped),2,4,64,0.1601,419.1395,0.27,90.0552,1,1
+encryption,aes-gcm (shipped),3,4,64,0.1651,406.5211,0.28,90.0894,1,1
+encryption,aes-gcm (shipped),4,4,64,0.1515,442.821,0.27,90.0498,1,1
+encryption,plaintext,0,4,64,0.1392,482.1495,0.26,90.0519,1,1
+encryption,plaintext,1,4,64,0.1447,463.7951,0.25,90.0529,1,1
+encryption,plaintext,2,4,64,0.1674,400.87,0.26,90.049,1,1
+encryption,plaintext,3,4,64,0.1643,408.4948,0.27,90.0566,1,1
+encryption,plaintext,4,4,64,0.177,379.1952,0.25,90.0566,1,1
