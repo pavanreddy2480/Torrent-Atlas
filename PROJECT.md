@@ -69,7 +69,7 @@ The prompt and tracker connection sit at the top; `peer/` talks to other peers, 
 | `peer/peer_protocol` | The encrypted peer-to-peer message format, shared by both sides. |
 | `download/download` | `Download`: one download, from re-hashing any existing `.part` (resume) to rarest-first parallel fetch to the final hash check; renews tickets before they expire. |
 | `download/download_manager` | `DownloadManager`: starts, lists, measures and cancels downloads. |
-| `storage/piece_file` | `PieceFile`: reads, writes and hashes a file one 512 KiB piece at a time. |
+| `storage/piece_file` | `PieceFile`: reads, writes and hashes a file one 2 MiB piece at a time. |
 | `storage/local_file.hpp` | `LocalFile`: a seeded file's path, metadata and available pieces. |
 
 ### 2.3 Shared code (`common/`)
@@ -80,7 +80,7 @@ The prompt and tracker connection sit at the top; `peer/` talks to other peers, 
 | --- | --- |
 | `net/net` | `Endpoint` (IPv4 address and port) and `Socket` (RAII socket with length-prefixed frames). |
 | `net/tcp_server` | `TcpServer`: accepts connections and handles each one on its own thread. Used by the tracker and the peer server. |
-| `crypto/crypto` | OpenSSL wrappers: random bytes, SHA-1, SHA-256, HMAC-SHA256, PBKDF2, AES-256-GCM, Ed25519, X25519. |
+| `crypto/crypto` | OpenSSL wrappers: random bytes, SHA-256 (also streaming), HMAC-SHA256, PBKDF2, AES-256-GCM, Ed25519, X25519. |
 | `net/secure_channel` | `SecureChannel`: the client-to-tracker handshake and the sealed request and reply. |
 | `file_metadata` | `FileMetadata`: a file's size and hashes, with validation. |
 | `peer_ticket` | `PeerTicket` and `SeederAccess`: the tickets the tracker issues and seeders check. |
@@ -134,7 +134,7 @@ The client prints a `>` prompt. Every command accepts both `create user` and `cr
 
 ```text
  client A                                   tracker
-    │ 1. read file, SHA-1 each 512 KiB piece
+    │ 1. read file, SHA-256 each 2 MiB piece
     │    and the whole file
     │ 2. upload_file group name size hash      ──▶  checks membership, saves
     │    piece-hashes my-ip my-port my-peer-key
@@ -159,19 +159,19 @@ The peer key is a random 256-bit key the client makes when it starts. Only the t
     │ start up to 8 workers; each takes the next piece:
     │      GET piece i (ticket + encrypted) ────────────────────▶ a holder
     │      ◀──────────────────────────────── piece bytes (encrypted)
-    │      SHA-1 matches? ── no ─▶ try the next holder (3 passes, 200 ms pause)
+    │      SHA-256 matches? ── no ─▶ try the next holder (3 passes, 200 ms pause)
     │            │ yes
     │      write piece, start seeding it to others immediately
     │ ticket expires within a minute ─▶ download_file again for fresh ones
     │
-    │ all pieces done ─▶ SHA-1 of the whole file ─▶ rename .part to final name
+    │ all pieces done ─▶ SHA-256 of the whole file ─▶ rename .part to final name
     │ upload_file (now a full seeder) ──▶ tracker
 ```
 
 - **Rarest first:** pieces that few peers hold are fetched first, so they spread before those peers leave.
 - **Partial seeding:** as soon as a piece is verified, the downloader serves it to others.
 - **Resume:** there is no separate resume file. When a download starts and `<dest>.part` already exists, every piece in it is re-hashed against the tracker's piece hashes; matching pieces are kept and the rest are fetched.
-- **Integrity:** a piece is written only if its SHA-1 matches the tracker's hash, and the file is renamed into place only if the full-file SHA-1 matches.
+- **Integrity:** a piece is written only if its SHA-256 matches the tracker's hash, and the file is renamed into place only if the full-file SHA-256 matches.
 
 ---
 
@@ -241,7 +241,7 @@ ctest --test-dir build --output-on-failure
 | Test | Covers |
 | --- | --- |
 | `net_tests` | Endpoint, number and hex parsing; frame limits |
-| `security_tests` | SHA-1, SHA-256 and PBKDF2 known answers; AES-GCM tampering; Ed25519; X25519; handshake success and wrong-key failure |
+| `security_tests` | SHA-256 and PBKDF2 known answers; base64 round trips; AES-GCM tampering; Ed25519; X25519; handshake success and wrong-key failure |
 | `command_line_tests` | Quoting, escaping and two-word command names |
 | `piece_file_tests` | File hashing, piece reads and writes |
 | `tracker_state_tests` | Tracker commands; access control (login, member-only, owner-only); removing members; ticket issue |
@@ -258,4 +258,3 @@ CI (`.github/workflows/ci.yml`) runs a release build and an AddressSanitizer/UBS
 - **One in-memory tracker:** if it is down, nobody can log in or start a download (transfers already running continue), and a restart loses all users, groups and shared files.
 - **Revocation takes up to 5 minutes at seeders:** a removed member's tickets work until they expire.
 - **Crashed seeders stay listed** until that user logs out, stops sharing or leaves the group. Downloads still succeed by retrying other peers.
-- **SHA-1 for integrity** is kept for compatibility; SHA-256 would be the modern choice.

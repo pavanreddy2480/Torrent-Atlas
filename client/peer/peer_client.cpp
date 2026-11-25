@@ -2,8 +2,6 @@
 
 #include "client/peer/peer_protocol.hpp"
 
-#include "common/ablation.hpp"
-
 TransferResult PeerClient::request(const SeederAccess &seeder, const std::string &operation,
                                    std::size_t piece, std::string &reply) const {
     std::string frame, nonce, response;
@@ -33,7 +31,7 @@ TransferResult PeerClient::fetchBitmap(const SeederAccess &seeder, std::size_t p
 TransferResult PeerClient::fetchPiece(const SeederAccess &seeder, std::size_t index,
                                       const std::string &expectedHash, std::string &data) const {
     TransferResult result = request(seeder, "GET", index, data);
-    if (result == TransferResult::Success && ablation::pieceVerify() && crypto::sha1Hex(data) != expectedHash)
+    if (result == TransferResult::Success && crypto::sha256Hex(data) != expectedHash)
         return TransferResult::IntegrityFailure;
     return result;
 }

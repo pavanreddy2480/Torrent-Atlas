@@ -3,8 +3,8 @@
 /// @file peer_protocol.hpp
 /// Peer <-> peer piece transfer, one request per connection. A downloader may
 /// only ask with a ticket the tracker issued for it (see peer_ticket.hpp), and
-/// everything is AES-256-GCM under that ticket's key. Fields are hex unless
-/// noted.
+/// everything is AES-256-GCM under that ticket's key. Binary fields
+/// are base64 (hex was 2.6x slower; see docs/ablations/RESULTS.md).
 ///
 ///   request  "21|<ticket>|<nonce>|<ciphertext>|<tag>"     (ticket as text)
 ///            plaintext "<BITMAP or GET>\n<piece index>\n<unix seconds>"
@@ -46,18 +46,11 @@ inline std::string replyAad(const std::string &requestAad, const std::string &he
     return REPLY + "|" + requestAad + "|" + hexRequestNonce;
 }
 
-/// AES-256-GCM encrypt / decrypt for peer transfers (a pass-through under the
-/// TORRENT_ABL_ENCRYPT=0 ablation; see common/ablation.hpp).
-bool seal(const std::string &key, const std::string &aad, const std::string &plain,
-          crypto::AesGcmMessage &message);
-bool unseal(const std::string &key, const std::string &aad, const crypto::AesGcmMessage &message,
-            std::string &plain);
-
 /// Serializes an encrypted message as "<prefix>|<nonce>|<ciphertext>|<tag>",
-/// each part hex.
+/// each part base64.
 std::string encode(const std::string &prefix, const crypto::AesGcmMessage &message);
-/// Reads nonce, ciphertext and tag from hex fields[first .. first+2].
-/// @return false if there are too few fields or any isn't hex.
+/// Reads nonce, ciphertext and tag from base64 fields[first .. first+2].
+/// @return false if there are too few fields or any isn't base64.
 bool decode(const std::vector<std::string> &fields, std::size_t first,
             crypto::AesGcmMessage &message);
 

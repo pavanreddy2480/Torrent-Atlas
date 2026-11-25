@@ -44,7 +44,7 @@ bool TrackerClient::locate(const std::string &group, const std::string &name,
         error = response;
         return false;
     }
-    // META <size> <SHA-1> <piece hashes> <seeder>,<seeder>...
+    // META <size> <SHA-256> <piece hashes> <seeder>,<seeder>...
     std::istringstream input(response);
     std::vector<std::string> fields;
     for (std::string field; input >> field;) fields.push_back(field);

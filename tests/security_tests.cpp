@@ -12,12 +12,23 @@
 
 int main() {
     // Known answers.
-    assert(crypto::sha1Hex("") == "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-    assert(crypto::sha1Hex("abc") == "a9993e364706816aba3e25717850c26c9cd0d89d");
-    crypto::Sha1 streamed;
+    assert(crypto::sha256Hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assert(crypto::sha256Hex("abc") ==
+           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    crypto::Sha256Stream streamed;
     streamed.update("a", 1);
     streamed.update("bc", 2);
-    assert(streamed.hexDigest() == "a9993e364706816aba3e25717850c26c9cd0d89d");
+    assert(streamed.hexDigest() ==
+           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+    // Base64 round trips for every length, and rejects bad text.
+    for (std::size_t length = 0; length < 40; ++length) {
+        std::string bytes(length, '\xff'), decoded;
+        for (std::size_t i = 0; i < length; ++i) bytes[i] = static_cast<char>(i * 37);
+        assert(fromBase64(toBase64(bytes), decoded) && decoded == bytes);
+    }
+    std::string badOutput;
+    assert(!fromBase64("abc", badOutput) && !fromBase64("ab!d", badOutput));
     assert(toHex(crypto::sha256("abc")) ==
            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     assert(toHex(crypto::pbkdf2Sha256("password", "salt", 1, 32)) ==

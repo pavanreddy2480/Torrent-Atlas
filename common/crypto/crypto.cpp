@@ -102,23 +102,23 @@ std::string pbkdf2Sha256(const std::string &password, const std::string &salt,
     return output;
 }
 
-Sha1::Sha1() : context_(EVP_MD_CTX_new()) { EVP_DigestInit_ex(context_, EVP_sha1(), nullptr); }
+Sha256Stream::Sha256Stream() : context_(EVP_MD_CTX_new()) { EVP_DigestInit_ex(context_, EVP_sha256(), nullptr); }
 
-Sha1::~Sha1() { EVP_MD_CTX_free(context_); }
+Sha256Stream::~Sha256Stream() { EVP_MD_CTX_free(context_); }
 
-void Sha1::update(const void *data, std::size_t length) {
+void Sha256Stream::update(const void *data, std::size_t length) {
     EVP_DigestUpdate(context_, data, length);
 }
 
-std::string Sha1::hexDigest() {
-    std::string digest(20, '\0');
+std::string Sha256Stream::hexDigest() {
+    std::string digest(32, '\0');
     unsigned length = 0;
     EVP_DigestFinal_ex(context_, bytes(digest), &length);
     return toHex(digest);
 }
 
-std::string sha1Hex(const std::string &data) {
-    Sha1 hash;
+std::string sha256Hex(const std::string &data) {
+    Sha256Stream hash;
     hash.update(data.data(), data.size());
     return hash.hexDigest();
 }

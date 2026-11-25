@@ -1,0 +1,4 @@
+experiment,variant,rep,seeders,size_mb,seconds,mb_per_s,cpu_seconds,wire_mb,completed,intact
+after,current build,0,4,64,0.1761,381.1131,0.35,89.9798,1,1
+after,current build,1,4,64,0.1809,371.0688,0.36,89.9738,1,1
+after,current build,2,4,64,0.1658,404.8721,0.34,89.9004,1,1

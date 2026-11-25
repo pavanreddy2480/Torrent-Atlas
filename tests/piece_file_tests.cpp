@@ -16,7 +16,7 @@ int main() {
         FileMetadata hashed;
         assert(PieceFile::hash(path, hashed));
         assert(hashed.size == size && hashed.pieceHashes.size() == expectedPieces);
-        assert(isSha1Hex(hashed.fullHash));
+        assert(isSha256Hex(hashed.fullHash));
         unlink(path.c_str());
     };
     checkFile(0, 0);

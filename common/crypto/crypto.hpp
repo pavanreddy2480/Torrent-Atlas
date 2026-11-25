@@ -46,30 +46,30 @@ std::string hmacSha256(const std::string &key, const std::string &data);
 std::string pbkdf2Sha256(const std::string &password, const std::string &salt,
                          unsigned iterations, std::size_t length);
 
-/// Streaming SHA-1, for piece and whole-file hashes that are too large to
+/// Streaming SHA-256, for piece and whole-file hashes that are too large to
 /// hold in memory at once. Feed data with update() in any number of chunks,
 /// then call hexDigest() once. Not copyable; not thread-safe.
-class Sha1 {
+class Sha256Stream {
 public:
-    Sha1();
-    ~Sha1();
-    Sha1(const Sha1 &) = delete;
-    Sha1 &operator=(const Sha1 &) = delete;
+    Sha256Stream();
+    ~Sha256Stream();
+    Sha256Stream(const Sha256Stream &) = delete;
+    Sha256Stream &operator=(const Sha256Stream &) = delete;
 
     /// Adds `length` bytes at data to the running hash.
     void update(const void *data, std::size_t length);
 
     /// Finishes the hash.
-    /// @return 40 lowercase hex digits. Call at most once.
+    /// @return 64 lowercase hex digits. Call at most once.
     std::string hexDigest();
 
 private:
     evp_md_ctx_st *context_;   ///< Owned OpenSSL digest context.
 };
 
-/// SHA-1 of data in one call.
-/// @return 40 lowercase hex digits.
-std::string sha1Hex(const std::string &data);
+/// SHA-256 of data in one call.
+/// @return 64 lowercase hex digits.
+std::string sha256Hex(const std::string &data);
 
 /// One AES-256-GCM message: a 12-byte nonce, the ciphertext (same length as
 /// the plaintext) and a 16-byte authentication tag.

@@ -19,6 +19,7 @@ EXPERIMENTS = {
                  ("threads=16 only", {"TORRENT_ABL_THREADS": 16}),
                  ("base64 + 16 threads", {"TORRENT_ABL_ENCODING": "base64", "TORRENT_ABL_THREADS": 16}),
                  ("base64 + 16 threads + 2 MiB pieces", {"TORRENT_ABL_ENCODING": "base64", "TORRENT_ABL_THREADS": 16, "TORRENT_ABL_PIECE_SIZE": 2 << 20})],
+    "after": [("current build", {})],
     "selection": [("rarest-first (shipped)", {}), ("sequential", {"TORRENT_ABL_SELECTION": "sequential"}),
                   ("random", {"TORRENT_ABL_SELECTION": "random"})],
 }

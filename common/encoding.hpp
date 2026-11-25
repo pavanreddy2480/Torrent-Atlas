@@ -28,8 +28,16 @@ bool fromHex(const std::string &hex, std::string &bytes);
 /// @return true if text.size() == length and every character is a hex digit.
 bool isHex(const std::string &text, std::size_t length);
 
-/// Checks that text looks like a SHA-1 digest: exactly 40 hex digits.
-inline bool isSha1Hex(const std::string &text) { return isHex(text, 40); }
+/// Checks that text looks like a SHA-256 digest: exactly 64 hex digits.
+inline bool isSha256Hex(const std::string &text) { return isHex(text, 64); }
+
+/// Encodes raw bytes as base64 (with '=' padding). Smaller and much faster
+/// to decode than hex, and it never contains '|', so it fits our frames.
+std::string toBase64(const std::string &bytes);
+
+/// Decodes base64 text.
+/// @return false if the text is not valid padded base64.
+bool fromBase64(const std::string &text, std::string &bytes);
 
 /// Parses a strictly decimal unsigned 64-bit number.
 /// Rejects empty text, signs, spaces, any trailing characters and overflow.

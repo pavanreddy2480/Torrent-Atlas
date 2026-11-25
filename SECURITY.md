@@ -179,7 +179,7 @@ Seeders do not share a key with downloaders. Each running client makes a random 
    │                    C2 = AES-256-GCM(ticket key, aad2, piece bytes)
    │◀─── 30 | n2 | C2 | tag ──────────────────────────────────────│
    │ decrypt with aad2 (binds the reply to THIS request's nonce)  │
-   │ SHA-1(piece) == hash from tracker?  no ─▶ discard, try another peer
+   │ SHA-256(piece) == hash from tracker?  no ─▶ discard, try another peer
 ```
 
 | Mechanism | Stops |
@@ -189,7 +189,7 @@ Seeders do not share a key with downloaders. Each running client makes a random 
 | The ticket (user, group, file, expiry) in the authenticated data | Reusing a request for another file |
 | Reply bound to the request nonce | Substituting a reply from another request |
 | Timestamp checked within 5 minutes | Replaying an old captured request later |
-| SHA-1 per piece from the tracker, plus a full-file check | A malicious or buggy seeder sending wrong data |
+| SHA-256 per piece from the tracker, plus a full-file check | A malicious or buggy seeder sending wrong data |
 
 ### 5.3 One answer for every rejection
 
@@ -267,7 +267,6 @@ Sessions are random 63-bit IDs. They are only ever sent inside the encrypted cli
 | No forward secrecy between peers | Someone who later gets a seeder's peer key (from its memory or the tracker's memory) and recorded the traffic can decrypt it | Per-transfer X25519 between peers |
 | A peer request can be replayed while its ticket and timestamp are valid | The replayer gets an encrypted piece it can't read | Remember recent request nonces |
 | Single tracker | If it is down, nobody can log in or start a download | Run it under a supervisor |
-| SHA-1 for piece integrity | Weaker than SHA-256 against a peer crafting collisions | Move piece hashes to SHA-256 |
 | Peer clocks must agree within 5 min | Requests from badly skewed peers are refused | Peer handshake with nonces instead of timestamps |
 | Sessions never expire by time | A stolen session stays valid until logout | Session TTL |
 

@@ -13,7 +13,7 @@ enum class TransferResult {
     Success,                 ///< Got a valid, authenticated reply (and a matching hash).
     NetworkFailure,          ///< Couldn't connect, or the connection broke.
     AuthenticationFailure,   ///< Denied, or the reply didn't decrypt or had the wrong shape.
-    IntegrityFailure,        ///< A piece arrived but its SHA-1 was wrong.
+    IntegrityFailure,        ///< A piece arrived but its SHA-256 was wrong.
     Unavailable              ///< The peer accepted the ticket but lacks that piece.
 };
 
@@ -32,7 +32,7 @@ public:
                                std::vector<bool> &bitmap) const;
 
     /// Fetches one piece.
-    /// @param expectedHash The piece's SHA-1 from the tracker.
+    /// @param expectedHash The piece's SHA-256 from the tracker.
     /// @param data         Receives the piece bytes.
     /// @return Success only if the piece arrived and matches expectedHash;
     ///         IntegrityFailure if it arrived but doesn't match.

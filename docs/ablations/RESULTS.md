@@ -66,3 +66,21 @@ On loopback the 2 MiB change doesn't matter; under latency it adds 25 %.
 3. Move to 1-2 MiB pieces.
 4. Keep AES-GCM and both SHA-1 checks.
 5. Run the partial-seeder rarest-first experiment next.
+
+## Applied (branch `ablation/apply-findings`)
+
+The fixes are now in the code: SHA-256 for piece and file hashes, base64 on
+peer frames, up to 16 download threads (no longer capped by seeder count) and
+2 MiB pieces. AES-GCM and both hash checks stay. Same setup as above (64 MB,
+4 seeders); raw rows in `results/after_apply*.csv`.
+
+| Build | Loopback MB/s | 5 ms latency MB/s | CPU s | wire MB |
+|---|---|---|---|---|
+| before (shipped, SHA-1, hex) | 164 | 100 | 1.31 | 135 |
+| after (this branch) | 485 | 381 | 0.35 | 90 |
+
+That is 3.0x faster on loopback and 3.8x with latency, with the same 8/8 tests
+passing and every downloaded file intact. The 5 ms run used a scratch copy of
+this branch with the delay switch added; the switch is not in the shipped code.
+Moving from SHA-1 to SHA-256 did not show up in the numbers (hashing both runs
+at about 2.6 GB/s on this Mac), and the files stay byte-identical on download.

@@ -21,7 +21,7 @@ The system splits into two planes with very different needs.
    ┌─────────────┴────────────────────────────────────────────────────┐
    │                    DATA PLANE (large, must be fast)               │
    │                                                                  │
-   │    peer A ◀════ 512 KiB pieces ════▶ peer B ◀════▶ peer C         │
+   │    peer A ◀════ 2 MiB pieces ════▶ peer B ◀════▶ peer C         │
    └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -72,19 +72,19 @@ Each connection runs on its own thread; `TrackerState` takes one lock per comman
 
 ### 4.1 Pieces
 
-Files are cut into **512 KiB** pieces (the last may be shorter). The tracker stores the SHA-1 of each piece and of the whole file.
+Files are cut into **2 MiB** pieces (the last may be shorter; the size was chosen by measurement, see `docs/ablations/RESULTS.md`). The tracker stores the SHA-256 of each piece and of the whole file.
 
 ```text
  file (1.2 MiB)
  ┌──────────────┬──────────────┬───────┐
  │ piece 0      │ piece 1      │ p 2   │
- │ 512 KiB      │ 512 KiB      │ 205 K │
- │ sha1 = a3f…  │ sha1 = 91c…  │ 0d7…  │
+ │ 2 MiB        │ 2 MiB        │ 205 K │
+ │ sha256 = a3f… │ sha256 = 91c…  │ 0d7…  │
  └──────────────┴──────────────┴───────┘
- full-file sha1 = 6be…
+ full-file sha256 = 6be…
 ```
 
-**What this solves:** pieces can come from different peers in parallel, a corrupt piece costs only 512 KiB to refetch, and progress can be saved piece by piece.
+**What this solves:** pieces can come from different peers in parallel, a corrupt piece costs only 2 MiB to refetch, and progress can be saved piece by piece.
 
 ### 4.2 Who may ask a seeder: peer tickets
 
@@ -160,7 +160,7 @@ When a download starts, the downloader registers with the tracker as a seeder of
 
  on start:   .part exists? ─▶ re-read and re-hash every piece
              matches the tracker's hash ─▶ keep    mismatch ─▶ fetch it
- finish:     full-file SHA-1 ─▶ rename .part to the final name
+ finish:     full-file SHA-256 ─▶ rename .part to the final name
 ```
 
 There is no separate resume file: the tracker's piece hashes already say which bytes are correct. A resumed download gets fresh tickets from the tracker like any other.

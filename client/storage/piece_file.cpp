@@ -68,13 +68,13 @@ bool PieceFile::hash(const std::string &path, FileMetadata &metadata) {
     if (!std::filesystem::is_regular_file(path, error)) return false;
     std::ifstream input(path, std::ios::binary);
     if (!input) return false;
-    crypto::Sha1 whole;
+    crypto::Sha256Stream whole;
     std::string buffer(PIECE_SIZE, '\0');
     metadata.size = 0;
     metadata.pieceHashes.clear();
     while (input.read(&buffer[0], static_cast<std::streamsize>(buffer.size())) || input.gcount() > 0) {
         std::size_t length = static_cast<std::size_t>(input.gcount());
-        metadata.pieceHashes.push_back(crypto::sha1Hex(buffer.substr(0, length)));
+        metadata.pieceHashes.push_back(crypto::sha256Hex(buffer.substr(0, length)));
         whole.update(buffer.data(), length);
         metadata.size += length;
     }

@@ -1,17 +1,18 @@
 #include "client/download/download.hpp"
 
-#include "common/ablation.hpp"
 #include "common/crypto/crypto.hpp"
 #include "common/net/freshness.hpp"
 
 #include <algorithm>
 #include <filesystem>
-#include <random>
 #include <thread>
 
 namespace {
 
-constexpr std::size_t MAX_THREADS = 8;
+// 16 threads: throughput stops rising near 8-16 and CPU grows after that
+// (docs/ablations/RESULTS.md). Not limited by the number of seeders, since one
+// seeder can serve several pieces at once.
+constexpr std::size_t MAX_THREADS = 16;
 constexpr std::size_t PASSES_PER_PIECE = 3;
 constexpr std::chrono::milliseconds PASS_PAUSE{200};
 
@@ -71,7 +72,7 @@ bool Download::prepare() {
     std::string data;
     for (std::size_t piece = 0; resuming && piece < verified_.size(); ++piece) {
         verified_[piece] = file_.read(piece, metadata_.pieceLength(piece), data) &&
-                           crypto::sha1Hex(data) == metadata_.pieceHashes[piece];
+                           crypto::sha256Hex(data) == metadata_.pieceHashes[piece];
         if (verified_[piece]) ++resumedPieces_;
     }
     completed_ = resumedPieces_.load();
@@ -94,22 +95,15 @@ std::vector<std::size_t> Download::rarestFirst() const {
     std::vector<std::size_t> order;
     for (std::size_t piece = 0; piece < verified_.size(); ++piece)
         if (!verified_[piece]) order.push_back(piece);
-    if (ablation::selection() == "random") {
-        std::mt19937 generator(12345);
-        std::shuffle(order.begin(), order.end(), generator);
-    } else if (ablation::selection() != "sequential") {
-        std::stable_sort(order.begin(), order.end(),
-                         [&](std::size_t a, std::size_t b) { return rarity_[a] < rarity_[b]; });
-    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&](std::size_t a, std::size_t b) { return rarity_[a] < rarity_[b]; });
     return order;
 }
 
 bool Download::fetchPieces(const std::vector<std::size_t> &order) {
     std::atomic<std::size_t> next{0};
     std::atomic<bool> failed{false};
-    std::size_t threadCount = std::min({MAX_THREADS, seeders_.size(), order.size()});
-    if (ablation::threads() > 0)   // ablation: fixed thread count, not capped by seeders
-        threadCount = std::min(static_cast<std::size_t>(ablation::threads()), order.size());
+    std::size_t threadCount = std::min(MAX_THREADS, order.size());
     std::vector<std::thread> threads;
     for (std::size_t i = 0; i < threadCount; ++i)
         threads.emplace_back([&] {
@@ -153,8 +147,8 @@ void Download::markVerified(std::size_t piece) {
 void Download::complete() {
     FileMetadata actual;
     if (!PieceFile::hash(partPath_, actual)) return finish(true, "final file hashing failed");
-    if (actual.size != metadata_.size || (ablation::finalVerify() && actual.fullHash != metadata_.fullHash))
-        return finish(true, "final SHA1 integrity check failed");
+    if (actual.size != metadata_.size || actual.fullHash != metadata_.fullHash)
+        return finish(true, "final SHA-256 integrity check failed");
     std::error_code error;
     std::filesystem::rename(partPath_, destination_, error);
     if (error) return finish(true, "unable to move completed file into place");

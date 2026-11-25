@@ -3,12 +3,8 @@
 #include "client/peer/peer_protocol.hpp"
 #include "client/storage/piece_file.hpp"
 
-#include "common/ablation.hpp"
 #include "common/net/freshness.hpp"
 #include "common/peer_ticket.hpp"
-
-#include <chrono>
-#include <thread>
 
 using peer_protocol::DENIED;
 using peer_protocol::UNAVAILABLE;
@@ -43,7 +39,7 @@ std::string PeerServer::respond(const std::string &request) const {
     std::string key = ticket->key(peerKey_), plain;
     std::string aad = peer_protocol::requestAad(fields[1]);
     crypto::AesGcmMessage received;
-    if (!peer_protocol::decode(fields, 2, received) || !peer_protocol::unseal(key, aad, received, plain))
+    if (!peer_protocol::decode(fields, 2, received) || !crypto::decrypt(key, aad, received, plain))
         return DENIED;
     std::vector<std::string> parts = split(plain, '\n');   // operation, piece, timestamp
     u64 piece = 0;
@@ -62,10 +58,8 @@ std::string PeerServer::respond(const std::string &request) const {
     } else {
         return UNAVAILABLE;
     }
-    if (ablation::delayMs() > 0)   // ablation: simulate network latency
-        std::this_thread::sleep_for(std::chrono::milliseconds(ablation::delayMs()));
     crypto::AesGcmMessage sent;
-    if (!peer_protocol::seal(key, peer_protocol::replyAad(aad, toHex(received.nonce)), reply, sent))
+    if (!crypto::encrypt(key, peer_protocol::replyAad(aad, toHex(received.nonce)), reply, sent))
         return UNAVAILABLE;
     return peer_protocol::encode(peer_protocol::REPLY, sent);
 }

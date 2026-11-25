@@ -8,9 +8,9 @@ std::size_t FileMetadata::pieceLength(std::size_t index) const {
 }
 
 bool FileMetadata::valid() const {
-    return isSha1Hex(fullHash) &&
+    return isSha256Hex(fullHash) &&
            pieceHashes.size() == pieceCountForSize(size) &&
-           std::all_of(pieceHashes.begin(), pieceHashes.end(), isSha1Hex);
+           std::all_of(pieceHashes.begin(), pieceHashes.end(), isSha256Hex);
 }
 
 std::string FileMetadata::pieceHashList() const {

@@ -47,7 +47,7 @@ struct CommandResult {
 ///   create_group <group>                 join_group <group>          leave_group <group>
 ///   list_groups                          list_requests <group>       accept_request <group> <user>
 ///   remove_member <group> <user>         list_files <group>          stop_share <group> <file>
-///   upload_file <group> <file> <size> <SHA-1> <piece hashes> <ip> <port> <peer key>
+///   upload_file <group> <file> <size> <SHA-256> <piece hashes> <ip> <port> <peer key>
 ///   download_file <group> <file>
 /// Each answers "OK ...", "ERR <reason>", or (download_file) "META ...".
 class TrackerState {

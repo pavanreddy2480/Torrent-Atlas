@@ -41,7 +41,7 @@ int main() {
     { std::ofstream(path) << "hello"; }
     FileMetadata metadata;
     metadata.size = 5;
-    metadata.pieceHashes = {crypto::sha1Hex("hello")};
+    metadata.pieceHashes = {crypto::sha256Hex("hello")};
     metadata.fullHash = metadata.pieceHashes[0];
     SharedFiles files;
     files.add("demo", "shared.txt", {path, metadata, {true}});

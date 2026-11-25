@@ -1,6 +1,6 @@
 # Torrent Atlas
 
-Torrent Atlas is a BitTorrent-style file sharing system written in C++17: a tracker for accounts, groups and file metadata, direct encrypted peer transfer, SHA-1 integrity checks, resumable parallel downloads, rarest-first scheduling, and a command-line client.
+Torrent Atlas is a BitTorrent-style file sharing system written in C++17: a tracker for accounts, groups and file metadata, direct encrypted peer transfer, SHA-256 integrity checks, resumable parallel downloads, rarest-first scheduling, and a command-line client.
 
 ## Architecture
 
@@ -84,10 +84,11 @@ quit
 ## Transfer behavior
 
 - 4-byte big-endian length-prefixed TCP frames with a 16 MiB cap.
-- 512 KiB pieces and parallel rarest-first scheduling.
+- 2 MiB pieces and parallel rarest-first scheduling on up to 16 threads.
 - Tracker-issued, five-minute peer tickets; AES-256-GCM peer requests and responses under each ticket's key.
 - One identical `60|denied` for every rejected peer request, so peers don't reveal which files they hold.
-- Assignment-required SHA-1 per-piece and full-file verification.
+- SHA-256 per-piece and full-file verification.
+- Peer frames carry base64, not hex; the choices behind these numbers are measured in `docs/ablations/RESULTS.md`.
 - Resume by re-hashing an existing `.part` file; only matching pieces are kept.
 - Partial seeding as pieces are verified.
 - Retry from another available peer after disconnect, authentication failure, or corruption.
@@ -97,7 +98,6 @@ quit
 
 - One tracker, in memory only: while it is down nobody can log in or start a download, and a restart loses all users, groups and shared files. Transfers already running continue.
 - Removing a member takes effect at seeders when that member's tickets expire, within five minutes.
-- SHA-1 is kept for piece and file integrity for compatibility; it is not recommended for new designs.
 - A seeder that crashes without `logout` stays listed until that user logs out or stops sharing; downloads still succeed by retrying other peers.
 
 ## Documentation

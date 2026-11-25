@@ -28,12 +28,12 @@ int main() {
     std::string hexPeerKey = toHex(peerKey);
     assert(state.apply(session, "upload_file demo 66696c65 1 "
                                 "0123456789abcdef0123456789abcdef0123456z "
-                                "0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000 " +
+                                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 127.0.0.1 9000 " +
                                 hexPeerKey)
                .response == "ERR invalid upload metadata");
     assert(state.apply(session, "upload_file demo 66696c65 1 "
-                                "0123456789abcdef0123456789abcdef01234567 "
-                                "0123456789abcdef0123456789abcdef01234567 127.0.0.1 9000 abcd")
+                                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef "
+                                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 127.0.0.1 9000 abcd")
                .response == "ERR invalid upload metadata");
 
     // Access control: login required, members-only files, owner-only admin.
@@ -46,7 +46,7 @@ int main() {
         assert(acl.apply(0, "create_group secret").response == "ERR login required");
         assert(acl.apply(owner, "create_group secret").response == "OK group created");
         std::string upload = "upload_file secret " + toHex("a.txt") +
-                             " 0 0123456789abcdef0123456789abcdef01234567 - 127.0.0.1 9000 " +
+                             " 0 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef - 127.0.0.1 9000 " +
                              hexPeerKey;
         assert(acl.apply(owner, upload).response == "OK file shared");
 
@@ -57,7 +57,7 @@ int main() {
         PeerTicket ticket{"owner", "secret", "a.txt", 1000 + PeerTicket::LIFETIME_SECONDS};
         SeederAccess expected{*Endpoint::parse("127.0.0.1:9000"), ticket.encode(),
                               ticket.key(peerKey)};
-        assert(meta == "META 0 0123456789abcdef0123456789abcdef01234567 - " + expected.encode());
+        assert(meta == "META 0 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef - " + expected.encode());
         std::optional<SeederAccess> parsed = SeederAccess::decode(expected.encode());
         assert(parsed && parsed->key == expected.key && parsed->expires() == ticket.expires);
         assert(acl.apply(outsider, "list_files secret").response == "ERR not a group member");
@@ -76,7 +76,7 @@ int main() {
         // A removed member gets no more tickets and is no longer a seeder.
         assert(acl.apply(owner, "accept_request secret outsider").response == "OK request accepted");
         std::string outsiderUpload = "upload_file secret " + toHex("a.txt") +
-                                     " 0 0123456789abcdef0123456789abcdef01234567 - 127.0.0.1 "
+                                     " 0 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef - 127.0.0.1 "
                                      "9001 " + toHex(std::string(32, 'o'));
         assert(acl.apply(outsider, outsiderUpload).response == "OK file shared");
         assert(acl.apply(outsider, "download_file secret " + toHex("a.txt")).response.rfind(

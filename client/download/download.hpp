@@ -18,13 +18,13 @@
 ///
 /// run() goes through these steps:
 ///  1. prepare(): open <destination>.part and keep every piece already in it
-///     that matches its SHA-1. This is how a download resumes.
+///     that matches its SHA-256. This is how a download resumes.
 ///  2. fetchBitmaps(): ask every seeder which pieces it has.
 ///  3. Start seeding the pieces we already have, and register with the
 ///     tracker as a seeder.
-///  4. fetchPieces(): fetch missing pieces rarest-first on up to eight
-///     threads, checking each piece's SHA-1.
-///  5. complete(): check the whole file's SHA-1 and rename .part into place.
+///  4. fetchPieces(): fetch missing pieces rarest-first on up to 16
+///     threads, checking each piece's SHA-256.
+///  5. complete(): check the whole file's SHA-256 and rename .part into place.
 ///
 /// Seeder tickets last five minutes, so seederAt() asks the tracker for
 /// fresh ones when a ticket is about to expire.
@@ -59,7 +59,7 @@ public:
     void printSummary(std::ostream &out) const;
 
 private:
-    /// Opens the .part file and keeps every piece in it whose SHA-1 matches.
+    /// Opens the .part file and keeps every piece in it whose SHA-256 matches.
     /// On failure calls finish(true, ...).
     /// @return false if the download can't proceed.
     bool prepare();
@@ -67,7 +67,7 @@ private:
     void fetchBitmaps();
     /// @return The missing pieces, fewest holders first, ties by index.
     std::vector<std::size_t> rarestFirst() const;
-    /// Fetches the pieces in order on up to MAX_THREADS worker threads.
+    /// Fetches the pieces in order on up to MAX_THREADS (16) worker threads.
     /// @return true if every piece was fetched.
     bool fetchPieces(const std::vector<std::size_t> &order);
     /// Tries the seeders that have the piece in turn, a few passes each.
@@ -75,7 +75,7 @@ private:
     bool fetchPiece(std::size_t piece);
     /// Counts the piece and publishes it to the peer server.
     void markVerified(std::size_t piece);
-    /// Checks the full-file SHA-1, renames .part into place and seeds the
+    /// Checks the full-file SHA-256, renames .part into place and seeds the
     /// complete file.
     void complete();
     /// Records the outcome.

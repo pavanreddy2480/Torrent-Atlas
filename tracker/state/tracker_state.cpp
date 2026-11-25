@@ -190,7 +190,7 @@ CommandResult TrackerState::removeMember(Request &request) {
     return request.reply("OK member removed");
 }
 
-// upload_file <group> <hex name> <size> <SHA-1> <piece hashes> <ip> <port> <hex peer key>
+// upload_file <group> <hex name> <size> <SHA-256> <piece hashes> <ip> <port> <hex peer key>
 CommandResult TrackerState::uploadFile(Request &request) {
     const std::vector<std::string> &args = request.args;
     Group *group = findGroup(args.empty() ? "" : args[0]);
@@ -228,7 +228,7 @@ CommandResult TrackerState::listFiles(Request &request) {
     return request.reply(response);
 }
 
-// Replies "META <size> <SHA-1> <piece hashes> <seeder>,<seeder>...", where each
+// Replies "META <size> <SHA-256> <piece hashes> <seeder>,<seeder>...", where each
 // seeder is a SeederAccess: its address, a fresh ticket and that ticket's key.
 CommandResult TrackerState::downloadFile(Request &request) {
     Group *group = findGroup(request.args[0]);
